@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+ruff_cache/
+
+# Outputs
+outputs/
+logs/
+checkpoints/
+
+# OS / IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude local config
+.claude/settings.local.json
+state.json
+progress.md
+next_step.txt
+controller.log
