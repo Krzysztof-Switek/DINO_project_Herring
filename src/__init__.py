@@ -1,0 +1,1 @@
+"""OtolithDinoStandalone — weakly supervised otolith age prediction with DINOv2."""

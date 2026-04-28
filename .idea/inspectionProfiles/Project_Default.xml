@@ -1,0 +1,24 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="torch" />
+          <option value="torchvision" />
+          <option value="omegaconf" />
+          <option value="opencv-python" />
+          <option value="matplotlib" />
+          <option value="tqdm" />
+          <option value="scikit-learn" />
+          <option value="numpy" />
+          <option value="pillow" />
+          <option value="pandas" />
+          <option value="seaborn" />
+          <option value="pytest" />
+          <option value="reportlab" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>

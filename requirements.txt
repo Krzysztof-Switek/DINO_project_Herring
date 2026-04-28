@@ -1,0 +1,14 @@
+pytest
+pyyaml
+pydantic
+numpy
+pandas
+pillow
+matplotlib
+opencv-python
+torch
+torchvision
+timm
+transformers
+scipy
+openpyxl

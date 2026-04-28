@@ -1,0 +1,6 @@
+image_id,age,length_cm,weight_g,sex,population,split
+sample_001.png,3,25.4,120.5,F,North,train
+sample_002.png,5,28.1,145.2,M,North,train
+sample_003.png,7,31.0,180.8,F,South,val
+sample_004.png,2,22.3,95.0,M,South,test
+sample_005.png,9,35.5,220.0,F,East,train

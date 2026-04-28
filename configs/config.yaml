@@ -1,0 +1,52 @@
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14         # dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14
+  use_metadata: false             # image-only baseline; set true in Stage 4
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518                 # must be divisible by patch_size (14*37=518)
+  patch_size: 14                  # DINOv2 default
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine               # cosine | step | none
+  freeze_backbone_epochs: 5       # freeze DINOv2 for first N epochs
+  device: auto                    # auto | cpu | cuda | mps
+  checkpoint_dir: checkpoints
+  log_dir: logs
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+
+interpretation:
+  method: patch_token_importance  # patch_token_importance | attention_rollout | gradient_saliency
+  top_k_patches: 20
+  heatmap_alpha: 0.5
+
+candidates:
+  min_peak_distance: 5            # min patch-distance between candidate increments
+  prominence_threshold: 0.1
