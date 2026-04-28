@@ -44,7 +44,10 @@ def run_inference(
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(device)
-            logits = model(images)
+            metadata = batch.get("metadata")
+            if metadata is not None:
+                metadata = metadata.to(device)
+            logits = model(images, metadata=metadata)
             pred_ages = decode_age_ordinal(logits)   # (B,) int
 
             has_labels = "age" in batch

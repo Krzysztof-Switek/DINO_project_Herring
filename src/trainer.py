@@ -86,8 +86,12 @@ class Trainer:
             images  = batch["image"].to(self.device)
             targets = batch["age_ordinal"].to(self.device)
 
+            metadata = batch.get("metadata")
+            if metadata is not None:
+                metadata = metadata.to(self.device)
+
             self.optimizer.zero_grad()
-            logits = self.model(images)
+            logits = self.model(images, metadata=metadata)
             loss = ordinal_loss(logits, targets)
             loss.backward()
             self.optimizer.step()
@@ -116,7 +120,10 @@ class Trainer:
                 targets = batch["age_ordinal"].to(self.device)
                 ages    = batch["age"].to(self.device)
 
-                logits = self.model(images)
+                metadata = batch.get("metadata")
+                if metadata is not None:
+                    metadata = metadata.to(self.device)
+                logits = self.model(images, metadata=metadata)
                 loss = ordinal_loss(logits, targets)
                 pred_ages = decode_age_ordinal(logits)
 

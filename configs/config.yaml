@@ -5,7 +5,7 @@ project:
 
 model:
   backbone: dinov2_vits14         # dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14
-  use_metadata: false             # image-only baseline; set true in Stage 4
+  use_metadata: true
   target_type: ordinal            # regression | ordinal | count_aware
   num_age_classes: 17             # max observed age = 16 (real data)
   dropout: 0.1

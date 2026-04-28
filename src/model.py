@@ -39,10 +39,11 @@ def ordinal_loss(logits: Tensor, targets: Tensor) -> Tensor:
 
 
 class OtolithModel(nn.Module):
-    """DINOv2 backbone + linear ordinal regression head.
+    """DINOv2 backbone + optional metadata fusion + ordinal regression head.
 
-    Forward:   image (B,3,H,W) → CLS token (B,D) → Dropout+Linear → logits (B, K-1)
-    Interpret: patch tokens available via get_patch_tokens() for Stage 7 heatmaps.
+    Forward (image-only):   image → CLS token (B,D) → Dropout+Linear → logits (B, K-1)
+    Forward (with metadata): [CLS token (B,D) | meta_proj(metadata) (B,32)] → Dropout+Linear → logits
+    Interpret: patch tokens available via get_patch_tokens() for heatmaps.
 
     A backbone can be injected at construction time (used for unit tests
     to avoid torch.hub network calls; pass None to load the real DINOv2).
@@ -55,6 +56,7 @@ class OtolithModel(nn.Module):
     ) -> None:
         super().__init__()
         self.cfg = cfg
+        self.use_metadata = cfg.model.use_metadata
 
         self.backbone = backbone if backbone is not None else load_dinov2(cfg.model.backbone)
 
@@ -65,19 +67,33 @@ class OtolithModel(nn.Module):
         )
         num_outputs = cfg.model.num_age_classes - 1
 
+        meta_hidden = 0
+        if self.use_metadata:
+            meta_dim = len(cfg.data.metadata_cols)
+            meta_hidden = 32
+            self.meta_proj = nn.Sequential(
+                nn.Linear(meta_dim, meta_hidden),
+                nn.ReLU(),
+            )
+
         self.head = nn.Sequential(
             nn.Dropout(p=cfg.model.dropout),
-            nn.Linear(embed_dim, num_outputs),
+            nn.Linear(embed_dim + meta_hidden, num_outputs),
         )
 
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
 
-    def forward(self, image: Tensor) -> Tensor:
+    def forward(self, image: Tensor, metadata: Optional[Tensor] = None) -> Tensor:
         """Return ordinal logits (B, K-1)."""
-        cls_token = self.backbone(image)   # (B, embed_dim)
-        return self.head(cls_token)        # (B, K-1)
+        cls_token = self.backbone(image)                           # (B, embed_dim)
+        if self.use_metadata and metadata is not None:
+            meta_feat = self.meta_proj(metadata)                   # (B, 32)
+            features = torch.cat([cls_token, meta_feat], dim=1)
+        else:
+            features = cls_token
+        return self.head(features)
 
     # ------------------------------------------------------------------
     # Patch token access (for interpretation, Stage 7)
