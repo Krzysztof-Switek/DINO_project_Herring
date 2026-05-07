@@ -151,7 +151,9 @@ class OtolithDataset(Dataset):
             raise ValueError(f"Labels CSV missing required columns: {missing}")
         if not pd.api.types.is_numeric_dtype(df["age"]):
             raise ValueError("Column 'age' must be numeric")
-        if df["age"].lt(0).any():
+        # Wiersze z split=None to sieroty i age=-9 — wykluczone z treningu, pomijamy je
+        split_rows = df[df["split"].notna()]
+        if split_rows["age"].lt(0).any():
             raise ValueError("Column 'age' contains negative values")
 
     # ------------------------------------------------------------------

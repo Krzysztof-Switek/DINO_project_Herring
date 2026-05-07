@@ -127,6 +127,29 @@ def _save_mock_checkpoint(cfg, labels_csv: Path, img_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# test_parse_train_log
+# ---------------------------------------------------------------------------
+
+def test_parse_train_log(tmp_path):
+    """_parse_train_log parses trainer text log into list of epoch dicts."""
+    from scripts.run_pipeline import _parse_train_log
+
+    log = tmp_path / "train.log"
+    log.write_text(
+        "[2026-05-07 10:00:00] epoch=  1  train_loss=0.8234  val_loss=0.7456  val_mae=2.345\n"
+        "[2026-05-07 10:01:00] epoch=  2  train_loss=0.6100  val_loss=0.6800  val_mae=1.900\n",
+        encoding="utf-8",
+    )
+    rows = _parse_train_log(log)
+    assert len(rows) == 2
+    assert rows[0] == {"epoch": 1, "train_loss": 0.8234, "val_loss": 0.7456, "val_mae": 2.345}
+    assert rows[1]["epoch"] == 2
+    assert rows[1]["val_mae"] == 1.9
+    # Missing file returns empty list
+    assert _parse_train_log(tmp_path / "nonexistent.log") == []
+
+
+# ---------------------------------------------------------------------------
 # test_pipeline_state_file
 # ---------------------------------------------------------------------------
 

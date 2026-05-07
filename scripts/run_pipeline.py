@@ -27,7 +27,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+import time as _time
 from pathlib import Path
 
 import yaml
@@ -122,8 +124,41 @@ def _step_scan(args, data_dir: Path) -> tuple[Path, Path]:
     return emb_path, notemb_path
 
 
-def _step_train(cfg, labels_csv: Path) -> Path:
-    """Train model and return path to best checkpoint."""
+def _parse_train_log(log_path: Path) -> list[dict]:
+    """Parsuje train.log trainera → lista słowników per epoka.
+
+    Format linii: [timestamp] epoch=  N  train_loss=X.XXXX  val_loss=X.XXXX  val_mae=X.XXX
+    """
+    if not log_path.exists():
+        return []
+    pattern = re.compile(
+        r"epoch=\s*(\d+)\s+"
+        r"train_loss=([\d.]+)\s+"
+        r"val_loss=([\d.]+)\s+"
+        r"val_mae=([\d.]+)"
+    )
+    rows: list[dict] = []
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        m = pattern.search(line)
+        if m:
+            try:
+                rows.append({
+                    "epoch":      int(m.group(1)),
+                    "train_loss": float(m.group(2)),
+                    "val_loss":   float(m.group(3)),
+                    "val_mae":    float(m.group(4)),
+                })
+            except ValueError:
+                continue
+    return rows
+
+
+def _step_train(cfg, labels_csv: Path) -> tuple[Path, list[dict]]:
+    """Train model and return (path to best checkpoint, per-epoch training logs)."""
     from src.dataset import OtolithDataset
     from src.model import OtolithModel
     from src.trainer import Trainer
@@ -136,13 +171,19 @@ def _step_train(cfg, labels_csv: Path) -> Path:
     val_ds = OtolithDataset(cfg_copy, split="val")
 
     train_loader = DataLoader(train_ds, batch_size=cfg.training.batch_size,
-                              shuffle=True, num_workers=cfg.training.num_workers)
+                              shuffle=True, num_workers=cfg.data.num_workers)
     val_loader = DataLoader(val_ds, batch_size=cfg.training.batch_size,
-                            shuffle=False, num_workers=cfg.training.num_workers)
+                            shuffle=False, num_workers=cfg.data.num_workers)
 
     model = OtolithModel(cfg_copy)
     trainer = Trainer(cfg_copy, model, train_loader, val_loader)
     trainer.fit()
+
+    # Parse training log (Trainer resolves log_dir relative to PROJECT_ROOT)
+    log_dir = Path(cfg.training.log_dir)
+    if not log_dir.is_absolute():
+        log_dir = PROJECT_ROOT / log_dir
+    training_log_data = _parse_train_log(log_dir / "train.log")
 
     ckpt_files = sorted(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt"))
     if not ckpt_files:
@@ -153,7 +194,7 @@ def _step_train(cfg, labels_csv: Path) -> Path:
     best_ckpt = trainer.checkpoint_dir / "best.pt"
     _shutil.copy2(best_ckpt_src, best_ckpt)
     print(f"  Best checkpoint: {best_ckpt} (← {best_ckpt_src.name})")
-    return best_ckpt
+    return best_ckpt, training_log_data
 
 
 def _step_infer(cfg, ckpt_path: Path, labels_csv: Path, output_dir: Path) -> Path:
@@ -167,7 +208,7 @@ def _step_infer(cfg, ckpt_path: Path, labels_csv: Path, output_dir: Path) -> Pat
 
     test_ds = OtolithDataset(cfg_copy, split="test")
     loader = DataLoader(test_ds, batch_size=cfg.training.batch_size,
-                        shuffle=False, num_workers=cfg.training.num_workers)
+                        shuffle=False, num_workers=cfg.data.num_workers)
 
     model = load_model_from_checkpoint(cfg_copy, ckpt_path)
     run_inference(cfg_copy, model, loader, output_dir)
@@ -205,6 +246,58 @@ def _step_cards(
         cards["worst"].extend(worst_saved)
 
     return cards
+
+
+def _write_pipeline_summary(
+    output_dir: Path,
+    training_logs: dict[str, list[dict]],
+    results_dfs: dict,
+    completed_steps: list[str],
+) -> None:
+    """Zapisuje pipeline_summary.json — szybka weryfikacja wyników bez otwierania HTML."""
+    from src.comparison_report import compute_metrics
+
+    training_summary: dict[str, dict] = {}
+    for model_key, logs in training_logs.items():
+        if not logs:
+            training_summary[model_key] = {
+                "epochs_completed": 0,
+                "best_val_mae": None,
+                "final_train_loss": None,
+            }
+        else:
+            training_summary[model_key] = {
+                "epochs_completed": len(logs),
+                "best_val_mae":     round(min(r["val_mae"] for r in logs), 4),
+                "final_train_loss": round(logs[-1]["train_loss"], 4),
+            }
+
+    inference_summary: dict[str, dict] = {}
+    for cond_key, df in results_dfs.items():
+        if df is None or df.empty:
+            inference_summary[cond_key] = None
+            continue
+        if "age" not in df.columns or "predicted_age" not in df.columns:
+            inference_summary[cond_key] = {"n_samples": len(df), "error": "missing columns"}
+            continue
+        m = compute_metrics(df["age"].values, df["predicted_age"].values)
+        inference_summary[cond_key] = {
+            "n_samples": int(len(df)),
+            "MAE":    round(m["MAE"],    4),
+            "RMSE":   round(m["RMSE"],   4),
+            "Acc1yr": round(m["Acc1yr"], 4),
+            "Bias":   round(m["Bias"],   4),
+        }
+
+    summary = {
+        "generated_at":    _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "steps_completed": completed_steps,
+        "training":        training_summary,
+        "inference":       inference_summary,
+    }
+    out_path = output_dir / "pipeline_summary.json"
+    out_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"  Pipeline summary: {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -297,11 +390,15 @@ def main() -> None:
     ckpt_emb = ckpt_emb_dir / "best.pt"
     ckpt_notemb = ckpt_notemb_dir / "best.pt"
 
+    # Training logs — populated by _step_train; empty when --skip-train or step already done
+    logs_emb: list[dict] = []
+    logs_notemb: list[dict] = []
+
     # --- Steps 2-3: training ---
     if not args.skip_train:
         if "train_e" not in completed:
             print("\n[2/9] TRAIN — Embedded")
-            _step_train(cfg_emb, emb_labels)
+            ckpt_emb, logs_emb = _step_train(cfg_emb, emb_labels)
             completed.append("train_e")
             _save_state(state_path, completed)
         else:
@@ -309,7 +406,7 @@ def main() -> None:
 
         if "train_n" not in completed:
             print("\n[3/9] TRAIN — NotEmbedded")
-            _step_train(cfg_notemb, notemb_labels)
+            ckpt_notemb, logs_notemb = _step_train(cfg_notemb, notemb_labels)
             completed.append("train_n")
             _save_state(state_path, completed)
         else:
@@ -350,22 +447,23 @@ def main() -> None:
         print("\n[8/9] CARDS — pominięty (już wykonany)")
         increment_cards = {"best": [], "worst": []}
 
+    # --- Prepare results_dfs (needed for both report and summary) ---
+    import pandas as pd
+    results_dfs: dict[str, pd.DataFrame | None] = {}
+    for cond_key, csv_path in pred_csvs.items():
+        if Path(csv_path).exists():
+            df = pd.read_csv(csv_path)
+            # predictions.csv uses "target_age"; normalise to "age"
+            if "target_age" in df.columns and "age" not in df.columns:
+                df = df.rename(columns={"target_age": "age"})
+            results_dfs[cond_key] = df
+        else:
+            results_dfs[cond_key] = None
+
     # --- Step 9: comparison report ---
     if "report" not in completed:
         print("\n[9/9] REPORT — raport porównawczy")
-        import pandas as pd
         from src.comparison_report import build_comparison_report
-
-        results_dfs: dict[str, pd.DataFrame | None] = {}
-        for cond_key, csv_path in pred_csvs.items():
-            if Path(csv_path).exists():
-                df = pd.read_csv(csv_path)
-                # predictions.csv uses "target_age"; normalise to "age"
-                if "target_age" in df.columns and "age" not in df.columns:
-                    df = df.rename(columns={"target_age": "age"})
-                results_dfs[cond_key] = df
-            else:
-                results_dfs[cond_key] = None
 
         model_info = {
             "backbone": cfg_emb.model.backbone,
@@ -376,9 +474,10 @@ def main() -> None:
         }
 
         report_path = output_dir / "comparison_report.html"
+        training_logs = {"embedded": logs_emb, "not_embedded": logs_notemb}
         build_comparison_report(
             results=results_dfs,
-            training_logs={},
+            training_logs=training_logs,
             increment_cards=increment_cards,
             dataset_stats={"counts": {}, "orphan_count": "N/A", "age_distributions": {}},
             output_path=report_path,
@@ -390,8 +489,17 @@ def main() -> None:
     else:
         print("\n[9/9] REPORT — pominięty (już wykonany)")
 
+    # --- Pipeline summary (always written, niezależnie od trybu) ---
+    _write_pipeline_summary(
+        output_dir=output_dir,
+        training_logs={"embedded": logs_emb, "not_embedded": logs_notemb},
+        results_dfs=results_dfs,
+        completed_steps=completed,
+    )
+
     print("\n=== Pipeline zakończony ===")
-    print(f"Raport: {output_dir / 'comparison_report.html'}")
+    print(f"Raport:          {output_dir / 'comparison_report.html'}")
+    print(f"Pipeline summary: {output_dir / 'pipeline_summary.json'}")
 
 
 if __name__ == "__main__":

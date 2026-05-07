@@ -1,0 +1,55 @@
+# Demo config — nadpisuje config.yaml dla szybkiego testu całego pipeline'u
+# Uruchomienie:
+#   python scripts/run_pipeline.py \
+#       --base-config configs/config_demo.yaml \
+#       --image-dir "Z:/Photo/Otolithes/HER/Processed" \
+#       --excel data/analysisWithOtolithPhoto.xlsx \
+#       --output-dir outputs/demo/ \
+#       --skip-scan
+
+model:
+  backbone: dinov2_vits14
+  use_metadata: false
+  target_type: ordinal
+  num_age_classes: 17
+  dropout: 0.1
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0           # bezpieczne dla Windows (multiprocessing)
+  metadata_cols: []
+
+training:
+  epochs: 1                # jedna epoka — tylko sprawdzamy czy pipeline działa
+  batch_size: 8
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: none          # nie potrzebny dla 1 epoki
+  freeze_backbone_epochs: 0
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+
+inference:
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 3          # mniej kart do wygenerowania
+    top_k_worst: 3
+    annotate_all: false
+
+interpretation:
+  method: patch_token_importance
+  top_k_patches: 20
+  heatmap_alpha: 0.5
+
+candidates:
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  profile_axis: vertical
