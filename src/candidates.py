@@ -30,21 +30,26 @@ from src.utils import resolve_device, tensor_to_uint8_rgb
 
 def extract_radial_profile(
     importance_grid: Union[Tensor, np.ndarray],
+    axis: str = "vertical",
 ) -> np.ndarray:
-    """Collapse 2D patch importance to a 1D radial profile.
+    """Collapse 2D patch importance to a 1D profile.
 
-    Takes the mean across rows (axis=0), yielding shape (W_p,).
-    Each element is the average importance at a given horizontal (radial) position.
+    axis='vertical'   → mean(axis=1) → shape (H_p,), profile along image height.
+    axis='horizontal' → mean(axis=0) → shape (W_p,), profile along image width.
+
+    Otolith images are vertical (longer axis = height), so 'vertical' is the default.
 
     Args:
         importance_grid: (H_p, W_p) Tensor or ndarray
+        axis: 'vertical' | 'horizontal'
 
     Returns:
-        profile: (W_p,) float32 ndarray
+        profile: (H_p,) or (W_p,) float32 ndarray
     """
-    if hasattr(importance_grid, "cpu"):            # Tensor
+    if hasattr(importance_grid, "cpu"):
         importance_grid = importance_grid.cpu().numpy()
-    return importance_grid.mean(axis=0).astype(np.float32)
+    collapse_axis = 1 if axis == "vertical" else 0
+    return importance_grid.mean(axis=collapse_axis).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +210,9 @@ def run_candidates(
     model.to(device)
     model.eval()
 
-    min_dist   = cfg.candidates.min_peak_distance
-    prominence = cfg.candidates.prominence_threshold
+    min_dist    = cfg.candidates.min_peak_distance
+    prominence  = cfg.candidates.prominence_threshold
+    profile_axis = cfg.candidates.profile_axis
     results: List[Dict] = []
 
     for batch in loader:
@@ -218,12 +224,21 @@ def run_candidates(
             image_id = image_ids[i]
             single   = images[i : i + 1]         # (1, 3, H, W)
 
-            importance   = compute_patch_importance(model, single)  # (H_p, W_p)
-            heatmap      = importance_to_heatmap(importance, H)     # (H, W) [0,1]
-            profile      = extract_radial_profile(importance)       # (W_p,)
-            peak_idx     = find_candidate_peaks(profile, min_dist, prominence)
-            num_patches_w = importance.shape[1]
-            peak_px      = peaks_to_pixel_positions(peak_idx, W, num_patches_w)
+            importance = compute_patch_importance(model, single)    # (H_p, W_p)
+            heatmap    = importance_to_heatmap(importance, H)       # (H, W) [0,1]
+            profile    = extract_radial_profile(importance, axis=profile_axis)
+
+            if profile_axis == "vertical":
+                # profile shape (H_p,) → y-pixel positions
+                num_patches  = importance.shape[0]
+                image_extent = H
+            else:
+                # profile shape (W_p,) → x-pixel positions
+                num_patches  = importance.shape[1]
+                image_extent = W
+
+            peak_idx = find_candidate_peaks(profile, min_dist, prominence)
+            peak_px  = peaks_to_pixel_positions(peak_idx, image_extent, num_patches)
             orig_rgb     = tensor_to_uint8_rgb(images[i])           # (H, W, 3) uint8
 
             stem         = Path(image_id).stem

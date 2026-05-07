@@ -64,11 +64,19 @@ class TrainingConfig(BaseModel):
     log_dir: str = "logs"
 
 
+class IncrementSamplesConfig(BaseModel):
+    top_k_best: int = Field(10, ge=1)
+    top_k_worst: int = Field(10, ge=1)
+    annotate_all: bool = False
+
+
 class InferenceConfig(BaseModel):
     output_dir: str = "outputs"
     save_heatmaps: bool = True
     save_overlays: bool = True
     save_candidates: bool = True
+    increment_samples: IncrementSamplesConfig = Field(
+        default_factory=IncrementSamplesConfig)
 
 
 class InterpretationConfig(BaseModel):
@@ -82,6 +90,7 @@ class InterpretationConfig(BaseModel):
 class CandidatesConfig(BaseModel):
     min_peak_distance: int = Field(5, ge=1)
     prominence_threshold: float = Field(0.1, ge=0.0)
+    profile_axis: Literal["vertical", "horizontal"] = "vertical"
 
 
 class OtolithConfig(BaseModel):

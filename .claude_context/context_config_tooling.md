@@ -78,7 +78,7 @@ Files indexed here: 11
 - kind: `data_model`
 - roles: config, data_model, ml_data
 - lines: 52
-- size_bytes: 1446
+- size_bytes: 1390
 - keywords:
   - model
   - test

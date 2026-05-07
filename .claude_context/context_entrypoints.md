@@ -1,6 +1,6 @@
 # Entrypoints and Manifests
 
-Files indexed here: 7
+Files indexed here: 8
 
 ## `.claude/settings.json`
 
@@ -40,7 +40,7 @@ Files indexed here: 7
 - kind: `data_model`
 - roles: config, data_model, ml_data
 - lines: 52
-- size_bytes: 1446
+- size_bytes: 1390
 - keywords:
   - model
   - test
@@ -79,6 +79,18 @@ Files indexed here: 7
   - run_claude_resume
   - save_state
   - smoke_test
+
+## `main.py`
+
+- kind: `ml_data`
+- roles: ml_data
+- lines: 12
+- size_bytes: 316
+- entrypoint hints:
+  - entrypoint filename
+  - python main guard
+- keywords:
+  - train
 
 ## `scripts/generate_report.py`
 
@@ -134,20 +146,26 @@ Files indexed here: 7
 
 - kind: `data_model`
 - roles: data_model, ml_data
-- lines: 103
-- size_bytes: 3287
+- lines: 191
+- size_bytes: 6985
 - framework hints:
   - jest/vitest
+  - pytorch
 - entrypoint hints:
   - python main guard
 - keywords:
+  - api
   - model
+  - test
   - config
+  - worker
   - file
   - map
   - train
   - predict
+  - dataset
 - symbols:
+  - _build_loaders
   - main
   - parse_args
   - print_config_summary

@@ -1,6 +1,6 @@
 # ML and Data Context
 
-Files indexed here: 28
+Files indexed here: 29
 
 ## `CLAUDE.md`
 
@@ -45,13 +45,25 @@ Files indexed here: 28
 - kind: `data_model`
 - roles: config, data_model, ml_data
 - lines: 52
-- size_bytes: 1446
+- size_bytes: 1390
 - keywords:
   - model
   - test
   - config
   - worker
   - map
+  - train
+
+## `main.py`
+
+- kind: `ml_data`
+- roles: ml_data
+- lines: 12
+- size_bytes: 316
+- entrypoint hints:
+  - entrypoint filename
+  - python main guard
+- keywords:
   - train
 
 ## `progress.md`
@@ -263,20 +275,26 @@ Files indexed here: 28
 
 - kind: `data_model`
 - roles: data_model, ml_data
-- lines: 103
-- size_bytes: 3287
+- lines: 191
+- size_bytes: 6985
 - framework hints:
   - jest/vitest
+  - pytorch
 - entrypoint hints:
   - python main guard
 - keywords:
+  - api
   - model
+  - test
   - config
+  - worker
   - file
   - map
   - train
   - predict
+  - dataset
 - symbols:
+  - _build_loaders
   - main
   - parse_args
   - print_config_summary
@@ -286,8 +304,8 @@ Files indexed here: 28
 
 - kind: `data_model`
 - roles: data_model, ml_data
-- lines: 124
-- size_bytes: 3998
+- lines: 127
+- size_bytes: 4146
 - framework hints:
   - pandas
   - pytorch
@@ -333,8 +351,8 @@ Files indexed here: 28
 
 - kind: `data_model`
 - roles: data_model, ml_data
-- lines: 128
-- size_bytes: 4398
+- lines: 144
+- size_bytes: 5137
 - framework hints:
   - pytorch
 - keywords:
@@ -391,8 +409,8 @@ Files indexed here: 28
 
 - kind: `data_model`
 - roles: data_model, ml_data
-- lines: 214
-- size_bytes: 7567
+- lines: 221
+- size_bytes: 7886
 - framework hints:
   - jest/vitest
   - pytorch

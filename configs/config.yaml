@@ -5,7 +5,7 @@ project:
 
 model:
   backbone: dinov2_vits14         # dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14
-  use_metadata: true
+  use_metadata: false
   target_type: ordinal            # regression | ordinal | count_aware
   num_age_classes: 17             # max observed age = 16 (real data)
   dropout: 0.1
@@ -41,6 +41,10 @@ inference:
   save_heatmaps: true
   save_overlays: true
   save_candidates: true
+  increment_samples:
+    top_k_best: 10
+    top_k_worst: 10
+    annotate_all: false
 
 interpretation:
   method: patch_token_importance  # patch_token_importance | attention_rollout | gradient_saliency
@@ -50,3 +54,4 @@ interpretation:
 candidates:
   min_peak_distance: 5            # min patch-distance between candidate increments
   prominence_threshold: 0.1
+  profile_axis: vertical          # vertical | horizontal (pionowe zdjęcia otolitów)

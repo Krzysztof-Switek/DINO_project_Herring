@@ -54,8 +54,8 @@ If task is unclear:
 
 ## Project summary
 
-- indexed files: 32
-- indexed source lines: 6363
+- indexed files: 33
+- indexed source lines: 6489
 - large files: 2
 
 ## Detected framework hints
@@ -79,6 +79,9 @@ If task is unclear:
 ## Likely entrypoints
 
 - `controller.py`
+  - python main guard
+- `main.py`
+  - entrypoint filename
   - python main guard
 - `scripts/generate_report.py`
   - python main guard

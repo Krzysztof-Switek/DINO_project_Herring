@@ -113,7 +113,8 @@ def test_radial_profile_shape():
 def test_radial_profile_shape_non_square():
     from src.candidates import extract_radial_profile
     grid = np.random.rand(3, 5).astype(np.float32)
-    profile = extract_radial_profile(grid)
+    # horizontal: mean(axis=0) → (W_p,) = (5,)
+    profile = extract_radial_profile(grid, axis="horizontal")
     assert profile.shape == (5,)
 
 
@@ -128,9 +129,12 @@ def test_radial_profile_accepts_tensor():
 def test_radial_profile_values_are_row_means():
     from src.candidates import extract_radial_profile
     grid = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
-    profile = extract_radial_profile(grid)
-    # col 0 mean = (1+3)/2 = 2.0, col 1 mean = (2+4)/2 = 3.0
-    np.testing.assert_allclose(profile, [2.0, 3.0])
+    # horizontal axis: col means: col0=(1+3)/2=2.0, col1=(2+4)/2=3.0
+    profile_h = extract_radial_profile(grid, axis="horizontal")
+    np.testing.assert_allclose(profile_h, [2.0, 3.0])
+    # vertical axis: row means: row0=(1+2)/2=1.5, row1=(3+4)/2=3.5
+    profile_v = extract_radial_profile(grid, axis="vertical")
+    np.testing.assert_allclose(profile_v, [1.5, 3.5])
 
 
 def test_radial_profile_dtype():
@@ -138,6 +142,30 @@ def test_radial_profile_dtype():
     grid = np.ones((4, 4), dtype=np.float64)
     profile = extract_radial_profile(grid)
     assert profile.dtype == np.float32
+
+
+def test_vertical_profile_shape():
+    from src.candidates import extract_radial_profile
+    grid = np.random.rand(4, 8).astype(np.float32)
+    profile = extract_radial_profile(grid, axis="vertical")
+    assert profile.shape == (4,)
+
+
+def test_horizontal_profile_shape():
+    from src.candidates import extract_radial_profile
+    grid = np.random.rand(4, 8).astype(np.float32)
+    profile = extract_radial_profile(grid, axis="horizontal")
+    assert profile.shape == (8,)
+
+
+def test_pixel_positions_vertical():
+    from src.candidates import peaks_to_pixel_positions
+    image_height = 56
+    num_patches_h = 4
+    indices = np.arange(num_patches_h)
+    pos = peaks_to_pixel_positions(indices, image_height, num_patches_h)
+    assert (pos >= 0).all()
+    assert (pos < image_height).all()
 
 
 # ---------------------------------------------------------------------------

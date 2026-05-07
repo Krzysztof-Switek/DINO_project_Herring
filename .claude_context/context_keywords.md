@@ -4,6 +4,7 @@ Use this file when the task is described by a feature name.
 
 ## api
 - `src/dataset.py`
+- `src/entrypoint.py`
 - `tools/build_project_context.py`
 
 ## cache
@@ -45,6 +46,7 @@ Use this file when the task is described by a feature name.
 - `progress.md`
 - `scripts/smoke_test.py`
 - `src/dataset.py`
+- `src/entrypoint.py`
 - `src/inference.py`
 - `src/trainer.py`
 - `tests/test_stage2_dataset.py`
@@ -228,6 +230,7 @@ Use this file when the task is described by a feature name.
 - `scripts/prepare_labels.py`
 - `scripts/smoke_test.py`
 - `src/config.py`
+- `src/entrypoint.py`
 - `src/inference.py`
 - `src/model.py`
 - `src/report.py`
@@ -247,6 +250,7 @@ Use this file when the task is described by a feature name.
 ## train
 - `CLAUDE.md`
 - `configs/config.yaml`
+- `main.py`
 - `progress.md`
 - `scripts/generate_report.py`
 - `scripts/prepare_labels.py`
@@ -274,5 +278,6 @@ Use this file when the task is described by a feature name.
 - `configs/config.yaml`
 - `scripts/smoke_test.py`
 - `src/config.py`
+- `src/entrypoint.py`
 - `tests/test_stage8_end_to_end.py`
 

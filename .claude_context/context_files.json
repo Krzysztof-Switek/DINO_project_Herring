@@ -104,7 +104,7 @@
     "path": "configs/config.yaml",
     "suffix": ".yaml",
     "lines": 52,
-    "size_bytes": 1446,
+    "size_bytes": 1390,
     "kind": "data_model",
     "roles": [
       "config",
@@ -177,6 +177,33 @@
       "task",
       "file",
       "state"
+    ],
+    "warnings": []
+  },
+  {
+    "path": "main.py",
+    "suffix": ".py",
+    "lines": 12,
+    "size_bytes": 316,
+    "kind": "ml_data",
+    "roles": [
+      "ml_data"
+    ],
+    "imports": [
+      "src.entrypoint"
+    ],
+    "local_imports": [],
+    "exports": [],
+    "symbols": [],
+    "routes": [],
+    "entrypoint_hints": [
+      "entrypoint filename",
+      "python main guard"
+    ],
+    "data_access_hints": [],
+    "framework_hints": [],
+    "keywords": [
+      "train"
     ],
     "warnings": []
   },
@@ -598,8 +625,8 @@
   {
     "path": "src/entrypoint.py",
     "suffix": ".py",
-    "lines": 103,
-    "size_bytes": 3287,
+    "lines": 191,
+    "size_bytes": 6985,
     "kind": "data_model",
     "roles": [
       "data_model",
@@ -608,15 +635,22 @@
     "imports": [
       "__future__",
       "argparse",
-      "json",
       "pathlib",
+      "src.candidates",
       "src.config",
+      "src.dataset",
+      "src.inference",
+      "src.interpretation",
+      "src.model",
       "src.report",
-      "sys"
+      "src.trainer",
+      "sys",
+      "torch.utils.data"
     ],
     "local_imports": [],
     "exports": [],
     "symbols": [
+      "_build_loaders",
       "main",
       "parse_args",
       "print_config_summary",
@@ -628,23 +662,28 @@
     ],
     "data_access_hints": [],
     "framework_hints": [
-      "jest/vitest"
+      "jest/vitest",
+      "pytorch"
     ],
     "keywords": [
+      "api",
       "model",
+      "test",
       "config",
+      "worker",
       "file",
       "map",
       "train",
-      "predict"
+      "predict",
+      "dataset"
     ],
     "warnings": []
   },
   {
     "path": "src/inference.py",
     "suffix": ".py",
-    "lines": 124,
-    "size_bytes": 3998,
+    "lines": 127,
+    "size_bytes": 4146,
     "kind": "data_model",
     "roles": [
       "data_model",
@@ -744,8 +783,8 @@
   {
     "path": "src/model.py",
     "suffix": ".py",
-    "lines": 128,
-    "size_bytes": 4398,
+    "lines": 144,
+    "size_bytes": 5137,
     "kind": "data_model",
     "roles": [
       "data_model",
@@ -853,8 +892,8 @@
   {
     "path": "src/trainer.py",
     "suffix": ".py",
-    "lines": 214,
-    "size_bytes": 7567,
+    "lines": 221,
+    "size_bytes": 7886,
     "kind": "data_model",
     "roles": [
       "data_model",

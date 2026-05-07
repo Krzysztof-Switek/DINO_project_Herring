@@ -1,0 +1,10 @@
+data:
+  labels_csv: data/labels_not_embedded.csv
+  image_dir: "Z:/Photo/Otolithes/HER/Processed"
+
+training:
+  checkpoint_dir: checkpoints/not_embedded
+  log_dir: logs/not_embedded
+
+inference:
+  output_dir: outputs/notemb_on_notemb
