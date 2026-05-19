@@ -53,3 +53,10 @@ candidates:
   min_peak_distance: 5
   prominence_threshold: 0.1
   profile_axis: vertical
+
+demo:
+  enabled: true            # limity działają w OtolithDataset — cały pipeline od razu
+                           # pracuje na małej próbce (train/val/test/inferencja/cards/raport)
+  max_train_samples: 12    # kilkanaście obrazów wystarczy żeby trener zaliczył 1 epokę
+  max_val_samples: 4
+  max_test_samples: 4      # 4 × 4 warunki = 16 predykcji + segmentacja masek

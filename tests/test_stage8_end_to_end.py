@@ -138,9 +138,9 @@ def test_full_pipeline(tmp_path):
     # Backbone should be unfrozen after training (freeze_backbone_epochs=1 < epochs=2)
     assert not model.backbone_is_frozen()
 
-    # Two checkpoint files must exist
+    # Two per-epoch checkpoint files must exist (plus best.pt from early stopping logic)
     ckpt_dir = Path(cfg.training.checkpoint_dir)
-    ckpt_files = sorted(ckpt_dir.glob("*.pt"))
+    ckpt_files = sorted(ckpt_dir.glob("checkpoint_epoch*.pt"))
     assert len(ckpt_files) == 2, f"Expected 2 checkpoints, got {len(ckpt_files)}"
 
     # ------------------------------------------------------------------
@@ -205,7 +205,7 @@ def test_full_pipeline(tmp_path):
         assert ov_path.exists(),   f"Candidates overlay missing: {ov_path}"
 
         data = json.loads(json_path.read_text(encoding="utf-8"))
-        for key in ("image_id", "num_candidates", "peak_pixel_positions", "radial_profile"):
+        for key in ("image_id", "num_candidates", "peak_profile_indices", "radial_profile"):
             assert key in data, f"Candidates JSON missing key '{key}'"
-        assert isinstance(data["peak_pixel_positions"], list)
+        assert isinstance(data["peak_profile_indices"], list)
         assert isinstance(data["radial_profile"],       list)

@@ -166,6 +166,35 @@ def test_pipeline_state_file(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# test_reload_cards_from_disk
+# ---------------------------------------------------------------------------
+
+def test_reload_cards_from_disk(tmp_path):
+    """_reload_cards_from_disk should reconstruct {best, worst} from PNGs on disk
+       so that idempotent re-runs of the pipeline don't drop section E content."""
+    from scripts.run_pipeline import _reload_cards_from_disk
+
+    # Empty output dir → empty dict (graceful)
+    out = tmp_path / "out"
+    out.mkdir()
+    cards = _reload_cards_from_disk(out)
+    assert cards == {"best": [], "worst": []}
+
+    # Layout: out/cards/<cond>/{best,worst}/*.png
+    for cond in ("emb_on_emb", "notemb_on_notemb"):
+        for label, n in [("best", 2), ("worst", 1)]:
+            d = out / "cards" / cond / label
+            d.mkdir(parents=True)
+            for i in range(n):
+                (d / f"{label}_img{i}_card.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    cards = _reload_cards_from_disk(out)
+    # 2 conds × 2 best = 4; 2 conds × 1 worst = 2
+    assert len(cards["best"]) == 4
+    assert len(cards["worst"]) == 2
+    assert all(p.suffix == ".png" for p in cards["best"])
+
+
+# ---------------------------------------------------------------------------
 # test_skip_scan_flag
 # ---------------------------------------------------------------------------
 

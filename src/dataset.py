@@ -139,7 +139,32 @@ class OtolithDataset(Dataset):
                     self._pop_map[key] = len(self._pop_map) + 1
 
         self.df = full_df[full_df["split"] == split].reset_index(drop=True)
+        self.df = self._maybe_demo_subsample(self.df, split)
         self.transform = transform or build_transforms(cfg.data.image_size, split)
+
+    # ------------------------------------------------------------------
+    # Demo mode — limit dataset right at the source
+    # ------------------------------------------------------------------
+
+    def _maybe_demo_subsample(self, df: pd.DataFrame, split: str) -> pd.DataFrame:
+        """Limit dataset to cfg.demo.max_{split}_samples when demo mode is on.
+
+        Sampling is deterministic (uses cfg.project.seed) so re-runs and the
+        4 cross-condition inference passes see a consistent subset.
+        """
+        demo = getattr(self.cfg, "demo", None)
+        if demo is None or not getattr(demo, "enabled", False):
+            return df
+        limit_map = {
+            "train": demo.max_train_samples,
+            "val":   demo.max_val_samples,
+            "test":  demo.max_test_samples,
+        }
+        limit = limit_map.get(split)
+        if limit is None or len(df) <= limit:
+            return df
+        seed = getattr(self.cfg.project, "seed", 42)
+        return df.sample(n=limit, random_state=seed).reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # Internal validation

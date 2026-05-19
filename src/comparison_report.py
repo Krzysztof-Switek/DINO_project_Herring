@@ -320,12 +320,63 @@ def _section_d(results: dict) -> str:
 </table>
 <p><b>Emb model cross:</b> {comment_e}</p>
 <p><b>NotEmb model cross:</b> {comment_n}</p>
+<p style="font-size:90%;color:#444;margin-top:1em;">
+  <b>Mapy uwagi modelu</b> (w katalogach <code>heatmaps/</code> i <code>overlays/</code>
+  każdej kondycji): kolormap <i>inferno</i> — ciemne = niski sygnał, jasno-żółte =
+  wysoki sygnał. <code>heatmaps/</code> = czysta mapa ważności w rozdzielczości
+  oryginału, <code>overlays/</code> = ta sama mapa zblendowana z oryginalnym
+  zdjęciem (α=0.55) <i>wewnątrz sylwetki otolitu</i>; poza otolitem pokazujemy
+  surowe zdjęcie, żeby tło nie generowało fałszywych „gorących punktów”.
+</p>
 </section>
 """
 
 
 def _section_e(increment_cards: dict) -> str:
-    html = '<section id="E"><h2>E. Karty przyrostów</h2>'
+    html = '<section id="E"><h2>E. Karty rozumowania modelu</h2>'
+    html += """
+<p>Każda karta pokazuje 6 etapów dochodzenia modelu do werdyktu wiekowego
+(od surowego zdjęcia do liczby pierścieni). Wszystkie panele renderowane są
+na zdjęciu w oryginalnej rozdzielczości — żółta linia to <i>oś biologiczna</i>
+od jądra (centroid) do najdalszej krawędzi konturu (zwykle post-rostralnej):</p>
+<ol>
+  <li><b>Surowe zdjęcie</b> — wejście do modelu, bez żadnych anotacji.</li>
+  <li><b>Segmentacja otolitu</b> — cyjanowy kontur, niebieski krzyżyk = jądro
+      (klasyczne CV, niezależnie od modelu). Tu sprawdzasz, czy segmentacja w
+      ogóle złapała otolit; jeśli nie, panele 4/5/6 pokażą placeholder
+      „Segmentacja nieudana”.</li>
+  <li><b>Mapa uwagi modelu</b> — kolormap <i>inferno</i> wewnątrz otolitu:
+      ciemne = niski sygnał, jasno-żółte = wysoki sygnał. Wartość = norma L2
+      tokenów DINOv2 (heurystyka — model w obecnej wersji nie jest jeszcze
+      trenowany do bezpośredniej lokalizacji przyrostów).</li>
+  <li><b>Oś pomiaru + profil 1D</b> — żółta oś biologiczna na zdjęciu, a w
+      <b>prawym górnym rogu mała wstawka 1D</b> z profilem ważności wzdłuż tej
+      osi. Wstawkę czyta się od góry: oś pionowa = pozycja na osi (góra = jądro,
+      dół = brzeg), oś pozioma = wartość ważności. <i>Czerwone kropki + przerywane
+      poziome linie</i> w tej wstawce = wykryte peaki profilu (kandydaci na
+      przyrosty roczne).</li>
+  <li><b>Strefy roczne</b> — obszary <i>między kolejnymi peakami</i>, każdy w
+      innym kolorze (czerwony / niebieski / zielony / fioletowy …). Tu widać
+      <i>jak duży obszar otolitu</i> model przypisuje każdemu rocznemu
+      przyrostowi. <b>Jeśli model nie wykrył ani jednego peaku, cały otolit
+      jest zalany jednym kolorem</b> — to nie jest brakujący render, to
+      sygnał, że profil 1D był płaski.</li>
+  <li><b>Werdykt</b> — końcowa anotacja: żółta oś + <i>ponumerowane żółte
+      kropki</i> w pozycjach peaków + przewidziany wiek (zielona ramka = trafny,
+      czerwona = błąd). <b>Brak ponumerowanych kropek na osi = peak-detector
+      zwrócił pustą listę</b> (zob. uwaga niżej).</li>
+</ol>
+<p style="font-size:90%;color:#666;background:#f8f8f0;padding:8px;border-left:3px solid #c8b400;">
+  <b>Dlaczego niektóre karty mają puste panele 4/5/6?</b><br>
+  Peaki w profilu 1D wykrywa <code>scipy.signal.find_peaks</code> z progiem
+  prominencji <code>0.1</code>. Gdy model jest jeszcze niewytrenowany
+  (np. po 1 epoce w trybie <code>demo</code>, na kilkunastu obrazach), mapa
+  ważności DINOv2 jest praktycznie jednorodnym szumem, profil wzdłuż osi jest
+  płaski i detector zwraca pustą tablicę. <b>To zachowanie oczekiwane,
+  nie błąd</b> — peaki, strefy i ponumerowane kropki pojawią się dopiero
+  po pełnym treningu (<code>config.yaml</code>, 50 epok na model).
+</p>
+"""
     for label, paths in increment_cards.items():
         html += f"<h3>{label.capitalize()}</h3>"
         for p in paths:

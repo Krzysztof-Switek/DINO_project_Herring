@@ -58,7 +58,10 @@ def parse_filename(name: str) -> dict | None:
         return None
 
     neutral_fish_key = f"{parts[0]}_{parts[1]}_{parts[2]}_{parts[3]}_{parts[6]}"
-    side = parts[8] if parts[8].lower() in {"left", "right"} else None
+    side_token = parts[8].lower()
+    if side_token == "wrong":
+        return None                     # explicitly rejected image — skip
+    side = parts[8] if side_token in {"left", "right"} else None
 
     return {
         "image_id": name,

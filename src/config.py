@@ -20,6 +20,12 @@ class ModelConfig(BaseModel):
     target_type: Literal["regression", "ordinal", "count_aware"] = "ordinal"
     num_age_classes: int = Field(20, ge=2, le=100)
     dropout: float = Field(0.1, ge=0.0, lt=1.0)
+    # MIL weakly supervised localisation head
+    head_type: Literal["coral", "mil", "both"] = "both"
+    mil_count_weight:    float = Field(1.0,  ge=0.0)
+    mil_sparsity_weight: float = Field(0.01, ge=0.0)
+    mil_hidden_dim:      int   = Field(64,   ge=1)
+    coral_loss_weight:   float = Field(0.5,  ge=0.0)
 
 
 class DataConfig(BaseModel):
@@ -59,6 +65,9 @@ class TrainingConfig(BaseModel):
     weight_decay: float = Field(1e-4, ge=0.0)
     scheduler: Literal["cosine", "step", "none"] = "cosine"
     freeze_backbone_epochs: int = Field(5, ge=0)
+    early_stopping_patience: int = Field(10, ge=0)
+    early_stopping_metric: Literal["val_mae", "val_loss"] = "val_mae"
+    early_stopping_min_delta: float = Field(0.001, ge=0.0)
     device: str = "auto"
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
@@ -93,6 +102,20 @@ class CandidatesConfig(BaseModel):
     profile_axis: Literal["vertical", "horizontal"] = "vertical"
 
 
+class DemoConfig(BaseModel):
+    """Demo mode — szybki test końcowy pipeline na ograniczonej próbce.
+
+    Limity działają na poziomie OtolithDataset (po filtrze split), więc
+    cały dalszy pipeline (train / val / inferencja / interpretacja / cards /
+    raport) od razu pracuje na małej liczbie próbek.
+    Tryb wyłączony (enabled=False) = brak jakichkolwiek ograniczeń.
+    """
+    enabled: bool = False
+    max_train_samples: Optional[int] = Field(None, ge=1)
+    max_val_samples:   Optional[int] = Field(None, ge=1)
+    max_test_samples:  Optional[int] = Field(None, ge=1)
+
+
 class OtolithConfig(BaseModel):
     project: ProjectConfig = Field(default_factory=ProjectConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
@@ -101,6 +124,7 @@ class OtolithConfig(BaseModel):
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     interpretation: InterpretationConfig = Field(default_factory=InterpretationConfig)
     candidates: CandidatesConfig = Field(default_factory=CandidatesConfig)
+    demo: DemoConfig = Field(default_factory=DemoConfig)
 
 
 def load_config(path: str | Path) -> OtolithConfig:

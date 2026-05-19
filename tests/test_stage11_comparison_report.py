@@ -121,3 +121,35 @@ def test_report_has_all_sections(tmp_path):
     # All section anchors must be present
     for section_id in ["A", "B", "C", "D", "E", "F"]:
         assert f'id="{section_id}"' in content, f"Section {section_id} missing from HTML"
+
+
+# ---------------------------------------------------------------------------
+# test_section_e_has_reasoning_card_caption
+# ---------------------------------------------------------------------------
+
+def test_section_e_has_reasoning_card_caption(tmp_path):
+    """Section E must include the 6-step reasoning caption (ordered list)."""
+    from src.comparison_report import build_comparison_report
+    out = tmp_path / "report.html"
+    build_comparison_report(
+        results={k: _make_predictions() for k in
+                 ["emb_on_emb", "notemb_on_notemb", "emb_on_notemb", "notemb_on_emb"]},
+        training_logs={},
+        increment_cards={"best": [], "worst": []},
+        dataset_stats={"counts": {}, "orphan_count": 0, "age_distributions": {}},
+        output_path=out,
+    )
+    content = out.read_text(encoding="utf-8")
+    assert "Karty rozumowania" in content
+    assert "<ol>" in content
+    assert "Surowe zdjęcie" in content
+    assert "Strefy roczne" in content
+    # Section D caption about heatmaps/overlays distinction
+    assert "inferno" in content.lower()
+    assert "overlays" in content
+    # Doprecyzowanie opisu (post-fix sekcji E):
+    # — panel 4: jasno wskazana wstawka 1D w rogu zdjęcia
+    assert "wstawka" in content.lower()
+    # — panele 5/6 i adnotacja: brak peaków w demo to oczekiwane zachowanie
+    assert "oczekiwane" in content.lower()
+    assert "find_peaks" in content

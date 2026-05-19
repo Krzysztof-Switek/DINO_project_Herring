@@ -1,55 +1,83 @@
-"""Candidate increment markers via 1D radial importance profile and peak detection.
+"""Candidate increment markers using the biological measurement axis.
+
+Visualisation:
+  - Original-resolution image (not the scaled 518×518 model input)
+  - Measurement axis: from segmented otolith centroid (≈ nucleus) to the
+    farthest contour edge — the post-rostral tip / longest radius
+    (see ``src/otolith_axis.py`` for the segmentation pipeline)
+  - Filled dots on this axis at importance-profile peaks = candidate annual rings
+
+If segmentation fails for an image, we fall back to a vertical line through
+the image centre (the previous behaviour) so the pipeline never breaks.
 
 Caveats:
-  - Candidate peaks are regions of high patch importance, NOT confirmed annuli.
-  - Results are backbone-dependent and not biologically validated.
-  - Peak detection parameters (min_distance, prominence) are heuristic.
+  - Peaks reflect DINOv2 patch activation, not confirmed annuli
+  - For the current CORAL-only architecture, patch importance is the L2 norm of
+    patch tokens — a heuristic, not a directly supervised localisation signal
+  - The MIL architecture (planned, see plan file) will replace L2 norm with
+    directly-trained patch probabilities
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import cv2
 import numpy as np
 from PIL import Image as PILImage
 from scipy.signal import find_peaks
-from torch import Tensor
 from torch.utils.data import DataLoader
 
 from src.config import OtolithConfig
-from src.interpretation import compute_patch_importance, importance_to_heatmap
+from src.interpretation import compute_patch_importance
 from src.model import OtolithModel
+from src.otolith_axis import (
+    detect_axis,
+    find_centroid,
+    find_farthest_edge,
+    load_mask,
+    sample_profile_along_axis,
+    save_mask,
+)
 from src.utils import resolve_device, tensor_to_uint8_rgb
 
 
 # ---------------------------------------------------------------------------
-# Radial profile
+# Fallback profile (when segmentation fails) — vertical centre column, bottom half
 # ---------------------------------------------------------------------------
 
+def _fallback_axis(image_h: int, image_w: int) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Vertical line from image centre to bottom edge."""
+    cx, cy = image_w // 2, image_h // 2
+    return (cx, cy), (cx, image_h - 1)
+
+
 def extract_radial_profile(
-    importance_grid: Union[Tensor, np.ndarray],
+    importance_grid: Union["torch.Tensor", np.ndarray],
     axis: str = "vertical",
 ) -> np.ndarray:
-    """Collapse 2D patch importance to a 1D profile.
+    """Legacy fallback profile — centre column, bottom half.
 
-    axis='vertical'   → mean(axis=1) → shape (H_p,), profile along image height.
-    axis='horizontal' → mean(axis=0) → shape (W_p,), profile along image width.
-
-    Otolith images are vertical (longer axis = height), so 'vertical' is the default.
-
-    Args:
-        importance_grid: (H_p, W_p) Tensor or ndarray
-        axis: 'vertical' | 'horizontal'
-
-    Returns:
-        profile: (H_p,) or (W_p,) float32 ndarray
+    Kept for backwards compatibility. The biological-axis profile is now
+    computed via ``otolith_axis.sample_profile_along_axis``.
     """
     if hasattr(importance_grid, "cpu"):
         importance_grid = importance_grid.cpu().numpy()
-    collapse_axis = 1 if axis == "vertical" else 0
-    return importance_grid.mean(axis=collapse_axis).astype(np.float32)
+    importance_grid = np.asarray(importance_grid, dtype=np.float32)
+    H_p, W_p = importance_grid.shape
+
+    if axis == "vertical":
+        col = W_p // 2
+        col_s = max(0, col - 1)
+        col_e = min(W_p, col + 2)
+        full_col = importance_grid[:, col_s:col_e].mean(axis=1)
+        return full_col[H_p // 2:].astype(np.float32)
+    row = H_p // 2
+    row_s = max(0, row - 1)
+    row_e = min(H_p, row + 2)
+    full_row = importance_grid[row_s:row_e, :].mean(axis=0)
+    return full_row[W_p // 2:].astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -63,13 +91,7 @@ def find_candidate_peaks(
 ) -> np.ndarray:
     """Detect local maxima in a 1D importance profile.
 
-    Args:
-        profile:              1D float32 array (radial importance profile)
-        min_distance:         minimum sample-distance between returned peaks
-        prominence_threshold: minimum prominence of a valid peak
-
-    Returns:
-        peaks: 1D int64 array of peak indices (may be empty)
+    Returns int64 array of peak indices into ``profile``.
     """
     peaks, _ = find_peaks(
         profile,
@@ -80,98 +102,91 @@ def find_candidate_peaks(
 
 
 # ---------------------------------------------------------------------------
-# Coordinate conversion
-# ---------------------------------------------------------------------------
-
-def peaks_to_pixel_positions(
-    peak_indices: np.ndarray,
-    image_size: int,
-    num_patches: int,
-) -> np.ndarray:
-    """Convert patch-grid peak indices to pixel x-coordinates.
-
-    Each peak is placed at the centre of its patch.
-
-    Args:
-        peak_indices: 1D int array of indices into the radial profile (0..W_p-1)
-        image_size:   image width in pixels
-        num_patches:  number of patches along the horizontal axis (W_p)
-
-    Returns:
-        pixel_positions: 1D int64 array of x-coordinates (0..image_size-1)
-    """
-    if len(peak_indices) == 0:
-        return np.array([], dtype=np.int64)
-    patch_width = image_size / num_patches
-    return ((peak_indices + 0.5) * patch_width).astype(np.int64)
-
-
-# ---------------------------------------------------------------------------
-# Saving helpers
+# JSON / overlay saving
 # ---------------------------------------------------------------------------
 
 def save_candidates_json(
     image_id: str,
-    peak_positions: np.ndarray,
+    peak_profile_indices: np.ndarray,
     profile: np.ndarray,
     path: str | Path,
+    axis_info: Optional[dict] = None,
 ) -> None:
-    """Save candidate increment markers to JSON.
-
-    Saved fields:
-        image_id, num_candidates, peak_pixel_positions, radial_profile
-
-    Note: peak_pixel_positions are candidates only — NOT confirmed annuli.
-    """
+    """Save candidate increment positions + axis metadata to JSON."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {
-        "image_id": image_id,
-        "num_candidates": int(len(peak_positions)),
-        "peak_pixel_positions": [int(x) for x in peak_positions],
-        "radial_profile": [float(v) for v in profile],
+    data: dict = {
+        "image_id":             image_id,
+        "num_candidates":       int(len(peak_profile_indices)),
+        "peak_profile_indices": [int(i) for i in peak_profile_indices],
+        "radial_profile":       [float(v) for v in profile],
     }
+    if axis_info is not None:
+        data["axis"] = {
+            "centroid":  [int(axis_info["centroid"][0]), int(axis_info["centroid"][1])],
+            "far_edge":  [int(axis_info["far_edge"][0]), int(axis_info["far_edge"][1])],
+            "length_px": float(axis_info["length_px"]),
+            "method":    "centroid_to_farthest",
+        }
+    else:
+        data["axis"] = {"method": "fallback_vertical_centre"}
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def save_candidates_overlay(
     original_image: np.ndarray,
-    peak_positions: np.ndarray,
-    heatmap: np.ndarray,
+    peak_profile_indices: np.ndarray,
+    line_xy: np.ndarray,
     path: str | Path,
-    alpha: float = 0.5,
-    line_color: tuple = (255, 0, 0),
-    line_thickness: int = 2,
+    axis_info: Optional[dict] = None,
+    contour_color:  tuple = (0,   255, 255),   # cyan
+    centroid_color: tuple = (0,   100, 255),   # blue
+    axis_color:     tuple = (255, 220, 0),     # yellow
+    dot_color:      tuple = (220, 30,  30),    # red
+    dot_radius:     Optional[int] = None,
+    line_thickness: Optional[int] = None,
 ) -> None:
-    """Blend heatmap over original image and mark candidate peaks with vertical lines.
+    """Draw the otolith contour, measurement axis and increment dots.
 
     Args:
-        original_image: (H, W, 3) uint8 RGB
-        peak_positions: 1D int array of x pixel positions
-        heatmap:        (H, W) float32 in [0, 1]
-        path:           output file path
-        alpha:          heatmap opacity
-        line_color:     RGB colour for peak marker lines (default: red)
-        line_thickness: line width in pixels
+        original_image       : (H, W, 3) uint8 RGB — full-resolution photo
+        peak_profile_indices : indices into the sampled profile (= indices into line_xy)
+        line_xy              : (n_samples, 2) int — pixel coords sampled along the axis
+        axis_info            : dict from detect_axis(); None ⇒ fallback overlay
+        ... colours and sizes auto-scale with image height when not provided
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Blend JET heatmap over original
-    uint8_map = (heatmap * 255).clip(0, 255).astype(np.uint8)
-    bgr = cv2.applyColorMap(uint8_map, cv2.COLORMAP_JET)
-    rgb_map = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
-    blended = (alpha * rgb_map + (1.0 - alpha) * original_image.astype(np.float32))
-    blended = blended.clip(0, 255).astype(np.uint8)
+    img = original_image.copy()
+    H = img.shape[0]
+    r  = dot_radius     if dot_radius     is not None else max(8, H // 60)
+    lw = line_thickness if line_thickness is not None else max(2, H // 250)
 
-    # Draw vertical line at each candidate position
-    H = blended.shape[0]
-    for x in peak_positions:
-        x_int = int(x)
-        if 0 <= x_int < blended.shape[1]:
-            cv2.line(blended, (x_int, 0), (x_int, H - 1), line_color, line_thickness)
+    if axis_info is not None:
+        # 1. Otolith contour
+        cv2.drawContours(img, [axis_info["contour"]], -1, contour_color, lw)
+        cx, cy = axis_info["centroid"]
+        fx, fy = axis_info["far_edge"]
+        # 2. Centroid cross
+        cross = max(8, H // 80)
+        cv2.line(img, (cx - cross, cy), (cx + cross, cy), centroid_color, lw)
+        cv2.line(img, (cx, cy - cross), (cx, cy + cross), centroid_color, lw)
+        # 3. Axis line (centroid → far edge)
+        cv2.line(img, (cx, cy), (fx, fy), axis_color, lw)
+    else:
+        # Fallback overlay — vertical line from centre to bottom edge
+        cx, cy = img.shape[1] // 2, img.shape[0] // 2
+        cv2.line(img, (cx, cy), (cx, img.shape[0] - 1), axis_color, lw)
 
-    PILImage.fromarray(blended, mode="RGB").save(path)
+    # 4. Increment dots at peak positions on the axis
+    for idx in peak_profile_indices:
+        k = int(idx)
+        if 0 <= k < len(line_xy):
+            x, y = int(line_xy[k][0]), int(line_xy[k][1])
+            cv2.circle(img, (x, y), r, dot_color, -1)
+
+    PILImage.fromarray(img, mode="RGB").save(path)
 
 
 # ---------------------------------------------------------------------------
@@ -183,79 +198,113 @@ def run_candidates(
     model: OtolithModel,
     loader: DataLoader,
     output_dir: str | Path,
+    image_dir: Optional[Path] = None,
 ) -> List[Dict]:
-    """Detect candidate increment markers for all samples in loader.
+    """Detect candidate increments along the biological axis for every sample.
 
-    For each sample:
-      1. Compute patch importance grid
-      2. Extract 1D radial profile (mean across rows)
-      3. Detect candidate peaks (scipy.signal.find_peaks)
-      4. Save markers JSON and annotated overlay PNG
+    Outputs per image:
+        output_dir/masks/<stem>_mask.png                  — cached binary mask
+        output_dir/candidates/<stem>_candidates.json      — peaks + axis metadata
+        output_dir/candidates_overlays/<stem>_*.png       — annotated overlay
 
-    Returns list of dicts with keys:
-        image_id, num_candidates, candidate_markers_path, candidates_overlay_path
-
-    Caveats:
-        - Peaks reflect patch activation patterns, not biological annuli.
-        - No spatial normalisation — results are backbone- and input-dependent.
-        - Prominence/distance thresholds are global; otolith shape is ignored.
+    Masks are cached on disk; subsequent runs re-use them (segmentation is the
+    most expensive step). Delete the masks/ directory to force re-segmentation.
     """
-    output_dir = Path(output_dir)
+    output_dir  = Path(output_dir)
+    mask_dir    = output_dir / "masks"
     json_dir    = output_dir / "candidates"
     overlay_dir = output_dir / "candidates_overlays"
-    json_dir.mkdir(parents=True, exist_ok=True)
-    overlay_dir.mkdir(parents=True, exist_ok=True)
+    for d in (mask_dir, json_dir, overlay_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
     device = resolve_device(cfg.training.device)
     model.to(device)
     model.eval()
 
-    min_dist    = cfg.candidates.min_peak_distance
-    prominence  = cfg.candidates.prominence_threshold
-    profile_axis = cfg.candidates.profile_axis
+    min_dist   = cfg.candidates.min_peak_distance
+    prominence = cfg.candidates.prominence_threshold
+    n_samples_axis = 50          # profile samples along the (cx,cy)→(fx,fy) line
     results: List[Dict] = []
 
     for batch in loader:
-        images    = batch["image"].to(device)    # (B, 3, H, W)
+        images    = batch["image"].to(device)
         image_ids = batch["image_id"]
-        B, C, H, W = images.shape
+        B = images.shape[0]
 
         for i in range(B):
             image_id = image_ids[i]
-            single   = images[i : i + 1]         # (1, 3, H, W)
+            single   = images[i : i + 1]
 
-            importance = compute_patch_importance(model, single)    # (H_p, W_p)
-            heatmap    = importance_to_heatmap(importance, H)       # (H, W) [0,1]
-            profile    = extract_radial_profile(importance, axis=profile_axis)
+            importance = compute_patch_importance(model, single)
+            imp_np = importance.cpu().numpy() if hasattr(importance, "cpu") else np.asarray(importance)
 
-            if profile_axis == "vertical":
-                # profile shape (H_p,) → y-pixel positions
-                num_patches  = importance.shape[0]
-                image_extent = H
+            # --- Load original ----
+            orig_rgb: Optional[np.ndarray] = None
+            if image_dir is not None:
+                img_path = Path(image_dir) / image_id
+                if img_path.exists():
+                    try:
+                        orig_rgb = np.array(PILImage.open(img_path).convert("RGB"))
+                    except Exception:
+                        orig_rgb = None
+            if orig_rgb is None:
+                orig_rgb = tensor_to_uint8_rgb(images[i])
+            orig_h, orig_w = orig_rgb.shape[:2]
+
+            stem      = Path(image_id).stem
+            mask_path = mask_dir / f"{stem}_mask.png"
+
+            # --- Resolve axis: try cached mask, else segment ---
+            axis_info: Optional[dict] = None
+            cached = load_mask(mask_path)
+            if cached is not None:
+                cent = find_centroid(cached)
+                far  = find_farthest_edge(cached, cent) if cent else None
+                if cent and far:
+                    contours, _ = cv2.findContours(cached, cv2.RETR_EXTERNAL,
+                                                   cv2.CHAIN_APPROX_NONE)
+                    if contours:
+                        contour = max(contours, key=cv2.contourArea)
+                        axis_info = {
+                            "mask":      cached,
+                            "centroid":  cent,
+                            "far_edge":  far,
+                            "contour":   contour,
+                            "length_px": float(np.hypot(far[0] - cent[0], far[1] - cent[1])),
+                        }
+            if axis_info is None:
+                axis_info = detect_axis(orig_rgb)
+                if axis_info is not None:
+                    save_mask(axis_info["mask"], mask_path)
+
+            # --- Sample profile along axis (or fallback) ---
+            if axis_info is not None:
+                profile, line_xy = sample_profile_along_axis(
+                    imp_np, axis_info["centroid"], axis_info["far_edge"],
+                    orig_h, orig_w, n_samples=n_samples_axis,
+                )
             else:
-                # profile shape (W_p,) → x-pixel positions
-                num_patches  = importance.shape[1]
-                image_extent = W
+                # Fallback — vertical centre→bottom
+                cent, far = _fallback_axis(orig_h, orig_w)
+                profile, line_xy = sample_profile_along_axis(
+                    imp_np, cent, far, orig_h, orig_w, n_samples=n_samples_axis,
+                )
 
             peak_idx = find_candidate_peaks(profile, min_dist, prominence)
-            peak_px  = peaks_to_pixel_positions(peak_idx, image_extent, num_patches)
-            orig_rgb     = tensor_to_uint8_rgb(images[i])           # (H, W, 3) uint8
 
-            stem         = Path(image_id).stem
             json_path    = json_dir    / f"{stem}_candidates.json"
             overlay_path = overlay_dir / f"{stem}_candidates_overlay.png"
 
-            save_candidates_json(image_id, peak_px, profile, json_path)
-            save_candidates_overlay(
-                orig_rgb, peak_px, heatmap, overlay_path,
-                alpha=cfg.interpretation.heatmap_alpha,
-            )
+            save_candidates_json(image_id, peak_idx, profile, json_path, axis_info)
+            save_candidates_overlay(orig_rgb, peak_idx, line_xy, overlay_path,
+                                    axis_info=axis_info)
 
             results.append({
                 "image_id":                image_id,
-                "num_candidates":          int(len(peak_px)),
+                "num_candidates":          int(len(peak_idx)),
                 "candidate_markers_path":  str(json_path),
                 "candidates_overlay_path": str(overlay_path),
+                "axis_detected":           bool(axis_info is not None),
             })
 
     return results

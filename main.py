@@ -15,7 +15,7 @@ from pathlib import Path
 MODE = "demo"   # "demo"  → 1 epoka, szybki test pipeline'u
                 # "full"  → pełny trening (50 epok na model)
 
-SKIP_SCAN  = True   # True  = używaj istniejących data/labels_*.csv
+SKIP_SCAN  = False   # True  = używaj istniejących data/labels_*.csv
                     # False = skanuj Z: od nowa (kilka minut)
 
 SKIP_TRAIN = False  # True  = pomija trening; używa istniejących checkpoints

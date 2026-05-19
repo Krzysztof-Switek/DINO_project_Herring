@@ -120,21 +120,21 @@ def test_model_embed_dim_from_backbone():
 def test_forward_output_shape():
     model = _make_model(num_age_classes=10)
     images, _ = _dummy_batch(B=3)
-    logits = model(images)
-    assert logits.shape == (3, 9)   # K-1 = 9
+    out = model(images)
+    assert out["coral_logits"].shape == (3, 9)   # K-1 = 9
 
 
 def test_forward_output_dtype():
     model = _make_model()
     images, _ = _dummy_batch()
-    assert model(images).dtype == torch.float32
+    assert model(images)["coral_logits"].dtype == torch.float32
 
 
 def test_forward_batch_size_one():
     model = _make_model()
     images = torch.randn(1, 3, 56, 56)
-    logits = model(images)
-    assert logits.shape[0] == 1
+    out = model(images)
+    assert out["coral_logits"].shape[0] == 1
 
 
 def test_forward_output_changes_with_different_inputs():
@@ -142,7 +142,7 @@ def test_forward_output_changes_with_different_inputs():
     model.eval()
     x1 = torch.randn(1, 3, 56, 56)
     x2 = torch.randn(1, 3, 56, 56)
-    assert not torch.allclose(model(x1), model(x2))
+    assert not torch.allclose(model(x1)["coral_logits"], model(x2)["coral_logits"])
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +187,7 @@ def test_backward_frozen_backbone_no_grad_on_backbone():
     model.freeze_backbone()
     images, targets = _dummy_batch()
 
-    loss = ordinal_loss(model(images), targets)
+    loss = ordinal_loss(model(images)["coral_logits"], targets)
     loss.backward()
 
     for p in model.backbone.parameters():
@@ -201,7 +201,7 @@ def test_backward_frozen_backbone_head_gets_grad():
     model.freeze_backbone()
     images, targets = _dummy_batch()
 
-    loss = ordinal_loss(model(images), targets)
+    loss = ordinal_loss(model(images)["coral_logits"], targets)
     loss.backward()
 
     for p in model.head.parameters():
@@ -218,7 +218,7 @@ def test_backward_unfrozen_backbone_all_grads():
     model = _make_model()
     images, targets = _dummy_batch()
 
-    loss = ordinal_loss(model(images), targets)
+    loss = ordinal_loss(model(images)["coral_logits"], targets)
     loss.backward()
 
     for p in model.backbone.parameters():
@@ -241,7 +241,7 @@ def test_train_step_completes():
     images, targets = _dummy_batch()
 
     optimizer.zero_grad()
-    loss = ordinal_loss(model(images), targets)
+    loss = ordinal_loss(model(images)["coral_logits"], targets)
     loss.backward()
     optimizer.step()
 
@@ -262,7 +262,7 @@ def test_loss_decreases_over_multiple_steps():
     losses = []
     for _ in range(20):
         optimizer.zero_grad()
-        loss = ordinal_loss(model(images), targets)
+        loss = ordinal_loss(model(images)["coral_logits"], targets)
         loss.backward()
         optimizer.step()
         losses.append(loss.item())
@@ -294,3 +294,87 @@ def test_get_cls_and_patches_shapes():
     cls, patches = model.get_cls_and_patches(images)
     assert cls.shape == (2, 64)
     assert patches.shape == (2, 4, 4, 64)
+
+
+# ---------------------------------------------------------------------------
+# MIL head (weakly supervised localisation)
+# ---------------------------------------------------------------------------
+
+def _make_model_with_head(head_type: str):
+    from src.config import OtolithConfig
+    from src.model import OtolithModel
+    cfg = OtolithConfig()
+    cfg.model.num_age_classes = 10
+    cfg.model.dropout = 0.0
+    cfg.model.head_type = head_type
+    return OtolithModel(cfg, backbone=_MockDinoBackbone())
+
+
+def test_forward_dict_both_heads():
+    model = _make_model_with_head("both")
+    images, _ = _dummy_batch(B=2)
+    out = model(images)
+    assert "coral_logits" in out
+    assert "patch_probs" in out
+    assert "patch_count" in out
+    # 56 / 14 = 4 patches per side → N = 16
+    assert out["patch_probs"].shape == (2, 16)
+    assert ((out["patch_probs"] >= 0) & (out["patch_probs"] <= 1)).all()
+    assert out["coral_logits"].shape == (2, 9)
+
+
+def test_forward_coral_only_no_patch_probs():
+    model = _make_model_with_head("coral")
+    images, _ = _dummy_batch()
+    out = model(images)
+    assert "coral_logits" in out
+    assert "patch_probs" not in out
+    assert "patch_count" not in out
+
+
+def test_forward_mil_only_no_coral_logits():
+    model = _make_model_with_head("mil")
+    images, _ = _dummy_batch()
+    out = model(images)
+    assert "coral_logits" not in out
+    assert "patch_probs" in out
+    assert "patch_count" in out
+
+
+def test_mil_count_equals_sum_of_probs():
+    model = _make_model_with_head("mil")
+    images, _ = _dummy_batch(B=2)
+    out = model(images)
+    assert torch.allclose(out["patch_count"], out["patch_probs"].sum(dim=1))
+
+
+def test_mil_count_loss_minimises_to_age():
+    """MIL count loss: optimising patch_probs so their sum equals target age."""
+    from src.model import mil_count_loss
+    torch.manual_seed(0)
+    logits = torch.zeros(1, 100, requires_grad=True)
+    opt = torch.optim.Adam([logits], lr=0.1)
+    target_age = torch.tensor([7.0])
+    for _ in range(200):
+        opt.zero_grad()
+        probs = torch.sigmoid(logits)
+        loss = mil_count_loss(probs, target_age, sparsity_weight=0.0)
+        loss.backward()
+        opt.step()
+    final_count = torch.sigmoid(logits).sum().item()
+    assert abs(final_count - 7.0) < 0.2
+
+
+def test_get_patch_probs_raises_when_no_mil_head():
+    model = _make_model_with_head("coral")
+    images = torch.randn(1, 3, 56, 56)
+    with pytest.raises(RuntimeError):
+        model.get_patch_probs(images)
+
+
+def test_get_patch_probs_shape():
+    model = _make_model_with_head("mil")
+    images = torch.randn(1, 3, 56, 56)
+    probs = model.get_patch_probs(images)
+    assert probs.shape == (1, 4, 4)
+    assert ((probs >= 0) & (probs <= 1)).all()

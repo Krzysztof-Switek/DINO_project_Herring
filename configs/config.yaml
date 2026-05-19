@@ -9,6 +9,12 @@ model:
   target_type: ordinal            # regression | ordinal | count_aware
   num_age_classes: 17             # max observed age = 16 (real data)
   dropout: 0.1
+  # MIL weakly-supervised localisation (per-patch increment scoring)
+  head_type: both                 # coral | mil | both
+  mil_count_weight: 1.0           # weight of MSE(sum_patch_probs, age)
+  mil_sparsity_weight: 0.01       # weight of mean(patch_probs) penalty
+  mil_hidden_dim: 64              # patch head hidden layer width
+  coral_loss_weight: 0.5          # weight of CORAL loss when head_type='both'
 
 data:
   image_dir: Z:/Photo/Otolithes/HER/Processed
@@ -26,12 +32,15 @@ data:
     - population
 
 training:
-  epochs: 50
+  epochs: 100                     # sufit; early_stopping zdecyduje kiedy faktycznie zakończyć
   batch_size: 16
   lr: 1.0e-4
   weight_decay: 1.0e-4
   scheduler: cosine               # cosine | step | none
   freeze_backbone_epochs: 5       # freeze DINOv2 for first N epochs
+  early_stopping_patience: 10     # 0 = wyłączone; epoki bez poprawy val_mae przed zatrzymaniem
+  early_stopping_metric: val_mae  # val_mae (zalecane) | val_loss
+  early_stopping_min_delta: 0.001 # minimalna poprawa żeby zresetować licznik
   device: auto                    # auto | cpu | cuda | mps
   checkpoint_dir: checkpoints
   log_dir: logs

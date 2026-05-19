@@ -1,5 +1,11 @@
-"""Stage 7 tests: radial profile, peak detection, coordinate conversion,
-candidate JSON/overlay saving, and run_candidates batch runner."""
+"""Stage 7 tests: candidates pipeline — profile, peaks, JSON, overlay, run_candidates.
+
+Updated for the biological-axis API:
+  - extract_radial_profile returns the bottom-half centre-column profile (legacy fallback)
+  - candidates use sample_profile_along_axis from src/otolith_axis.py
+  - JSON saves peak_profile_indices (not peak_pixel_positions)
+  - save_candidates_overlay takes line_xy + axis_info, not heatmap
+"""
 from __future__ import annotations
 
 import json
@@ -39,7 +45,6 @@ class _MockDinoBackbone(nn.Module):
         W_p = W // 14
         num_patches = H_p * W_p
         cls = self.forward(x)
-        # Spatially varying: each patch scaled by (index+1) → non-uniform importance
         idx   = torch.arange(num_patches, dtype=torch.float32, device=x.device)
         scale = (idx + 1.0).reshape(1, num_patches, 1)
         patches = scale.expand(B, num_patches, self.embed_dim).contiguous()
@@ -100,22 +105,22 @@ def _make_loader(n: int = 6) -> DataLoader:
 
 
 # ---------------------------------------------------------------------------
-# extract_radial_profile
+# extract_radial_profile — legacy fallback (centre column, bottom half)
 # ---------------------------------------------------------------------------
 
-def test_radial_profile_shape():
+def test_radial_profile_returns_bottom_half():
+    """For axis='vertical', profile = bottom half of centre-column values."""
     from src.candidates import extract_radial_profile
     grid = np.random.rand(4, 4).astype(np.float32)
-    profile = extract_radial_profile(grid)
-    assert profile.shape == (4,)
+    profile = extract_radial_profile(grid, axis="vertical")
+    assert profile.shape == (2,)            # bottom half of 4 rows
 
 
-def test_radial_profile_shape_non_square():
+def test_radial_profile_horizontal_returns_right_half():
     from src.candidates import extract_radial_profile
-    grid = np.random.rand(3, 5).astype(np.float32)
-    # horizontal: mean(axis=0) → (W_p,) = (5,)
+    grid = np.random.rand(4, 6).astype(np.float32)
     profile = extract_radial_profile(grid, axis="horizontal")
-    assert profile.shape == (5,)
+    assert profile.shape == (3,)            # right half of 6 cols
 
 
 def test_radial_profile_accepts_tensor():
@@ -123,49 +128,14 @@ def test_radial_profile_accepts_tensor():
     grid = torch.rand(4, 4)
     profile = extract_radial_profile(grid)
     assert isinstance(profile, np.ndarray)
-    assert profile.shape == (4,)
+    assert profile.shape == (2,)
 
 
-def test_radial_profile_values_are_row_means():
-    from src.candidates import extract_radial_profile
-    grid = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
-    # horizontal axis: col means: col0=(1+3)/2=2.0, col1=(2+4)/2=3.0
-    profile_h = extract_radial_profile(grid, axis="horizontal")
-    np.testing.assert_allclose(profile_h, [2.0, 3.0])
-    # vertical axis: row means: row0=(1+2)/2=1.5, row1=(3+4)/2=3.5
-    profile_v = extract_radial_profile(grid, axis="vertical")
-    np.testing.assert_allclose(profile_v, [1.5, 3.5])
-
-
-def test_radial_profile_dtype():
+def test_radial_profile_dtype_is_float32():
     from src.candidates import extract_radial_profile
     grid = np.ones((4, 4), dtype=np.float64)
     profile = extract_radial_profile(grid)
     assert profile.dtype == np.float32
-
-
-def test_vertical_profile_shape():
-    from src.candidates import extract_radial_profile
-    grid = np.random.rand(4, 8).astype(np.float32)
-    profile = extract_radial_profile(grid, axis="vertical")
-    assert profile.shape == (4,)
-
-
-def test_horizontal_profile_shape():
-    from src.candidates import extract_radial_profile
-    grid = np.random.rand(4, 8).astype(np.float32)
-    profile = extract_radial_profile(grid, axis="horizontal")
-    assert profile.shape == (8,)
-
-
-def test_pixel_positions_vertical():
-    from src.candidates import peaks_to_pixel_positions
-    image_height = 56
-    num_patches_h = 4
-    indices = np.arange(num_patches_h)
-    pos = peaks_to_pixel_positions(indices, image_height, num_patches_h)
-    assert (pos >= 0).all()
-    assert (pos < image_height).all()
 
 
 # ---------------------------------------------------------------------------
@@ -205,10 +175,9 @@ def test_peaks_indices_in_valid_range():
 
 def test_peaks_respects_min_distance():
     from src.candidates import find_candidate_peaks
-    # Two peaks at positions 3 and 5 (distance=2); min_distance=5 → only higher kept
     profile = np.zeros(20, dtype=np.float32)
-    profile[3] = 1.0    # higher peak
-    profile[5] = 0.9    # close, lower peak
+    profile[3] = 1.0
+    profile[5] = 0.9
     peaks = find_candidate_peaks(profile, min_distance=5, prominence_threshold=0.0)
     assert len(peaks) == 1
     assert peaks[0] == 3
@@ -225,46 +194,7 @@ def test_peaks_multiple_well_separated():
 
 
 # ---------------------------------------------------------------------------
-# peaks_to_pixel_positions
-# ---------------------------------------------------------------------------
-
-def test_pixel_positions_first_patch_center():
-    from src.candidates import peaks_to_pixel_positions
-    # image_size=56, 4 patches → patch_width=14; first patch center = 0.5*14 = 7
-    pos = peaks_to_pixel_positions(np.array([0]), image_size=56, num_patches=4)
-    assert pos[0] == 7
-
-
-def test_pixel_positions_last_patch_center():
-    from src.candidates import peaks_to_pixel_positions
-    # index 3 (last of 4): center = 3.5 * 14 = 49
-    pos = peaks_to_pixel_positions(np.array([3]), image_size=56, num_patches=4)
-    assert pos[0] == 49
-
-
-def test_pixel_positions_empty_input():
-    from src.candidates import peaks_to_pixel_positions
-    pos = peaks_to_pixel_positions(np.array([]), image_size=56, num_patches=4)
-    assert len(pos) == 0
-
-
-def test_pixel_positions_all_in_range():
-    from src.candidates import peaks_to_pixel_positions
-    indices = np.arange(4)
-    pos = peaks_to_pixel_positions(indices, image_size=56, num_patches=4)
-    assert (pos >= 0).all()
-    assert (pos < 56).all()
-
-
-def test_pixel_positions_monotone_increasing():
-    from src.candidates import peaks_to_pixel_positions
-    indices = np.array([0, 1, 2, 3])
-    pos = peaks_to_pixel_positions(indices, image_size=56, num_patches=4)
-    assert (np.diff(pos) > 0).all()
-
-
-# ---------------------------------------------------------------------------
-# save_candidates_json
+# save_candidates_json — new schema with peak_profile_indices + axis
 # ---------------------------------------------------------------------------
 
 def test_save_candidates_json_creates_file(tmp_path):
@@ -276,16 +206,6 @@ def test_save_candidates_json_creates_file(tmp_path):
     assert path.exists()
 
 
-def test_save_candidates_json_valid_json(tmp_path):
-    from src.candidates import save_candidates_json
-    profile = np.array([0.1, 0.5, 0.3], dtype=np.float32)
-    peaks   = np.array([1], dtype=np.int64)
-    path    = tmp_path / "out.json"
-    save_candidates_json("img_001.png", peaks, profile, path)
-    data = json.loads(path.read_text())
-    assert isinstance(data, dict)
-
-
 def test_save_candidates_json_required_fields(tmp_path):
     from src.candidates import save_candidates_json
     profile = np.array([0.2, 0.8, 0.4], dtype=np.float32)
@@ -293,7 +213,8 @@ def test_save_candidates_json_required_fields(tmp_path):
     path    = tmp_path / "out.json"
     save_candidates_json("img_001.png", peaks, profile, path)
     data = json.loads(path.read_text())
-    for key in ("image_id", "num_candidates", "peak_pixel_positions", "radial_profile"):
+    for key in ("image_id", "num_candidates", "peak_profile_indices",
+                "radial_profile", "axis"):
         assert key in data
 
 
@@ -305,7 +226,7 @@ def test_save_candidates_json_num_candidates_matches_peaks(tmp_path):
     save_candidates_json("x.png", peaks, profile, path)
     data = json.loads(path.read_text())
     assert data["num_candidates"] == 3
-    assert len(data["peak_pixel_positions"]) == 3
+    assert len(data["peak_profile_indices"]) == 3
 
 
 def test_save_candidates_json_empty_peaks(tmp_path):
@@ -316,7 +237,7 @@ def test_save_candidates_json_empty_peaks(tmp_path):
     save_candidates_json("x.png", peaks, profile, path)
     data = json.loads(path.read_text())
     assert data["num_candidates"] == 0
-    assert data["peak_pixel_positions"] == []
+    assert data["peak_profile_indices"] == []
 
 
 def test_save_candidates_json_profile_length(tmp_path):
@@ -328,26 +249,44 @@ def test_save_candidates_json_profile_length(tmp_path):
     assert len(data["radial_profile"]) == 5
 
 
+def test_save_candidates_json_axis_info_serialized(tmp_path):
+    """When axis_info is provided, JSON axis block contains centroid/far_edge/length_px."""
+    from src.candidates import save_candidates_json
+    axis_info = {
+        "centroid":  (100, 150),
+        "far_edge":  (110, 400),
+        "length_px": 250.5,
+    }
+    profile = np.zeros(5, dtype=np.float32)
+    path    = tmp_path / "out.json"
+    save_candidates_json("x.png", np.array([2]), profile, path, axis_info=axis_info)
+    data = json.loads(path.read_text())
+    assert data["axis"]["method"] == "centroid_to_farthest"
+    assert data["axis"]["centroid"] == [100, 150]
+    assert data["axis"]["far_edge"] == [110, 400]
+
+
 # ---------------------------------------------------------------------------
 # save_candidates_overlay
 # ---------------------------------------------------------------------------
 
-def test_save_candidates_overlay_creates_file(tmp_path):
+def test_save_candidates_overlay_creates_file_no_axis(tmp_path):
+    """Without axis_info, fallback overlay (vertical centre line) is drawn."""
     from src.candidates import save_candidates_overlay
     orig    = np.random.randint(0, 255, (56, 56, 3), dtype=np.uint8)
-    heatmap = np.random.rand(56, 56).astype(np.float32)
-    peaks   = np.array([14, 28, 42], dtype=np.int64)
+    line_xy = np.stack([np.full(10, 28), np.linspace(28, 55, 10).astype(int)], axis=1)
+    peaks   = np.array([3, 6], dtype=np.int64)
     path    = tmp_path / "overlay.png"
-    save_candidates_overlay(orig, peaks, heatmap, path)
+    save_candidates_overlay(orig, peaks, line_xy, path, axis_info=None)
     assert path.exists()
 
 
 def test_save_candidates_overlay_is_rgb(tmp_path):
     from src.candidates import save_candidates_overlay
     orig    = np.random.randint(0, 255, (56, 56, 3), dtype=np.uint8)
-    heatmap = np.random.rand(56, 56).astype(np.float32)
+    line_xy = np.array([[28, 30], [28, 40]], dtype=np.int64)
     path    = tmp_path / "overlay.png"
-    save_candidates_overlay(orig, np.array([20]), heatmap, path)
+    save_candidates_overlay(orig, np.array([0]), line_xy, path)
     img = PILImage.open(path)
     assert img.mode == "RGB"
 
@@ -356,9 +295,9 @@ def test_save_candidates_overlay_correct_size(tmp_path):
     from src.candidates import save_candidates_overlay
     H = 56
     orig    = np.random.randint(0, 255, (H, H, 3), dtype=np.uint8)
-    heatmap = np.random.rand(H, H).astype(np.float32)
+    line_xy = np.array([[28, 30]], dtype=np.int64)
     path    = tmp_path / "overlay.png"
-    save_candidates_overlay(orig, np.array([]), heatmap, path)
+    save_candidates_overlay(orig, np.array([], dtype=np.int64), line_xy, path)
     img = PILImage.open(path)
     assert img.size == (H, H)
 
@@ -366,31 +305,28 @@ def test_save_candidates_overlay_correct_size(tmp_path):
 def test_save_candidates_overlay_no_peaks_no_crash(tmp_path):
     from src.candidates import save_candidates_overlay
     orig    = np.random.randint(0, 255, (56, 56, 3), dtype=np.uint8)
-    heatmap = np.random.rand(56, 56).astype(np.float32)
+    line_xy = np.array([[28, 30]], dtype=np.int64)
     path    = tmp_path / "overlay.png"
-    save_candidates_overlay(orig, np.array([], dtype=np.int64), heatmap, path)
+    save_candidates_overlay(orig, np.array([], dtype=np.int64), line_xy, path)
     assert path.exists()
 
 
-def test_save_candidates_overlay_red_line_visible(tmp_path):
-    """With alpha=0 (no heatmap blend), a red line must appear at peak x-position."""
+def test_save_candidates_overlay_dot_visible_at_peak(tmp_path):
+    """A red dot should appear at the pixel (x, y) = line_xy[peak_idx]."""
     from src.candidates import save_candidates_overlay
-    H, W = 56, 56
-    orig    = np.zeros((H, W, 3), dtype=np.uint8)   # black original
-    heatmap = np.zeros((H, W), dtype=np.float32)    # all-zero heatmap
-    x_peak  = 28
+    H, W = 200, 200
+    orig    = np.zeros((H, W, 3), dtype=np.uint8)
+    line_xy = np.array([[100, 50], [100, 150]], dtype=np.int64)
     path    = tmp_path / "overlay.png"
-    save_candidates_overlay(orig, np.array([x_peak]), heatmap, path, alpha=0.0)
+    save_candidates_overlay(orig, np.array([1]), line_xy, path, axis_info=None)
     result = np.array(PILImage.open(path))
-    # Column x_peak should be predominantly red (R channel > others)
-    col = result[:, x_peak, :]   # (H, 3) — all pixels on the line
-    assert (col[:, 0] > 200).all()   # R channel high
-    assert (col[:, 1] < 10).all()    # G channel low
-    assert (col[:, 2] < 10).all()    # B channel low
+    # Pixel near (100, 150) should be red-ish (dot is filled circle with radius ~H/60)
+    px = result[150, 100]
+    assert px[0] > 150 and px[1] < 80 and px[2] < 80
 
 
 # ---------------------------------------------------------------------------
-# run_candidates
+# run_candidates — batch runner end-to-end
 # ---------------------------------------------------------------------------
 
 def test_run_candidates_returns_list(tmp_path):
@@ -450,7 +386,7 @@ def test_run_candidates_json_content_valid(tmp_path):
     for rec in results:
         data = json.loads(Path(rec["candidate_markers_path"]).read_text())
         assert data["num_candidates"] == rec["num_candidates"]
-        assert len(data["peak_pixel_positions"]) == rec["num_candidates"]
+        assert len(data["peak_profile_indices"]) == rec["num_candidates"]
         assert len(data["radial_profile"]) > 0
 
 

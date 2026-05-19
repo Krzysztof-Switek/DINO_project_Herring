@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from src.config import OtolithConfig
 from src.dataset import decode_age_ordinal
-from src.model import OtolithModel, ordinal_loss
+from src.model import OtolithModel, mil_count_loss, ordinal_loss
 from src.utils import resolve_device  # re-exported for backwards compat
 
 
@@ -41,6 +41,11 @@ class Trainer:
 
         self.device = resolve_device(cfg.training.device)
         self.model.to(self.device)
+
+        # Loss weights for combined CORAL + MIL training
+        self.coral_w    = cfg.model.coral_loss_weight
+        self.count_w    = cfg.model.mil_count_weight
+        self.sparsity_w = cfg.model.mil_sparsity_weight
 
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -77,6 +82,31 @@ class Trainer:
     # Train / validate
     # ------------------------------------------------------------------
 
+    def _combined_loss(self, out: dict, targets: torch.Tensor,
+                       ages: torch.Tensor) -> torch.Tensor:
+        """Combined CORAL + MIL loss based on which heads are active."""
+        parts: list[torch.Tensor] = []
+        if "coral_logits" in out:
+            parts.append(self.coral_w * ordinal_loss(out["coral_logits"], targets))
+        if "patch_probs" in out:
+            parts.append(self.count_w * mil_count_loss(
+                out["patch_probs"], ages, self.sparsity_w
+            ))
+        if not parts:
+            raise RuntimeError("Model produced no recognised head outputs")
+        return torch.stack(parts).sum()
+
+    @staticmethod
+    def _predict_age(out: dict) -> torch.Tensor:
+        """Decode integer age from dict output.
+
+        Prefers CORAL when available (matches existing val_mae semantics);
+        falls back to rounded MIL count when only MIL is active.
+        """
+        if "coral_logits" in out:
+            return decode_age_ordinal(out["coral_logits"])
+        return out["patch_count"].round().long()
+
     def train_one_epoch(self) -> float:
         """One full pass over train_loader. Returns mean loss."""
         self.model.train()
@@ -85,14 +115,15 @@ class Trainer:
         for batch in self.train_loader:
             images  = batch["image"].to(self.device)
             targets = batch["age_ordinal"].to(self.device)
+            ages    = batch["age"].to(self.device)
 
             metadata = batch.get("metadata")
             if metadata is not None:
                 metadata = metadata.to(self.device)
 
             self.optimizer.zero_grad()
-            logits = self.model(images, metadata=metadata)
-            loss = ordinal_loss(logits, targets)
+            out = self.model(images, metadata=metadata)
+            loss = self._combined_loss(out, targets, ages)
             loss.backward()
             self.optimizer.step()
 
@@ -102,11 +133,7 @@ class Trainer:
         return total_loss / max(n, 1)
 
     def validate(self) -> tuple[float, float]:
-        """Run validation. Returns (val_loss, val_mae).
-
-        val_mae is mean absolute error between predicted and true integer age.
-        Returns (nan, nan) when no val_loader is provided.
-        """
+        """Run validation. Returns (val_loss, val_mae)."""
         if self.val_loader is None:
             return float("nan"), float("nan")
 
@@ -123,9 +150,10 @@ class Trainer:
                 metadata = batch.get("metadata")
                 if metadata is not None:
                     metadata = metadata.to(self.device)
-                logits = self.model(images, metadata=metadata)
-                loss = ordinal_loss(logits, targets)
-                pred_ages = decode_age_ordinal(logits)
+
+                out = self.model(images, metadata=metadata)
+                loss = self._combined_loss(out, targets, ages)
+                pred_ages = self._predict_age(out)
 
                 total_loss += loss.item() * images.size(0)
                 total_mae  += (pred_ages - ages).abs().float().sum().item()
@@ -138,15 +166,22 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def fit(self) -> None:
-        """Train for cfg.training.epochs epochs.
+        """Train for cfg.training.epochs epochs with optional early stopping.
 
         Backbone is frozen for the first freeze_backbone_epochs epochs,
-        then unfrozen. Checkpoint is saved after every epoch.
+        then unfrozen. Checkpoint is saved after every epoch. best.pt is
+        updated whenever the monitored metric improves.
         """
         freeze_until = self.cfg.training.freeze_backbone_epochs
         if freeze_until > 0:
             self.model.freeze_backbone()
             self._log(f"Backbone frozen for first {freeze_until} epochs")
+
+        patience = self.cfg.training.early_stopping_patience
+        min_delta = self.cfg.training.early_stopping_min_delta
+        metric_name = self.cfg.training.early_stopping_metric
+        best_metric = float("inf")
+        patience_counter = 0
 
         for epoch in range(1, self.cfg.training.epochs + 1):
             if freeze_until > 0 and epoch == freeze_until + 1:
@@ -161,6 +196,20 @@ class Trainer:
 
             self._log_epoch(epoch, train_loss, val_loss, val_mae)
             self.save_checkpoint(epoch, val_loss)
+
+            current = val_mae if metric_name == "val_mae" else val_loss
+            if current < best_metric - min_delta:
+                best_metric = current
+                patience_counter = 0
+                self._save_best_checkpoint(epoch, val_loss)
+            else:
+                patience_counter += 1
+                if patience > 0 and patience_counter >= patience:
+                    self._log(
+                        f"Early stopping — brak poprawy {metric_name} przez {patience} epok "
+                        f"(best={best_metric:.4f})"
+                    )
+                    break
 
         self._log("Training complete")
 
@@ -187,6 +236,12 @@ class Trainer:
             path,
         )
         return path
+
+    def _save_best_checkpoint(self, epoch: int, val_loss: float) -> None:
+        import shutil as _shutil
+        src = self.checkpoint_dir / f"checkpoint_epoch{epoch:03d}_loss{val_loss:.4f}.pt"
+        if src.exists():
+            _shutil.copy2(src, self.checkpoint_dir / "best.pt")
 
     def load_checkpoint(self, path: str | Path) -> int:
         """Restore model + optimizer from checkpoint. Returns saved epoch."""

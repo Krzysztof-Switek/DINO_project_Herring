@@ -41,14 +41,22 @@ def run_inference(
 
     records: List[Dict] = []
 
+    K = cfg.model.num_age_classes
+
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(device)
             metadata = batch.get("metadata")
             if metadata is not None:
                 metadata = metadata.to(device)
-            logits = model(images, metadata=metadata)
-            pred_ages = decode_age_ordinal(logits)   # (B,) int
+
+            out = model(images, metadata=metadata)
+            # Prefer CORAL when present (continuity with prior reports);
+            # fall back to rounded MIL count for mil-only models.
+            if "coral_logits" in out:
+                pred_ages = decode_age_ordinal(out["coral_logits"])
+            else:
+                pred_ages = out["patch_count"].round().long().clamp(0, K - 1)
 
             has_labels = "age" in batch
             batch_size = images.size(0)
@@ -120,7 +128,9 @@ def load_model_from_checkpoint(
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    # strict=False allows loading old checkpoints that don't have patch_head
+    # (the new MIL head will then be randomly initialised — retraining needed).
+    model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.to(device)
     model.eval()
     return model

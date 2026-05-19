@@ -223,13 +223,14 @@ def test_save_heatmap_creates_file(tmp_path):
     assert path.exists()
 
 
-def test_save_heatmap_is_grayscale(tmp_path):
+def test_save_heatmap_is_jet_rgb(tmp_path):
+    """save_heatmap now colourises via JET → RGB output."""
     from src.interpretation import save_heatmap
     heatmap = np.random.rand(56, 56).astype(np.float32)
     path = tmp_path / "heatmap.png"
     save_heatmap(heatmap, path)
     img = PILImage.open(path)
-    assert img.mode == "L"
+    assert img.mode == "RGB"
 
 
 def test_save_heatmap_correct_size(tmp_path):
@@ -337,14 +338,14 @@ def test_run_interpretation_overlay_files_exist(tmp_path):
         assert Path(rec["overlay_path"]).exists()
 
 
-def test_run_interpretation_heatmaps_are_grayscale_png(tmp_path):
+def test_run_interpretation_heatmaps_are_jet_rgb_png(tmp_path):
     from src.interpretation import run_interpretation
     cfg = _make_cfg(tmp_path)
     model = _make_model(cfg)
     results = run_interpretation(cfg, model, _make_loader(n=2), tmp_path / "out")
     for rec in results:
         img = PILImage.open(rec["heatmap_path"])
-        assert img.mode == "L"
+        assert img.mode == "RGB"
 
 
 def test_run_interpretation_overlays_are_rgb_png(tmp_path):

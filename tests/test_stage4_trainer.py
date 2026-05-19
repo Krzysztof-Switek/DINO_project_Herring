@@ -200,7 +200,7 @@ def test_load_checkpoint_round_trip(tmp_path):
 
     trainer.model.eval()
     with torch.no_grad():
-        out_before = trainer.model(images).clone()
+        out_before = trainer.model(images)["coral_logits"].clone()
 
     ckpt_path = trainer.save_checkpoint(epoch=1, val_loss=0.5)
 
@@ -212,7 +212,7 @@ def test_load_checkpoint_round_trip(tmp_path):
 
     trainer.model.eval()
     with torch.no_grad():
-        out_after = trainer.model(images)
+        out_after = trainer.model(images)["coral_logits"]
 
     assert torch.allclose(out_before, out_after, atol=1e-6)
 
@@ -232,7 +232,7 @@ def test_load_checkpoint_returns_epoch(tmp_path):
 def test_fit_creates_checkpoint_per_epoch(tmp_path):
     trainer = _make_trainer(tmp_path, epochs=3)
     trainer.fit()
-    ckpts = list((tmp_path / "checkpoints").glob("*.pt"))
+    ckpts = list((tmp_path / "checkpoints").glob("checkpoint_epoch*.pt"))
     assert len(ckpts) == 3
 
 
@@ -284,3 +284,105 @@ def test_fit_frozen_backbone_head_still_trains(tmp_path):
     w_before = trainer.model.head[1].weight.data.clone()
     trainer.fit()
     assert not torch.allclose(w_before, trainer.model.head[1].weight.data)
+
+
+# ---------------------------------------------------------------------------
+# Early stopping
+# ---------------------------------------------------------------------------
+
+class _ConstantValTrainer:
+    """Trainer subclass whose validate() always returns (val_loss=1.0, val_mae=5.0).
+
+    After epoch 1 the metric never improves, so early stopping fires after
+    patience epochs.
+    """
+    pass  # defined per-test via local subclass to avoid import order issues
+
+
+def test_early_stopping_triggers(tmp_path):
+    """Training must stop before max_epochs when val_mae never improves."""
+    from src.trainer import Trainer
+
+    class ConstantValTrainer(Trainer):
+        def validate(self):
+            return 1.0, 5.0
+
+    cfg = _make_cfg(tmp_path, epochs=10)
+    cfg.training.early_stopping_patience = 2
+    cfg.training.early_stopping_metric = "val_mae"
+    cfg.training.early_stopping_min_delta = 0.001
+
+    model = _make_model(cfg)
+    trainer = ConstantValTrainer(cfg, model, _make_loader(), _make_loader())
+    trainer.fit()
+
+    ckpt_files = list(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt"))
+    # epoch 1 improves inf→5.0; epochs 2+3 don't improve → stop after epoch 3
+    assert len(ckpt_files) == 3
+
+
+def test_early_stopping_saves_best_pt(tmp_path):
+    """best.pt must exist after fit() completes."""
+    from src.trainer import Trainer
+
+    class ConstantValTrainer(Trainer):
+        def validate(self):
+            return 1.0, 5.0
+
+    cfg = _make_cfg(tmp_path, epochs=5)
+    cfg.training.early_stopping_patience = 2
+    cfg.training.early_stopping_metric = "val_mae"
+    cfg.training.early_stopping_min_delta = 0.001
+
+    model = _make_model(cfg)
+    trainer = ConstantValTrainer(cfg, model, _make_loader(), _make_loader())
+    trainer.fit()
+
+    assert (trainer.checkpoint_dir / "best.pt").exists()
+
+
+def test_trainer_supports_mil_head_type(tmp_path):
+    """Trener musi działać dla head_type='mil' (bez CORAL)."""
+    cfg = _make_cfg(tmp_path, epochs=1)
+    cfg.model.head_type = "mil"
+    model = _make_model(cfg)
+    train_loader = _make_loader(n=8)
+    val_loader   = _make_loader(n=4)
+
+    from src.trainer import Trainer
+    trainer = Trainer(cfg, model, train_loader, val_loader)
+    trainer.fit()   # nie powinno rzucić wyjątku
+    assert (trainer.checkpoint_dir / "best.pt").exists()
+
+
+def test_trainer_supports_both_head_type(tmp_path):
+    """Trener z head_type='both' liczy combined loss bez błędu."""
+    cfg = _make_cfg(tmp_path, epochs=1)
+    cfg.model.head_type = "both"
+    model = _make_model(cfg)
+    train_loader = _make_loader(n=8)
+    val_loader   = _make_loader(n=4)
+
+    from src.trainer import Trainer
+    trainer = Trainer(cfg, model, train_loader, val_loader)
+    trainer.fit()
+    assert (trainer.checkpoint_dir / "best.pt").exists()
+
+
+def test_early_stopping_disabled(tmp_path):
+    """patience=0 must run all epochs without stopping."""
+    from src.trainer import Trainer
+
+    class ConstantValTrainer(Trainer):
+        def validate(self):
+            return 1.0, 5.0
+
+    cfg = _make_cfg(tmp_path, epochs=3)
+    cfg.training.early_stopping_patience = 0
+
+    model = _make_model(cfg)
+    trainer = ConstantValTrainer(cfg, model, _make_loader(), _make_loader())
+    trainer.fit()
+
+    ckpt_files = list(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt"))
+    assert len(ckpt_files) == 3

@@ -296,11 +296,11 @@ def test_load_model_from_checkpoint_restores_weights(tmp_path):
     images = torch.randn(2, 3, 56, 56)
     original.eval()
     with torch.no_grad():
-        out_original = original(images).clone()
+        out_original = original(images)["coral_logits"].clone()
 
     loaded = load_model_from_checkpoint(cfg, ckpt_path, backbone=_MockDinoBackbone())
     with torch.no_grad():
-        out_loaded = loaded(images)
+        out_loaded = loaded(images)["coral_logits"]
 
     assert torch.allclose(out_original, out_loaded, atol=1e-6)
 
