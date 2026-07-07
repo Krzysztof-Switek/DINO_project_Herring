@@ -34,8 +34,7 @@ else:
     BASE_CONFIG = str(PROJECT_ROOT / "configs" / "config.yaml")
     OUTPUT_DIR  = str(PROJECT_ROOT / "outputs")
 
-sys.argv = [
-    "run_pipeline.py",
+ARGV = [
     "--base-config",          BASE_CONFIG,
     "--image-dir",            IMAGE_DIR,
     "--excel",                EXCEL_PATH,
@@ -44,13 +43,13 @@ sys.argv = [
     "--config-not-embedded",  str(PROJECT_ROOT / "configs" / "config_not_embedded.yaml"),
 ]
 if SKIP_SCAN:
-    sys.argv.append("--skip-scan")
+    ARGV.append("--skip-scan")
 if SKIP_TRAIN:
-    sys.argv.append("--skip-train")
+    ARGV.append("--skip-train")
 
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.run_pipeline import main  # noqa: E402
 
 if __name__ == "__main__":
-    main()
+    main(ARGV)

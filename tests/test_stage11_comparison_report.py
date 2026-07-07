@@ -198,3 +198,45 @@ def test_cross_prefixed_keys_populate_sections(tmp_path):
     # (bare "N/A" also occurs inside base64 PNG blobs, so match the cell text).
     assert "← CROSS" in content
     assert "MAE = N/A" not in content
+
+
+# ---------------------------------------------------------------------------
+# Section G — increment-dot gallery
+# ---------------------------------------------------------------------------
+
+def _base_kwargs():
+    return dict(
+        results={k: _make_predictions() for k in
+                 ["emb_on_emb", "notemb_on_notemb", "emb_on_notemb", "notemb_on_emb"]},
+        training_logs={},
+        increment_cards={},
+        dataset_stats={"counts": {}, "orphan_count": 0, "age_distributions": {}},
+    )
+
+
+def test_candidate_overlay_gallery_section(tmp_path):
+    """Section G embeds the model-drawn dot overlays passed in candidate_overlays."""
+    import numpy as np
+    from PIL import Image
+    from src.comparison_report import build_comparison_report
+
+    ov = tmp_path / "sample_001_candidates_overlay.png"
+    Image.fromarray(np.zeros((24, 24, 3), dtype=np.uint8)).save(ov)
+    out = tmp_path / "report.html"
+    build_comparison_report(
+        output_path=out,
+        candidate_overlays={"Emb → Emb": [ov]},
+        **_base_kwargs(),
+    )
+    content = out.read_text(encoding="utf-8")
+    assert 'id="G"' in content
+    assert "Galeria" in content
+    assert "Emb → Emb — 1 obraz" in content
+
+
+def test_no_gallery_section_without_overlays(tmp_path):
+    """Section G is omitted when no candidate_overlays are supplied."""
+    from src.comparison_report import build_comparison_report
+    out = tmp_path / "report.html"
+    build_comparison_report(output_path=out, **_base_kwargs())
+    assert 'id="G"' not in out.read_text(encoding="utf-8")

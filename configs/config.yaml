@@ -53,7 +53,8 @@ inference:
   increment_samples:
     top_k_best: 10
     top_k_worst: 10
-    annotate_all: false
+    annotate_all: false   # true = kropki + galeria (sekcja G raportu) dla WSZYSTKICH
+                          # obrazów testowych (wolniej, większy HTML); false = tylko top-k
 
 interpretation:
   method: auto                    # auto | patch_token_importance | mil_patch_probs

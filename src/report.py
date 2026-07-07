@@ -17,8 +17,6 @@ Usage:
 """
 from __future__ import annotations
 
-import base64
-import io
 import json
 import re
 import time
@@ -31,7 +29,11 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import numpy as np
 import pandas as pd
-from PIL import Image as PILImage
+
+# Shared report primitives (single source of truth — see src/report_common.py).
+from src.report_common import fig_to_b64 as _fig_to_b64
+from src.report_common import img_tag as _img_tag
+from src.report_common import pil_to_b64 as _pil_to_b64
 
 # ---------------------------------------------------------------------------
 # Colours
@@ -40,31 +42,6 @@ from PIL import Image as PILImage
 _SPLIT_COLORS = {"train": "#2196F3", "val": "#FF9800", "test": "#4CAF50"}
 _PALETTE      = ["#2196F3", "#FF9800", "#4CAF50", "#9C27B0", "#F44336",
                  "#00BCD4", "#8BC34A", "#FF5722", "#607D8B", "#795548"]
-
-
-# ---------------------------------------------------------------------------
-# Utility: matplotlib figure → base64 PNG
-# ---------------------------------------------------------------------------
-
-def _fig_to_b64(fig: plt.Figure, dpi: int = 110) -> str:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("ascii")
-
-
-def _img_tag(b64: str, alt: str = "", style: str = "") -> str:
-    return f'<img src="data:image/png;base64,{b64}" alt="{alt}" style="max-width:100%;{style}">'
-
-
-def _pil_to_b64(path: Path, max_px: int = 300) -> str:
-    img = PILImage.open(path).convert("RGB")
-    img.thumbnail((max_px, max_px), PILImage.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("ascii")
 
 
 # ---------------------------------------------------------------------------

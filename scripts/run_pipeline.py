@@ -257,24 +257,26 @@ def _step_infer(cfg, ckpt_path: Path, labels_csv: Path, output_dir: Path) -> Pat
     print("  Inferencja (wszystkie próbki)...")
     run_inference(cfg_copy, model, loader, output_dir)
 
-    # --- Step B: select top-k best + top-k worst for interpretation ---
+    # --- Step B: choose which samples get interpretation + candidate dots ---
+    # annotate_all=True → every test image (full gallery); else top-k best/worst.
     pred_csv = output_dir / "predictions.csv"
-    k_best  = cfg.inference.increment_samples.top_k_best
-    k_worst = cfg.inference.increment_samples.top_k_worst
-    top_ids = _select_topk_image_ids(pred_csv, k_best, k_worst)
-    if top_ids:
-        print(f"  Interpretacja dla {len(top_ids)} próbek "
-              f"({k_best} najlepszych + {k_worst} najgorszych)")
-
-    if top_ids:
-        # Build a filtered dataset with only the top-k image_ids
-        top_indices = [i for i, row in test_ds.df.iterrows()
-                       if str(row["image_id"]) in top_ids]
-        subset_ds = Subset(test_ds, top_indices)
-        interp_loader = DataLoader(subset_ds, batch_size=cfg.training.batch_size,
-                                   shuffle=False, num_workers=cfg.data.num_workers)
-    else:
+    if cfg.inference.increment_samples.annotate_all:
+        print("  Interpretacja/kandydaci dla WSZYSTKICH próbek testowych (annotate_all=True)")
         interp_loader = loader
+    else:
+        k_best  = cfg.inference.increment_samples.top_k_best
+        k_worst = cfg.inference.increment_samples.top_k_worst
+        top_ids = _select_topk_image_ids(pred_csv, k_best, k_worst)
+        if top_ids:
+            print(f"  Interpretacja dla {len(top_ids)} próbek "
+                  f"({k_best} najlepszych + {k_worst} najgorszych)")
+            top_indices = [i for i, row in test_ds.df.iterrows()
+                           if str(row["image_id"]) in top_ids]
+            subset_ds = Subset(test_ds, top_indices)
+            interp_loader = DataLoader(subset_ds, batch_size=cfg.training.batch_size,
+                                       shuffle=False, num_workers=cfg.data.num_workers)
+        else:
+            interp_loader = loader
 
     print("  Heatmapy i nakładki (oryginalna rozdzielczość)...")
     run_interpretation(cfg_copy, model, interp_loader, output_dir, image_dir=image_dir)
@@ -443,6 +445,30 @@ def _reload_cards_from_disk(output_dir: Path) -> dict[str, list[Path]]:
     return cards
 
 
+_CONDITION_LABELS = {
+    "emb_on_emb":          "Emb → Emb",
+    "notemb_on_notemb":    "NotEmb → NotEmb",
+    "cross_emb_on_notemb": "Emb → NotEmb (CROSS)",
+    "cross_notemb_on_emb": "NotEmb → Emb (CROSS)",
+}
+
+
+def _collect_candidate_overlays(output_dir: Path, cond_keys) -> dict[str, list[Path]]:
+    """Gather model-drawn increment-dot overlay PNGs per condition (report Section G).
+
+    Reads ``output_dir/<cond_key>/candidates_overlays/*_candidates_overlay.png``.
+    How many images are present depends on ``increment_samples.annotate_all``.
+    """
+    overlays: dict[str, list[Path]] = {}
+    for cond_key in cond_keys:
+        ov_dir = Path(output_dir) / cond_key / "candidates_overlays"
+        if ov_dir.exists():
+            pngs = sorted(ov_dir.glob("*_candidates_overlay.png"))
+            if pngs:
+                overlays[_CONDITION_LABELS.get(cond_key, cond_key)] = pngs
+    return overlays
+
+
 def _step_cards(
     pred_csvs: dict[str, Path],
     cfg_emb,
@@ -598,7 +624,7 @@ def _write_pipeline_summary(
 # Main
 # ---------------------------------------------------------------------------
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="OtolithDino — Embedded vs NotEmbedded pipeline")
     p.add_argument("--image-dir", default="Z:/Photo/Otolithes/HER/Processed")
     p.add_argument("--excel", default="data/analysisWithOtolithPhoto.xlsx")
@@ -617,11 +643,11 @@ def _parse_args() -> argparse.Namespace:
                    help="Skip steps 2-3; use existing checkpoints")
     p.add_argument("--dry-run", action="store_true",
                    help="Print planned steps without executing them")
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
-def main() -> None:
-    args = _parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     state_path = output_dir / "pipeline_state.json"
@@ -782,6 +808,7 @@ def main() -> None:
 
         report_path = output_dir / "comparison_report.html"
         training_logs = {"embedded": logs_emb, "not_embedded": logs_notemb}
+        candidate_overlays = _collect_candidate_overlays(output_dir, pred_csvs.keys())
         build_comparison_report(
             results=results_dfs,
             training_logs=training_logs,
@@ -789,6 +816,7 @@ def main() -> None:
             dataset_stats=dataset_stats,
             output_path=report_path,
             model_info=model_info,
+            candidate_overlays=candidate_overlays,
         )
         completed.append("report")
         _save_state(state_path, completed)

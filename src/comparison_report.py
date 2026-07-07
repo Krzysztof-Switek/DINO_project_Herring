@@ -7,11 +7,10 @@ Generates a self-contained HTML file with sections:
   D — Cross-evaluation summary table with automatic comment
   E — Increment annotation cards (best / worst predictions)
   F — Model and configuration info
+  G — Increment-dot gallery (model-drawn dots for every annotated test image)
 """
 from __future__ import annotations
 
-import base64
-import io
 import time
 from datetime import datetime
 from pathlib import Path
@@ -23,31 +22,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+# Shared report primitives (single source of truth). compute_metrics is
+# re-exported so existing `from src.comparison_report import compute_metrics`
+# imports (run_pipeline, tests) keep working.
+from src.report_common import compute_metrics, fig_to_b64, img_tag, pil_to_b64, png_to_b64
+
+__all__ = ["compute_metrics", "cross_comment", "normalize_result_keys",
+           "build_comparison_report"]
+
+
 # ---------------------------------------------------------------------------
-# Metrics
+# Comments
 # ---------------------------------------------------------------------------
-
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    """Compute regression metrics for age prediction.
-
-    Returns dict with keys: MAE, RMSE, R2, Acc1yr, Acc2yr, Bias.
-    """
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    errors = y_pred - y_true
-    mae = float(np.mean(np.abs(errors)))
-    rmse = float(np.sqrt(np.mean(errors ** 2)))
-    try:
-        ss_res = float(np.sum((y_true - y_pred) ** 2))
-        ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
-    except Exception:
-        r2 = float("nan")
-    acc1 = float(np.mean(np.abs(errors) <= 1.0))
-    acc2 = float(np.mean(np.abs(errors) <= 2.0))
-    bias = float(np.mean(errors))
-    return {"MAE": mae, "RMSE": rmse, "R2": r2, "Acc1yr": acc1, "Acc2yr": acc2, "Bias": bias}
-
 
 def cross_comment(own_mae: float, cross_mae: float) -> str:
     """Return automatic generalization comment based on cross/own MAE ratio."""
@@ -80,25 +66,18 @@ def normalize_result_keys(results: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Plot helpers
+# Plot helpers — thin adapters over src/report_common
 # ---------------------------------------------------------------------------
 
-def _fig_to_b64(fig: plt.Figure, dpi: int = 100) -> str:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("ascii")
+def _fig_to_b64(fig: plt.Figure) -> str:
+    return fig_to_b64(fig, dpi=100)
 
 
-def _load_png_b64(path: Path) -> str | None:
-    if not Path(path).exists():
-        return None
-    data = Path(path).read_bytes()
-    return base64.b64encode(data).decode("ascii")
+_load_png_b64 = png_to_b64
 
 
 def _img_tag(b64: str, width: str = "100%") -> str:
-    return f'<img src="data:image/png;base64,{b64}" style="width:{width};max-width:100%;">'
+    return img_tag(b64, style=f"width:{width};")
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +407,53 @@ def _section_f(model_info: dict) -> str:
 """
 
 
+def _thumb_b64(path) -> str | None:
+    """Downscaled base64 PNG thumbnail; None if the file can't be read."""
+    try:
+        return pil_to_b64(path, max_px=340)
+    except Exception:
+        return None
+
+
+def _section_g(candidate_overlays: dict | None) -> str:
+    """Gallery of model-drawn increment-dot overlays for every annotated image.
+
+    ``candidate_overlays``: ``{label -> [png Path, ...]}``. Empty/None → section omitted.
+    Which images appear is governed by ``inference.increment_samples.annotate_all``
+    (all test images when True, otherwise only the top-k best/worst).
+    """
+    if not candidate_overlays:
+        return ""
+    html = (
+        '<section id="G">'
+        '<h2>G. Galeria: kropki przyrostów wykryte przez model</h2>'
+        '<p>Każdy kafelek to zdjęcie otolitu z konturem, żółtą osią biologiczną i '
+        '<b>czerwonymi kropkami</b> w miejscach przyrostów wykrytych przez model '
+        '(peaki profilu ważności wzdłuż osi). Odpowiednik anotacji SmartDots — '
+        'z tą różnicą, że kropki stawia <b>model</b>, nie technik. Liczba i pozycje '
+        'kropek stają się wiarygodne dopiero po pełnym treningu.</p>'
+    )
+    for label, paths in candidate_overlays.items():
+        paths = list(paths)
+        html += f'<h3>{label} — {len(paths)} obraz(ów)</h3>'
+        html += '<div style="display:flex;flex-wrap:wrap;gap:8px;">'
+        for p in paths:
+            b64 = _thumb_b64(p)
+            if not b64:
+                continue
+            stem = Path(p).stem.replace("_candidates_overlay", "")
+            html += (
+                '<figure style="width:230px;margin:0;">'
+                f'<img src="data:image/png;base64,{b64}" '
+                'style="width:100%;border:1px solid #ccc;border-radius:3px;">'
+                f'<figcaption style="font-size:10px;color:#666;word-break:break-all;">'
+                f'{stem}</figcaption></figure>'
+            )
+        html += '</div>'
+    html += '</section>'
+    return html
+
+
 # ---------------------------------------------------------------------------
 # Main builder
 # ---------------------------------------------------------------------------
@@ -439,6 +465,7 @@ def build_comparison_report(
     dataset_stats: dict,
     output_path: Path,
     model_info: dict | None = None,
+    candidate_overlays: dict | None = None,
 ) -> None:
     """Build and write a self-contained HTML comparison report.
 
@@ -452,6 +479,8 @@ def build_comparison_report(
     dataset_stats : keys counts, age_distributions, orphan_count
     output_path   : where to write the HTML file
     model_info    : optional dict of key→value pairs for section F
+    candidate_overlays : optional {label -> [png Path, ...]} for the Section G
+                    increment-dot gallery (model-drawn dots for every annotated image)
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -470,6 +499,7 @@ def build_comparison_report(
         + _section_d(results)
         + _section_e(increment_cards)
         + _section_f(model_info)
+        + _section_g(candidate_overlays)
     )
 
     html = f"""<!DOCTYPE html>

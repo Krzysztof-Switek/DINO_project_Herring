@@ -3,8 +3,12 @@
 Usage:
     python -m src.entrypoint --mode info     # print resolved config and exit
     python -m src.entrypoint --mode train    # train
-    python -m src.entrypoint --mode demo     # 1 epoch + full pipeline check
+    python -m src.entrypoint --mode demo     # unified quick-check → scripts/run_pipeline.py
     python -m src.entrypoint --mode report   # rebuild HTML report from existing outputs
+
+`--mode demo` delegates to the single demo implementation in
+scripts/run_pipeline.py (configs/config_demo.yaml), identical to `python main.py`
+with MODE="demo".
 """
 from __future__ import annotations
 
@@ -62,6 +66,30 @@ def _build_loaders(cfg):
     return train_loader, val_loader, test_loader
 
 
+def _test_loader(cfg):
+    from torch.utils.data import DataLoader
+    from src.dataset import OtolithDataset
+
+    return DataLoader(
+        OtolithDataset(cfg, split="test"),
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        num_workers=cfg.data.num_workers,
+    )
+
+
+def _resolve_checkpoint(root: Path, cfg) -> Path | None:
+    """Return best.pt (preferred) or the latest epoch checkpoint, else None."""
+    ckpt_dir = Path(cfg.training.checkpoint_dir)
+    if not ckpt_dir.is_absolute():
+        ckpt_dir = root / ckpt_dir
+    best = ckpt_dir / "best.pt"
+    if best.exists():
+        return best
+    ckpts = sorted(ckpt_dir.glob("checkpoint_epoch*.pt"))
+    return ckpts[-1] if ckpts else None
+
+
 def run(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
@@ -92,81 +120,69 @@ def run(argv: list[str] | None = None) -> int:
         return 0
 
     # ------------------------------------------------------------------
-    # demo — 1 epoch, then full pipeline: inference → heatmaps → candidates → report
+    # demo — unified quick-check of the whole pipeline
     # ------------------------------------------------------------------
+    # A single demo implementation lives in scripts/run_pipeline.py. Both this
+    # mode and `python main.py` (MODE="demo") funnel into it with
+    # configs/config_demo.yaml (1 epoch + demo-subsampled dataset), so they
+    # always produce the same artefacts (outputs/demo/comparison_report.html).
     if args.mode == "demo":
-        cfg = cfg.model_copy(
-            update={"training": cfg.training.model_copy(update={"epochs": 1})}
-        )
-        print_config_summary(cfg)
+        from scripts.run_pipeline import main as run_pipeline_main
 
-        from src.model import OtolithModel
-        from src.trainer import Trainer
-        from src.inference import load_model_from_checkpoint, run_inference
-        from src.interpretation import run_interpretation
-        from src.candidates import run_candidates
-        from src.report import build_html_report, save_report
-
-        print("[demo] Trening — 1 epoka...")
-        train_loader, val_loader, test_loader = _build_loaders(cfg)
-        model   = OtolithModel(cfg)
-        trainer = Trainer(cfg, model, train_loader, val_loader)
-        trainer.fit()
-
-        ckpt_dir  = root / cfg.training.checkpoint_dir
-        ckpts     = sorted(ckpt_dir.glob("checkpoint_epoch*.pt"))
-        if not ckpts:
-            print("[demo] Błąd: brak checkpointu po treningu.")
-            return 1
-        ckpt_path = ckpts[-1]
-        print(f"[demo] Checkpoint: {ckpt_path.name}")
-
-        print("[demo] Inferencja na zbiorze testowym...")
-        model = load_model_from_checkpoint(cfg, ckpt_path)
-        run_inference(cfg, model, test_loader, out_dir)
-
-        print("[demo] Heatmapy i nakładki...")
-        run_interpretation(cfg, model, test_loader, out_dir)
-
-        print("[demo] Detekcja kandydatów przyrostów...")
-        run_candidates(cfg, model, test_loader, out_dir)
-
-        print("[demo] Generowanie raportu HTML...")
-        html = build_html_report(
-            labels_csv        = root / cfg.data.labels_csv,
-            log_path          = root / cfg.training.log_dir / "train.log",
-            predictions_csv   = out_dir / "predictions.csv",
-            heatmaps_dir      = out_dir / "heatmaps",
-            overlays_dir      = out_dir / "overlays",
-            cand_json_dir     = out_dir / "candidates",
-            cand_overlays_dir = out_dir / "candidates_overlays",
-        )
-        report_path = out_dir / "report.html"
-        save_report(html, report_path)
-
-        print("\n[demo] Gotowe. Zapisane artefakty:")
-        print(f"  checkpoint  : {ckpt_path}")
-        print(f"  predykcje   : {out_dir / 'predictions.csv'}")
-        print(f"  heatmapy    : {out_dir / 'heatmaps/'}")
-        print(f"  nakładki    : {out_dir / 'overlays/'}")
-        print(f"  kandydaci   : {out_dir / 'candidates/'}")
-        print(f"  raport      : {report_path}")
+        demo_cfg = root / "configs" / "config_demo.yaml"
+        print(f"[demo] Delegacja do run_pipeline (config: {demo_cfg.name})")
+        run_pipeline_main([
+            "--base-config", str(demo_cfg),
+            "--output-dir",  str(root / "outputs" / "demo"),
+        ])
         return 0
 
     # ------------------------------------------------------------------
-    # inference
+    # inference — predict on the test split using the trained checkpoint
     # ------------------------------------------------------------------
     if args.mode == "inference":
         print_config_summary(cfg)
-        print("[inference] Inference not yet implemented.")
+        ckpt = _resolve_checkpoint(root, cfg)
+        if ckpt is None:
+            print(f"[inference] Brak checkpointu w {root / cfg.training.checkpoint_dir} "
+                  f"— najpierw wytrenuj model (--mode train).")
+            return 1
+
+        from src.inference import load_model_from_checkpoint, run_inference
+        print(f"[inference] Checkpoint: {ckpt}")
+        model = load_model_from_checkpoint(cfg, ckpt)
+        run_inference(cfg, model, _test_loader(cfg), out_dir)
+        print(f"[inference] Zapisano: {out_dir / 'predictions.csv'}")
         return 0
 
     # ------------------------------------------------------------------
-    # eval
+    # eval — inference on the test split + printed regression metrics
     # ------------------------------------------------------------------
     if args.mode == "eval":
         print_config_summary(cfg)
-        print("[eval] Evaluation not yet implemented.")
+        ckpt = _resolve_checkpoint(root, cfg)
+        if ckpt is None:
+            print(f"[eval] Brak checkpointu w {root / cfg.training.checkpoint_dir} "
+                  f"— najpierw wytrenuj model (--mode train).")
+            return 1
+
+        import pandas as pd
+        from src.inference import load_model_from_checkpoint, run_inference
+        from src.report_common import compute_metrics
+
+        print(f"[eval] Checkpoint: {ckpt}")
+        model = load_model_from_checkpoint(cfg, ckpt)
+        run_inference(cfg, model, _test_loader(cfg), out_dir)
+
+        preds = pd.read_csv(out_dir / "predictions.csv")
+        labeled = preds[preds["target_age"].notna()]
+        if labeled.empty:
+            print("[eval] Zbiór testowy nie ma etykiet — metryki niedostępne.")
+            return 0
+        m = compute_metrics(labeled["target_age"].values, labeled["predicted_age"].values)
+        print(f"[eval] Metryki na zbiorze testowym (n={len(labeled)}):")
+        for key, val in m.items():
+            print(f"  {key:8s} = {val:.4f}")
         return 0
 
     # ------------------------------------------------------------------
