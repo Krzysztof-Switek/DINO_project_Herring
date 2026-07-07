@@ -53,4 +53,3 @@ from scripts.run_pipeline import main  # noqa: E402
 
 if __name__ == "__main__":
     main(ARGV)
-poprawiony
