@@ -12,7 +12,7 @@ from pathlib import Path
 # KONFIGURACJA — zmień tylko tutaj
 # ============================================================
 
-MODE = "demo"   # "demo"  → 1 epoka, szybki test pipeline'u
+MODE = "full"   # "demo"  → 1 epoka, szybki test pipeline'u
                 # "full"  → pełny trening (50 epok na model)
 
 SKIP_SCAN  = False   # True  = używaj istniejących data/labels_*.csv
@@ -23,7 +23,7 @@ SKIP_TRAIN = False  # True  = pomija trening; używa istniejących checkpoints
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-
+# /home/kswitek/Documents/Photo/Otolithes/HER
 IMAGE_DIR  = "Z:/Photo/Otolithes/HER/Processed"
 EXCEL_PATH = str(PROJECT_ROOT / "data" / "analysisWithOtolithPhoto.xlsx")
 
