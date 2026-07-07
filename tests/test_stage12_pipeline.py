@@ -149,6 +149,41 @@ def test_parse_train_log(tmp_path):
     assert _parse_train_log(tmp_path / "nonexistent.log") == []
 
 
+def test_parse_train_log_with_lr(tmp_path):
+    """Newer logs include lr=…; parser must expose it (older logs stay unchanged)."""
+    from scripts.run_pipeline import _parse_train_log
+
+    log = tmp_path / "train.log"
+    log.write_text(
+        "[2026-07-07 10:00:00] epoch=  1  train_loss=0.80  val_loss=0.70  val_mae=2.30  lr=1.00e-04\n",
+        encoding="utf-8",
+    )
+    rows = _parse_train_log(log)
+    assert len(rows) == 1
+    assert rows[0]["epoch"] == 1
+    assert rows[0]["lr"] == 1e-4
+
+
+def test_select_topk_image_ids_uses_target_age(tmp_path):
+    """Top-k selection must fire on the 'target_age' column written by run_inference."""
+    import pandas as pd
+    from scripts.run_pipeline import _select_topk_image_ids
+
+    df = pd.DataFrame({
+        "image_id":      [f"img_{i}.png" for i in range(6)],
+        "predicted_age": [3, 3, 3, 3, 3, 3],
+        "target_age":    [3, 3, 3, 4, 5, 9],   # abs errors: 0,0,0,1,2,6
+    })
+    csv = tmp_path / "predictions.csv"
+    df.to_csv(csv, index=False)
+
+    ids = _select_topk_image_ids(csv, k_best=1, k_worst=1)
+    assert len(ids) == 2
+    assert "img_5.png" in ids          # worst (error 6) always selected
+    # Missing file / bad columns → empty set (interpretation falls back to all)
+    assert _select_topk_image_ids(tmp_path / "nope.csv", 1, 1) == set()
+
+
 # ---------------------------------------------------------------------------
 # test_pipeline_state_file
 # ---------------------------------------------------------------------------

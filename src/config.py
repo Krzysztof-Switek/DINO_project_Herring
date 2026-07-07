@@ -18,7 +18,7 @@ class ModelConfig(BaseModel):
     backbone: str = "dinov2_vits14"
     use_metadata: bool = False
     target_type: Literal["regression", "ordinal", "count_aware"] = "ordinal"
-    num_age_classes: int = Field(20, ge=2, le=100)
+    num_age_classes: int = Field(17, ge=2, le=100)
     dropout: float = Field(0.1, ge=0.0, lt=1.0)
     # MIL weakly supervised localisation head
     head_type: Literal["coral", "mil", "both"] = "both"
@@ -65,6 +65,9 @@ class TrainingConfig(BaseModel):
     weight_decay: float = Field(1e-4, ge=0.0)
     scheduler: Literal["cosine", "step", "none"] = "cosine"
     freeze_backbone_epochs: int = Field(5, ge=0)
+    # Discriminative LR: pretrained backbone is fine-tuned at lr * this factor,
+    # the freshly-initialised heads at the full lr. 1.0 => uniform LR (old behaviour).
+    backbone_lr_mult: float = Field(0.1, ge=0.0, le=1.0)
     early_stopping_patience: int = Field(10, ge=0)
     early_stopping_metric: Literal["val_mae", "val_loss"] = "val_mae"
     early_stopping_min_delta: float = Field(0.001, ge=0.0)
@@ -89,17 +92,17 @@ class InferenceConfig(BaseModel):
 
 
 class InterpretationConfig(BaseModel):
-    method: Literal[
-        "patch_token_importance", "attention_rollout", "gradient_saliency"
-    ] = "patch_token_importance"
-    top_k_patches: int = Field(20, ge=1)
+    # Only the two implemented signals are exposed:
+    #   auto                   — MIL patch probabilities if a MIL head exists, else L2 norm
+    #   patch_token_importance — always the L2 norm of DINOv2 patch tokens
+    #   mil_patch_probs        — always the trained MIL patch probabilities (requires MIL head)
+    method: Literal["auto", "patch_token_importance", "mil_patch_probs"] = "auto"
     heatmap_alpha: float = Field(0.5, ge=0.0, le=1.0)
 
 
 class CandidatesConfig(BaseModel):
     min_peak_distance: int = Field(5, ge=1)
     prominence_threshold: float = Field(0.1, ge=0.0)
-    profile_axis: Literal["vertical", "horizontal"] = "vertical"
 
 
 class DemoConfig(BaseModel):

@@ -47,11 +47,7 @@ class Trainer:
         self.count_w    = cfg.model.mil_count_weight
         self.sparsity_w = cfg.model.mil_sparsity_weight
 
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=cfg.training.lr,
-            weight_decay=cfg.training.weight_decay,
-        )
+        self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
 
         root = Path(__file__).resolve().parents[1]
@@ -65,6 +61,27 @@ class Trainer:
     # ------------------------------------------------------------------
     # Scheduler
     # ------------------------------------------------------------------
+
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        """AdamW with a lower LR for the pretrained backbone than for the heads.
+
+        Fine-tuning a pretrained ViT works best when the backbone is updated more
+        gently than the freshly-initialised heads (discriminative learning rate).
+        ``backbone_lr_mult == 1.0`` reproduces the old uniform-LR behaviour.
+        """
+        lr = self.cfg.training.lr
+        wd = self.cfg.training.weight_decay
+        backbone_lr = lr * self.cfg.training.backbone_lr_mult
+
+        backbone_ids = {id(p) for p in self.model.backbone.parameters()}
+        backbone_params = [p for p in self.model.parameters() if id(p) in backbone_ids]
+        head_params = [p for p in self.model.parameters() if id(p) not in backbone_ids]
+
+        groups = [
+            {"params": head_params, "lr": lr},
+            {"params": backbone_params, "lr": backbone_lr},
+        ]
+        return torch.optim.AdamW(groups, lr=lr, weight_decay=wd)
 
     def _build_scheduler(self) -> Optional[object]:
         sched = self.cfg.training.scheduler
@@ -191,10 +208,12 @@ class Trainer:
             train_loss = self.train_one_epoch()
             val_loss, val_mae = self.validate()
 
+            # lr used during this epoch (before the scheduler advances it)
+            current_lr = self.optimizer.param_groups[0]["lr"]
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            self._log_epoch(epoch, train_loss, val_loss, val_mae)
+            self._log_epoch(epoch, train_loss, val_loss, val_mae, current_lr)
             self.save_checkpoint(epoch, val_loss)
 
             current = val_mae if metric_name == "val_mae" else val_loss
@@ -265,11 +284,15 @@ class Trainer:
             f.write(line + "\n")
 
     def _log_epoch(
-        self, epoch: int, train_loss: float, val_loss: float, val_mae: float
+        self, epoch: int, train_loss: float, val_loss: float, val_mae: float,
+        lr: float | None = None,
     ) -> None:
-        self._log(
+        line = (
             f"epoch={epoch:3d}  "
             f"train_loss={train_loss:.4f}  "
             f"val_loss={val_loss:.4f}  "
             f"val_mae={val_mae:.3f}"
         )
+        if lr is not None:
+            line += f"  lr={lr:.2e}"
+        self._log(line)

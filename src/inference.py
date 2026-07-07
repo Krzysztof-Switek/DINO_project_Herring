@@ -130,7 +130,18 @@ def load_model_from_checkpoint(
         ckpt = torch.load(checkpoint_path, map_location=device)
     # strict=False allows loading old checkpoints that don't have patch_head
     # (the new MIL head will then be randomly initialised — retraining needed).
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    result = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if result.missing_keys or result.unexpected_keys:
+        import warnings
+        warnings.warn(
+            "Checkpoint loaded non-strictly: "
+            f"{len(result.missing_keys)} missing key(s), "
+            f"{len(result.unexpected_keys)} unexpected key(s). "
+            "Affected layers are randomly initialised — retrain before trusting outputs. "
+            f"(missing={result.missing_keys[:5]}, unexpected={result.unexpected_keys[:5]})",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     model.to(device)
     model.eval()
     return model

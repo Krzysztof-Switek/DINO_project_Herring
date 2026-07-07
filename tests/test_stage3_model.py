@@ -145,6 +145,17 @@ def test_forward_output_changes_with_different_inputs():
     assert not torch.allclose(model(x1)["coral_logits"], model(x2)["coral_logits"])
 
 
+def test_coral_logits_are_rank_monotonic():
+    """CORAL rank consistency: P(age>0) >= P(age>1) >= ... for every sample."""
+    model = _make_model(num_age_classes=10)
+    model.eval()
+    x = torch.randn(4, 3, 56, 56)
+    with torch.no_grad():
+        probs = torch.sigmoid(model(x)["coral_logits"])   # (4, 9)
+    diffs = probs[:, 1:] - probs[:, :-1]                   # must be <= 0
+    assert torch.all(diffs <= 1e-6), "ordinal probabilities must be non-increasing"
+
+
 # ---------------------------------------------------------------------------
 # Freeze / unfreeze
 # ---------------------------------------------------------------------------

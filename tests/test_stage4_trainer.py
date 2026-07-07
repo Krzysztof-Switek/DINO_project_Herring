@@ -254,6 +254,14 @@ def test_fit_log_contains_all_epochs(tmp_path):
         assert f"epoch={ep:3d}" in content
 
 
+def test_fit_log_contains_lr(tmp_path):
+    """Each epoch line must record the learning rate (for the report LR curve)."""
+    trainer = _make_trainer(tmp_path, epochs=1)
+    trainer.fit()
+    content = (tmp_path / "logs" / "train.log").read_text(encoding="utf-8")
+    assert "lr=" in content
+
+
 def test_fit_with_cosine_scheduler(tmp_path):
     """fit() must not crash with cosine scheduler."""
     trainer = _make_trainer(tmp_path, epochs=2, scheduler="cosine")
@@ -386,3 +394,12 @@ def test_early_stopping_disabled(tmp_path):
 
     ckpt_files = list(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt"))
     assert len(ckpt_files) == 3
+
+
+def test_optimizer_has_discriminative_lr(tmp_path):
+    """Backbone must sit in its own param group with a lower LR than the heads."""
+    trainer = _make_trainer(tmp_path, epochs=1)
+    groups = trainer.optimizer.param_groups
+    assert len(groups) == 2
+    lrs = sorted(g["lr"] for g in groups)
+    assert lrs[0] < lrs[1]   # backbone_lr (lr * backbone_lr_mult) < head_lr

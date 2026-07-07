@@ -14,6 +14,9 @@ outputs/
 logs/
 checkpoints/
 
+# Generated project context
+project_context/
+
 # OS / IDE
 .vscode/
 .idea/

@@ -153,3 +153,48 @@ def test_section_e_has_reasoning_card_caption(tmp_path):
     # — panele 5/6 i adnotacja: brak peaków w demo to oczekiwane zachowanie
     assert "oczekiwane" in content.lower()
     assert "find_peaks" in content
+
+
+# ---------------------------------------------------------------------------
+# test_cross_prefixed_keys_are_handled  (regresja: run_pipeline daje cross_*)
+# ---------------------------------------------------------------------------
+
+def test_normalize_result_keys_maps_cross_prefix():
+    from src.comparison_report import normalize_result_keys
+    norm = normalize_result_keys({"cross_emb_on_notemb": "X", "emb_on_emb": "Y"})
+    assert norm["emb_on_notemb"] == "X"   # prefixed key exposed under canonical name
+    assert norm["emb_on_emb"] == "Y"      # already-canonical key untouched
+
+
+def test_cross_comment_nan_returns_no_data():
+    from src.comparison_report import cross_comment
+    assert "brak danych" in cross_comment(float("nan"), 1.0).lower()
+    assert "brak danych" in cross_comment(1.0, float("nan")).lower()
+
+
+def test_cross_prefixed_keys_populate_sections(tmp_path):
+    """run_pipeline delivers cross_ prefixed keys — sections C/D must resolve them."""
+    from src.comparison_report import build_comparison_report
+    results = {
+        "emb_on_emb":          _make_predictions(seed=0),
+        "notemb_on_notemb":    _make_predictions(seed=1),
+        "cross_emb_on_notemb": _make_predictions(seed=2),
+        "cross_notemb_on_emb": _make_predictions(seed=3),
+    }
+    out = tmp_path / "report.html"
+    build_comparison_report(
+        results=results,
+        training_logs={},
+        increment_cards={},
+        dataset_stats={"counts": {}, "orphan_count": 0, "age_distributions": {}},
+        output_path=out,
+        model_info={"backbone": "dinov2_vits14"},
+    )
+    content = out.read_text(encoding="utf-8")
+    # Both CROSS labels present in section C metric table
+    assert "Emb → NotEmb ★ CROSS" in content
+    assert "NotEmb → Emb ★ CROSS" in content
+    # Section D cross cells carry numeric MAE, not the "N/A" placeholder
+    # (bare "N/A" also occurs inside base64 PNG blobs, so match the cell text).
+    assert "← CROSS" in content
+    assert "MAE = N/A" not in content

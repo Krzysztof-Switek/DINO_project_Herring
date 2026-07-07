@@ -56,11 +56,9 @@ inference:
     annotate_all: false
 
 interpretation:
-  method: patch_token_importance  # patch_token_importance | attention_rollout | gradient_saliency
-  top_k_patches: 20
+  method: auto                    # auto | patch_token_importance | mil_patch_probs
   heatmap_alpha: 0.5
 
 candidates:
   min_peak_distance: 5            # min patch-distance between candidate increments
   prominence_threshold: 0.1
-  profile_axis: vertical          # vertical | horizontal (pionowe zdjęcia otolitów)

@@ -312,3 +312,19 @@ def test_load_model_is_in_eval_mode(tmp_path):
     ckpt_path = _save_checkpoint(model, tmp_path)
     loaded = load_model_from_checkpoint(cfg, ckpt_path, backbone=_MockDinoBackbone())
     assert not loaded.training
+
+
+def test_load_checkpoint_warns_on_missing_keys(tmp_path):
+    """Partial (non-strict) load must emit a RuntimeWarning, not silently succeed."""
+    from src.inference import load_model_from_checkpoint
+    cfg = _make_cfg(tmp_path)
+    model = _make_model(cfg)
+    state = model.state_dict()
+    # Drop a head parameter → forces a missing key on load
+    head_key = next(k for k in state if k.startswith("head."))
+    del state[head_key]
+    ckpt_path = tmp_path / "partial.pt"
+    torch.save({"model_state_dict": state, "epoch": 1}, ckpt_path)
+
+    with pytest.warns(RuntimeWarning):
+        load_model_from_checkpoint(cfg, ckpt_path, backbone=_MockDinoBackbone())

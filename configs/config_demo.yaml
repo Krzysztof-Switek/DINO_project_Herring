@@ -45,14 +45,12 @@ inference:
     annotate_all: false
 
 interpretation:
-  method: patch_token_importance
-  top_k_patches: 20
+  method: auto
   heatmap_alpha: 0.5
 
 candidates:
   min_peak_distance: 5
   prominence_threshold: 0.1
-  profile_axis: vertical
 
 demo:
   enabled: true            # limity działają w OtolithDataset — cały pipeline od razu

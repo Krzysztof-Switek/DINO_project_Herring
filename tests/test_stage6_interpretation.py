@@ -367,3 +367,28 @@ def test_run_interpretation_image_ids_match_loader(tmp_path):
     expected_ids = [f"img_{i:03d}.png" for i in range(4)]
     returned_ids = [r["image_id"] for r in results]
     assert returned_ids == expected_ids
+
+
+def test_importance_mil_method_requires_head():
+    """method='mil_patch_probs' on a CORAL-only model must raise."""
+    import pytest
+    from src.interpretation import compute_patch_importance
+    cfg = _make_cfg()
+    cfg.model.head_type = "coral"
+    model = _make_model(cfg)
+    model.eval()
+    with pytest.raises(RuntimeError):
+        compute_patch_importance(model, _make_single_image_tensor(), method="mil_patch_probs")
+
+
+def test_importance_patch_token_method_returns_grid():
+    """method='patch_token_importance' works without a MIL head and returns (H_p, W_p)."""
+    from src.interpretation import compute_patch_importance
+    cfg = _make_cfg()
+    cfg.model.head_type = "coral"
+    model = _make_model(cfg)
+    model.eval()
+    imp = compute_patch_importance(
+        model, _make_single_image_tensor(), method="patch_token_importance"
+    )
+    assert imp.dim() == 2

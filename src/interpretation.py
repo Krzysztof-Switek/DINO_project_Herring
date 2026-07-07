@@ -23,19 +23,22 @@ from src.utils import resolve_device, tensor_to_uint8_rgb
 def compute_patch_importance(
     model: OtolithModel,
     image_tensor: Tensor,
+    method: str = "auto",
 ) -> Tensor:
-    """Per-patch importance.
+    """Per-patch importance, honouring ``cfg.interpretation.method``.
 
-    For models with a MIL head (``patch_head`` attribute), returns the
-    learned per-patch increment probabilities ∈ [0, 1] — a directly-supervised
-    localisation signal.
-
-    For CORAL-only models, returns the L2 norm of DINOv2 patch tokens as a
-    fallback post-hoc heuristic (no localisation supervision).
+    Supported methods:
+        "auto"                   — MIL patch probabilities if the model has a MIL
+                                   head (``patch_head``), else L2 norm of tokens.
+        "patch_token_importance" — always the L2 norm of DINOv2 patch tokens
+                                   (post-hoc heuristic, no localisation supervision).
+        "mil_patch_probs"        — always the trained MIL patch probabilities;
+                                   raises if the model has no MIL head.
 
     Args:
         model:        OtolithModel in eval mode on the right device
         image_tensor: (1, 3, H, W) or (3, H, W)
+        method:       one of the strings above
 
     Returns:
         importance: FloatTensor (H_p, W_p)
@@ -43,12 +46,19 @@ def compute_patch_importance(
     if image_tensor.dim() == 3:
         image_tensor = image_tensor.unsqueeze(0)
 
-    if hasattr(model, "patch_head"):
-        # MIL: directly trained patch probabilities
+    has_mil = hasattr(model, "patch_head")
+    use_mil = method == "mil_patch_probs" or (method == "auto" and has_mil)
+
+    if use_mil:
+        if not has_mil:
+            raise RuntimeError(
+                "method='mil_patch_probs' requires a MIL head "
+                "(cfg.model.head_type must be 'mil' or 'both')"
+            )
         probs = model.get_patch_probs(image_tensor)        # (1, H_p, W_p)
         return probs.squeeze(0)                             # (H_p, W_p)
 
-    # CORAL-only fallback: L2 norm of patch tokens
+    # L2 norm of patch tokens (patch_token_importance, or auto without MIL head)
     _, patches = model.get_cls_and_patches(image_tensor)   # (1, H_p, W_p, D)
     patches = patches.squeeze(0)                            # (H_p, W_p, D)
     return patches.norm(dim=-1)                             # (H_p, W_p)
@@ -245,7 +255,9 @@ def run_interpretation(
             image_id = image_ids[i]
             single   = images[i : i + 1]
 
-            importance = compute_patch_importance(model, single)   # (H_p, W_p)
+            importance = compute_patch_importance(
+                model, single, method=cfg.interpretation.method,
+            )   # (H_p, W_p)
 
             # Load original-resolution image if possible
             orig_rgb: Optional[np.ndarray] = None

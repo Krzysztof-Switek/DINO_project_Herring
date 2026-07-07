@@ -30,6 +30,13 @@ EMBED_DIMS: Dict[str, int] = {
     "dinov2_vitb14": 768,
     "dinov2_vitl14": 1024,
     "dinov2_vitg14": 1536,
+    # "with registers" variants — recommended for patch-level interpretation, as
+    # register tokens suppress the high-norm artifact patches that otherwise
+    # pollute L2-norm / MIL importance maps (Darcet et al. 2023).
+    "dinov2_vits14_reg": 384,
+    "dinov2_vitb14_reg": 768,
+    "dinov2_vitl14_reg": 1024,
+    "dinov2_vitg14_reg": 1536,
 }
 
 
@@ -129,12 +136,19 @@ class OtolithModel(nn.Module):
                 nn.ReLU(),
             )
 
-        # CORAL head (CLS-based ordinal regression)
+        # CORAL head (CLS-based ordinal regression) — rank-consistent.
+        # A single shared weight vector maps the feature to one scalar score g;
+        # K-1 monotonically-increasing thresholds are then subtracted, so
+        # P(age>0) >= P(age>1) >= ... is GUARANTEED for every sample (Cao et
+        # al. 2020, "Rank consistent ordinal regression"). Thresholds are
+        # parameterised as base + cumulative softplus gaps to stay increasing.
         if self.head_type in {"coral", "both"}:
             self.head = nn.Sequential(
                 nn.Dropout(p=cfg.model.dropout),
-                nn.Linear(embed_dim + meta_hidden, num_outputs),
+                nn.Linear(embed_dim + meta_hidden, 1, bias=False),
             )
+            self.coral_theta0 = nn.Parameter(torch.zeros(1))
+            self.coral_gaps = nn.Parameter(torch.zeros(max(num_outputs - 1, 0)))
 
         # MIL head (per-patch increment scoring — shared MLP across patches)
         if self.head_type in {"mil", "both"}:
@@ -165,7 +179,7 @@ class OtolithModel(nn.Module):
             feat = cls
             if self.use_metadata and metadata is not None:
                 feat = torch.cat([cls, self.meta_proj(metadata)], dim=1)
-            out["coral_logits"] = self.head(feat)     # (B, K-1)
+            out["coral_logits"] = self._coral_logits(feat)   # (B, K-1)
 
         if self.head_type in {"mil", "both"}:
             patch_logits = self.patch_head(patches).squeeze(-1)   # (B, N)
@@ -174,6 +188,21 @@ class OtolithModel(nn.Module):
             out["patch_count"] = patch_probs.sum(dim=1)           # (B,)
 
         return out
+
+    def _coral_logits(self, feat: Tensor) -> Tensor:
+        """Rank-consistent ordinal logits: shared score g minus increasing thresholds.
+
+        thetas = [theta0, theta0+softplus(gap_0), theta0+softplus(gap_0)+softplus(gap_1), …]
+        are strictly increasing, so logits[:, k] = g - thetas[k] are non-increasing
+        in k and the decoded age (# of sigmoids > 0.5) is always a consistent prefix.
+        """
+        g = self.head(feat)                              # (B, 1)
+        gaps = F.softplus(self.coral_gaps)               # (K-2,) >= 0
+        thetas = torch.cat([
+            self.coral_theta0,
+            self.coral_theta0 + torch.cumsum(gaps, dim=0),
+        ])                                               # (K-1,)
+        return g - thetas.unsqueeze(0)                   # (B, K-1)
 
     # ------------------------------------------------------------------
     # Patch access (interpretation / inference)

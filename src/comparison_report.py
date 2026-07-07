@@ -51,9 +51,32 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
 
 def cross_comment(own_mae: float, cross_mae: float) -> str:
     """Return automatic generalization comment based on cross/own MAE ratio."""
+    if np.isnan(own_mae) or np.isnan(cross_mae):
+        return "Brak danych do oceny generalizacji (brak wyników cross)."
     if cross_mae < 1.5 * own_mae:
         return "Model generalizuje dobrze (cross MAE < 1.5 × own MAE)."
     return "Słaba generalizacja cross-domain (cross MAE ≥ 1.5 × own MAE)."
+
+
+# Canonical condition keys used by the report. The pipeline may deliver the
+# cross-domain results under a ``cross_`` prefix (cross_emb_on_notemb, …), so we
+# normalise both spellings to the bare canonical key below.
+CANONICAL_CONDITIONS = ("emb_on_emb", "notemb_on_notemb", "emb_on_notemb", "notemb_on_emb")
+
+
+def normalize_result_keys(results: dict) -> dict:
+    """Accept both bare and ``cross_``-prefixed condition keys.
+
+    ``scripts/run_pipeline.py`` stores cross-domain results as
+    ``cross_emb_on_notemb`` / ``cross_notemb_on_emb`` while the report sections
+    look them up as ``emb_on_notemb`` / ``notemb_on_emb``. This maps the prefixed
+    keys onto the canonical ones without clobbering an already-canonical entry.
+    """
+    normalized = dict(results)
+    for key, df in results.items():
+        if key.startswith("cross_"):
+            normalized.setdefault(key[len("cross_"):], df)
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +284,12 @@ def _plots_per_condition(results: dict, condition_labels: dict) -> str:
         # Box plot
         fig, ax = plt.subplots(figsize=(7, 4))
         labels_list = list(all_errors.keys())
-        ax.boxplot([np.abs(all_errors[l]) for l in labels_list],
-                   labels=[l.replace(" ★ CROSS", "\n★CROSS") for l in labels_list])
+        box_data = [np.abs(all_errors[l]) for l in labels_list]
+        box_ticks = [l.replace(" ★ CROSS", "\n★CROSS") for l in labels_list]
+        try:
+            ax.boxplot(box_data, tick_labels=box_ticks)   # Matplotlib >= 3.9
+        except TypeError:
+            ax.boxplot(box_data, labels=box_ticks)        # older Matplotlib
         ax.set_ylabel("|error| (lata)")
         ax.set_title("Rozkład błędów bezwzględnych")
         fig.tight_layout()
@@ -428,6 +455,9 @@ def build_comparison_report(
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Accept cross_-prefixed keys from the pipeline (see normalize_result_keys).
+    results = normalize_result_keys(results)
 
     if model_info is None:
         model_info = {}

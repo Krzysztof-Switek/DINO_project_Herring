@@ -1,9 +1,10 @@
 """Main entrypoint for OtolithDinoStandalone.
 
 Usage:
-    python main.py                   # train
-    python main.py --mode demo       # 1 epoch + full pipeline check
-    python main.py --mode report     # rebuild HTML report from existing outputs
+    python -m src.entrypoint --mode info     # print resolved config and exit
+    python -m src.entrypoint --mode train    # train
+    python -m src.entrypoint --mode demo     # 1 epoch + full pipeline check
+    python -m src.entrypoint --mode report   # rebuild HTML report from existing outputs
 """
 from __future__ import annotations
 
@@ -28,7 +29,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--mode",
         type=str,
         default="train",
-        choices=["train", "inference", "eval", "report", "demo"],
+        choices=["info", "train", "inference", "eval", "report", "demo"],
         help="Run mode",
     )
     return parser.parse_args(argv)
@@ -69,6 +70,13 @@ def run(argv: list[str] | None = None) -> int:
 
     root    = PROJECT_ROOT
     out_dir = root / cfg.inference.output_dir
+
+    # ------------------------------------------------------------------
+    # info — print the resolved config and exit (no training)
+    # ------------------------------------------------------------------
+    if args.mode == "info":
+        print_config_summary(cfg)
+        return 0
 
     # ------------------------------------------------------------------
     # train

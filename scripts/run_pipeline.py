@@ -136,6 +136,7 @@ def _parse_train_log(log_path: Path) -> list[dict]:
         r"train_loss=([\d.]+)\s+"
         r"val_loss=([\d.]+)\s+"
         r"val_mae=([\d.]+)"
+        r"(?:\s+lr=([\d.eE+-]+))?"
     )
     rows: list[dict] = []
     try:
@@ -146,12 +147,17 @@ def _parse_train_log(log_path: Path) -> list[dict]:
         m = pattern.search(line)
         if m:
             try:
-                rows.append({
+                row = {
                     "epoch":      int(m.group(1)),
                     "train_loss": float(m.group(2)),
                     "val_loss":   float(m.group(3)),
                     "val_mae":    float(m.group(4)),
-                })
+                }
+                # lr is optional — only present in logs written by the newer
+                # Trainer; keep the row shape unchanged for older logs.
+                if m.group(5) is not None:
+                    row["lr"] = float(m.group(5))
+                rows.append(row)
             except ValueError:
                 continue
     return rows
@@ -198,6 +204,32 @@ def _step_train(cfg, labels_csv: Path) -> tuple[Path, list[dict]]:
     return best_ckpt, training_log_data
 
 
+def _select_topk_image_ids(pred_csv: Path, k_best: int, k_worst: int) -> set[str]:
+    """image_ids of the k_best closest + k_worst farthest-off predictions.
+
+    ``run_inference`` writes the ground-truth column as ``target_age``; it is
+    normalised to ``age`` here so the |predicted - true| ranking works. Returns
+    an empty set when the file is missing or the required columns are absent.
+    """
+    import pandas as pd
+
+    if not Path(pred_csv).exists():
+        return set()
+    try:
+        df = pd.read_csv(pred_csv)
+    except Exception:
+        return set()
+    if "target_age" in df.columns and "age" not in df.columns:
+        df = df.rename(columns={"target_age": "age"})
+    if "age" not in df.columns or "predicted_age" not in df.columns:
+        return set()
+    df = df.assign(_err=(df["predicted_age"] - df["age"]).abs()).sort_values("_err")
+    return (
+        set(df.head(k_best)["image_id"].astype(str))
+        | set(df.tail(k_worst)["image_id"].astype(str))
+    )
+
+
 def _step_infer(cfg, ckpt_path: Path, labels_csv: Path, output_dir: Path) -> Path:
     """Run inference for all test samples; then interpretation+candidates for top-k only."""
     import pandas as pd
@@ -227,24 +259,12 @@ def _step_infer(cfg, ckpt_path: Path, labels_csv: Path, output_dir: Path) -> Pat
 
     # --- Step B: select top-k best + top-k worst for interpretation ---
     pred_csv = output_dir / "predictions.csv"
-    top_k = cfg.inference.increment_samples.top_k_best + cfg.inference.increment_samples.top_k_worst
-    top_ids: set[str] = set()
-    if pred_csv.exists():
-        try:
-            pred_df = pd.read_csv(pred_csv)
-            if "age" in pred_df.columns and "predicted_age" in pred_df.columns:
-                pred_df["_err"] = (pred_df["predicted_age"] - pred_df["age"]).abs()
-                pred_df = pred_df.sort_values("_err")
-                k_best  = cfg.inference.increment_samples.top_k_best
-                k_worst = cfg.inference.increment_samples.top_k_worst
-                top_ids = (
-                    set(pred_df.head(k_best)["image_id"].astype(str))
-                    | set(pred_df.tail(k_worst)["image_id"].astype(str))
-                )
-                print(f"  Interpretacja dla {len(top_ids)} próbek "
-                      f"({k_best} najlepszych + {k_worst} najgorszych)")
-        except Exception as e:
-            print(f"  Uwaga: nie można wybrać top-k ({e}) — interpretacja dla wszystkich")
+    k_best  = cfg.inference.increment_samples.top_k_best
+    k_worst = cfg.inference.increment_samples.top_k_worst
+    top_ids = _select_topk_image_ids(pred_csv, k_best, k_worst)
+    if top_ids:
+        print(f"  Interpretacja dla {len(top_ids)} próbek "
+              f"({k_best} najlepszych + {k_worst} najgorszych)")
 
     if top_ids:
         # Build a filtered dataset with only the top-k image_ids
