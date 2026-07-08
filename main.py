@@ -23,6 +23,9 @@ SKIP_TRAIN = False  # True  = pomija trening; używa istniejących checkpoints
 FRESH      = False  # True  = kasuje pipeline_state.json i robi pełny re-run od zera
                     #         (użyj, gdy „wszystkie kroki pominięte bo już wykonane”)
 
+EMBEDDED_ONLY = True  # True = trenuj/raportuj TYLKO Embedded (szybciej;
+                       #        pomija NotEmbedded i cross-domain). Kod NotEmbedded zostaje.
+
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -51,6 +54,8 @@ if SKIP_TRAIN:
     ARGV.append("--skip-train")
 if FRESH:
     ARGV.append("--fresh")
+if EMBEDDED_ONLY:
+    ARGV.append("--embedded-only")
 
 sys.path.insert(0, str(PROJECT_ROOT))
 

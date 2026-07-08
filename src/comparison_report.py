@@ -555,8 +555,21 @@ def build_comparison_report(
     if model_info is None:
         model_info = {}
 
+    # Embedded-only runs deliver a single condition — flag it so the report isn't
+    # mistaken for a broken cross-domain comparison.
+    n_present = sum(1 for k in CANONICAL_CONDITIONS
+                    if results.get(k) is not None and not results[k].empty)
+    single_note = ""
+    if n_present <= 1:
+        single_note = (
+            '<p style="background:#eef2ff;padding:8px;border-left:3px solid #2a78d6;">'
+            'Tryb <b>Embedded-only</b> — trenowany i oceniany tylko jeden model; '
+            'brak porównania cross-domain (Embedded vs NotEmbedded).</p>'
+        )
+
     body = (
-        _section_a(dataset_stats)
+        single_note
+        + _section_a(dataset_stats)
         + _section_b(training_logs)
         + _section_c(results)
         + _section_d(results)

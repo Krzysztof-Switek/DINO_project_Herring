@@ -62,3 +62,14 @@ def test_detect_and_draw_rings_wrapper():
     scales, overlay = detect_and_draw_rings(img_rgb, axis_info, prominence=0.1)
     assert overlay.shape == img_rgb.shape
     assert len(scales) >= 1
+
+
+def test_build_tuning_montage():
+    from scripts.tune_image_rings import build_tuning_montage
+    gray, mask, centroid, contour = _synthetic_otolith(n_bands=4)
+    axis_info = {"centroid": centroid, "contour": contour, "mask": mask}
+    img_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+    montage, counts = build_tuning_montage(img_rgb, axis_info, [0.1, 0.2], ["bright"])
+    assert len(counts) == 2                              # 2 prominence × 1 polarity
+    assert montage.shape[1] >= img_rgb.shape[1] * 3      # original + 2 variants side by side
+    assert montage.shape[0] >= img_rgb.shape[0]          # caption bar added on top

@@ -643,6 +643,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Skip steps 2-3; use existing checkpoints")
     p.add_argument("--fresh", action="store_true",
                    help="Delete output-dir/pipeline_state.json first (force a full re-run)")
+    p.add_argument("--embedded-only", action="store_true", dest="embedded_only",
+                   help="Only Embedded: train_e + infer_ee + cards + report "
+                        "(skip NotEmbedded training and all cross-domain inference)")
     p.add_argument("--dry-run", action="store_true",
                    help="Print planned steps without executing them")
     return p.parse_args(argv)
@@ -669,6 +672,8 @@ def main(argv: list[str] | None = None) -> None:
             skip_set.add("scan")
         if args.skip_train:
             skip_set.update({"train_e", "train_n"})
+        if args.embedded_only:
+            skip_set.update({"train_n", "infer_nn", "infer_en", "infer_ne"})
         print("=== DRY RUN — pipeline steps ===")
         for i, step in enumerate(STEPS, 1):
             status = "SKIP" if step in skip_set else "RUN "
@@ -729,7 +734,9 @@ def main(argv: list[str] | None = None) -> None:
         else:
             print("\n[2/9] TRAIN Embedded — pominięty (już wykonany)")
 
-        if "train_n" not in completed:
+        if args.embedded_only:
+            print("\n[3/9] TRAIN NotEmbedded — pominięty (--embedded-only)")
+        elif "train_n" not in completed:
             print("\n[3/9] TRAIN — NotEmbedded")
             ckpt_notemb, logs_notemb = _step_train(cfg_notemb, notemb_labels)
             completed.append("train_n")
@@ -746,6 +753,9 @@ def main(argv: list[str] | None = None) -> None:
         ("infer_en", "cross_emb_on_notemb",  cfg_emb,    ckpt_emb,    notemb_labels),
         ("infer_ne", "cross_notemb_on_emb",  cfg_notemb, ckpt_notemb, emb_labels),
     ]
+    if args.embedded_only:
+        conditions = [c for c in conditions if c[0] == "infer_ee"]
+
     pred_csvs: dict[str, Path] = {}
     step_nums = {"infer_ee": 4, "infer_nn": 5, "infer_en": 6, "infer_ne": 7}
 

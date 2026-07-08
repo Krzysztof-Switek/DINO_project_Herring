@@ -450,16 +450,22 @@ def draw_reasoning_card(
     else:
         panel4 = _placeholder_panel(H, W, "Oś niedostępna")
 
-    # --- Panel 5: concentric annual rings (model-detected) ---
-    n_peaks = int(len(peak_indices)) if peak_indices is not None else 0
-    if axis_info is not None and line_xy is not None and peak_indices is not None:
+    # --- Panel 5: model-derived ring CURVES (locus of high MIL probability) ---
+    # Extract real ring lines from the 2-D probability map (radial peaks per
+    # direction → clustered → connected), instead of the old scaled-contour
+    # approximation. Empty on an untrained model (flat map) — expected.
+    if axis_info is not None:
+        from src.ring_extraction import extract_ring_curves, draw_ring_curves
         panel5 = original_rgb.copy()
-        ring_thickness = max(2, line_thickness + 1)
-        _draw_concentric_rings(panel5, axis_info, peak_indices, line_xy, ring_thickness)
+        ring_curves = extract_ring_curves(importance_grid, axis_info, H, W)
+        draw_ring_curves(panel5, ring_curves, thickness=max(2, line_thickness + 1))
         _draw_axis_overlay(panel5, axis_info, line_thickness, cross_size)
-        _draw_numbered_dots(panel5, peak_indices, line_xy, dot_radius)
+        if line_xy is not None and peak_indices is not None:
+            _draw_numbered_dots(panel5, peak_indices, line_xy, dot_radius)
+        n_rings = len(ring_curves)
     else:
         panel5 = _placeholder_panel(H, W, "Pierscienie niedostepne")
+        n_rings = 0
 
     # --- Panel 6: final verdict ---
     panel6 = original_rgb.copy()
@@ -488,7 +494,7 @@ def draw_reasoning_card(
         "2. Segmentacja otolitu",
         "3. Mapa uwagi (inferno)",
         "4. Os pomiaru + profil 1D",
-        f"5. Pierscienie roczne (N={n_peaks})",
+        f"5. Pierscienie roczne (N={n_rings})",
         f"6. Werdykt: wiek = {int(predicted_age)}",
     ]
     panels = [panel1, panel2, panel3, panel4, panel5, panel6]

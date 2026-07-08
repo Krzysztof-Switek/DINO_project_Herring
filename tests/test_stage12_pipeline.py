@@ -215,6 +215,22 @@ def test_fresh_flag_clears_state(tmp_path, capsys):
     assert "(completed)" not in out       # nothing is marked done anymore
 
 
+def test_embedded_only_dry_run(tmp_path, capsys):
+    """--embedded-only runs only Embedded steps; NotEmbedded + cross are SKIP."""
+    from scripts.run_pipeline import main as rp_main
+
+    rp_main([
+        "--output-dir", str(tmp_path),
+        "--base-config", str(PROJECT_ROOT / "configs" / "config_demo.yaml"),
+        "--embedded-only", "--dry-run",
+    ])
+    out = capsys.readouterr().out
+    assert "[RUN ] train_e" in out
+    assert "[RUN ] infer_ee" in out
+    for skipped in ("train_n", "infer_nn", "infer_en", "infer_ne"):
+        assert f"[SKIP] {skipped}" in out
+
+
 # ---------------------------------------------------------------------------
 # test_pipeline_state_file
 # ---------------------------------------------------------------------------

@@ -103,8 +103,11 @@ class InterpretationConfig(BaseModel):
 class CandidatesConfig(BaseModel):
     min_peak_distance: int = Field(5, ge=1)
     prominence_threshold: float = Field(0.1, ge=0.0)
-    # Experimental: also detect annual rings directly from the image (alternating
-    # light/dark bands) and save an overlay. Off by default; needs tuning on real data.
+    # Experimental / diagnostic only. Classical image-based ring detection was
+    # evaluated on the current photos (whole otoliths, reflected light) and does
+    # NOT reliably recover annual rings — the ring signal is too weak/ambiguous
+    # (see plans and summaries/7.07_TO_DO.md, "wynik negatywny"). Kept OFF; the
+    # trained model is the ring signal. Revisit only with better imaging.
     detect_image_rings: bool = False
 
 

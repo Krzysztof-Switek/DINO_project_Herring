@@ -12,10 +12,13 @@ Pipeline:
     draw_scaled_rings()    — overlay those rings on the photo
     detect_and_draw_rings()— convenience wrapper returning (scales, overlay)
 
-Status: EXPERIMENTAL. The peak thresholds need tuning on real otolith images and
-the light/dark polarity depends on the imaging (reflected vs transmitted light).
-Off by default in the pipeline (``candidates.detect_image_rings``). Intended to be
-fused with the model's peaks once both are validated on a trained run.
+Status: EXPERIMENTAL / DIAGNOSTIC ONLY. Evaluated on the current photos (whole
+otoliths, reflected light) via scaled-contour, axis-transect+CLAHE and polar-unwrap
+methods — annual rings are NOT reliably recoverable (signal too weak; irregular
+otolith boundary produces false peaks). See "wynik negatywny" in
+``plans and summaries/7.07_TO_DO.md``. Kept as a tool for future, better imaging
+(sections / transmitted light / higher magnification); OFF by default
+(``candidates.detect_image_rings``). The trained model is the ring signal.
 """
 from __future__ import annotations
 
