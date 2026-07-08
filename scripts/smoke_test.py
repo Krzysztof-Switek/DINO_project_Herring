@@ -167,7 +167,8 @@ def run_smoke_test():
             model = OtolithModel(cfg, backbone=_MockDinoBackbone())
             trainer = Trainer(cfg, model, train_loader, val_loader)
             trainer.fit()
-            ckpts = sorted(Path(cfg.training.checkpoint_dir).glob("*.pt"))
+            # one checkpoint per epoch (best.pt is a copy, excluded from the count)
+            ckpts = sorted(Path(cfg.training.checkpoint_dir).glob("checkpoint_epoch*.pt"))
             assert len(ckpts) == 2
 
         train()
@@ -228,7 +229,7 @@ def run_smoke_test():
                 op = Path(r["candidates_overlay_path"])
                 assert jp.exists() and op.exists()
                 data = json.loads(jp.read_text(encoding="utf-8"))
-                for k in ("image_id", "num_candidates", "peak_pixel_positions", "radial_profile"):
+                for k in ("image_id", "num_candidates", "peak_profile_indices", "radial_profile"):
                     assert k in data
 
         candidates()
@@ -242,9 +243,9 @@ def run_smoke_test():
             assert len(json_files) == 4
             for jf in json_files:
                 d = json.loads(jf.read_text(encoding="utf-8"))
-                assert isinstance(d["peak_pixel_positions"], list)
+                assert isinstance(d["peak_profile_indices"], list)
                 assert isinstance(d["radial_profile"], list)
-                assert d["num_candidates"] == len(d["peak_pixel_positions"])
+                assert d["num_candidates"] == len(d["peak_profile_indices"])
 
         validate_schema()
 

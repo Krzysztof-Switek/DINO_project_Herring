@@ -11,8 +11,6 @@ Generates a self-contained HTML file with sections:
 """
 from __future__ import annotations
 
-import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +27,39 @@ from src.report_common import compute_metrics, fig_to_b64, img_tag, pil_to_b64, 
 
 __all__ = ["compute_metrics", "cross_comment", "normalize_result_keys",
            "build_comparison_report"]
+
+
+# Colour follows the CONDITION (the entity), consistently across EVERY chart —
+# not matplotlib's per-figure default cycle. 4-hue categorical palette validated
+# with the dataviz validate_palette.js (light mode: all ≥3:1 contrast).
+_COND_COLORS = {
+    "emb_on_emb":       "#2a78d6",   # blue
+    "notemb_on_notemb": "#eb6834",   # orange
+    "emb_on_notemb":    "#008300",   # green
+    "notemb_on_emb":    "#4a3aa7",   # violet
+}
+_LABEL_COLORS = {
+    "Emb → Emb":            "#2a78d6",
+    "NotEmb → NotEmb":      "#eb6834",
+    "Emb → NotEmb ★ CROSS": "#008300",
+    "NotEmb → Emb ★ CROSS": "#4a3aa7",
+}
+_PTYPE_COLORS = {"Embedded": "#2a78d6", "NotEmbedded": "#eb6834"}
+_INK, _MUTED, _GRID = "#0b0b0b", "#898781", "#e1e0d9"
+
+
+def _style_ax(ax) -> None:
+    """Recessive hairline grid + muted axes (dataviz chrome). Call on every axis."""
+    ax.set_axisbelow(True)
+    ax.grid(True, color=_GRID, linewidth=0.6)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(_MUTED)
+    ax.tick_params(colors=_MUTED, labelcolor=_INK)
+    ax.title.set_color(_INK)
+    ax.xaxis.label.set_color(_MUTED)
+    ax.yaxis.label.set_color(_MUTED)
 
 
 # ---------------------------------------------------------------------------
@@ -97,17 +128,22 @@ def _section_a(dataset_stats: dict) -> str:
     age_data = dataset_stats.get("age_distributions", {})
     plots_html = ""
     if age_data:
-        fig, ax = plt.subplots(figsize=(6, 3))
-        colors = {"Embedded": "#2196F3", "NotEmbedded": "#FF9800"}
-        for ptype, ages in age_data.items():
-            if ages:
-                ax.hist(ages, bins=range(0, 21), alpha=0.6, label=ptype, color=colors.get(ptype))
-        ax.set_xlabel("Wiek (lata)")
-        ax.set_ylabel("Liczba zdjęć")
-        ax.set_title("Rozkład wiekowy: Embedded vs NotEmbedded")
-        ax.legend()
-        plots_html = _img_tag(_fig_to_b64(fig))
-        plt.close(fig)
+        present = [(p, ages) for p, ages in age_data.items() if ages]
+        if present:
+            fig, ax = plt.subplots(figsize=(7, 3))
+            ax.hist([ages for _, ages in present],
+                    bins=range(0, 21),
+                    label=[p for p, _ in present],
+                    color=[_PTYPE_COLORS.get(p, "#888888") for p, _ in present])
+            ax.set_xlabel("Wiek (lata)")
+            ax.set_ylabel("Liczba zdjęć")
+            ax.set_title("Rozkład wiekowy: Embedded vs NotEmbedded")
+            ax.set_xticks(range(0, 21, 2))
+            ax.legend()
+            _style_ax(ax)
+            fig.tight_layout()
+            plots_html = _img_tag(_fig_to_b64(fig))
+            plt.close(fig)
 
     return f"""
 <section id="A">
@@ -137,22 +173,23 @@ def _section_b(training_logs: dict) -> str:
         best_mae = val_mae[best_epoch] if best_epoch is not None else float("nan")
 
         fig, axes = plt.subplots(1, 3, figsize=(12, 3))
-        axes[0].plot(epochs, train_loss, label="train_loss")
-        axes[0].plot(epochs, val_loss, label="val_loss")
+        axes[0].plot(epochs, train_loss, label="train_loss", color="#2a78d6", linewidth=2)
+        axes[0].plot(epochs, val_loss, label="val_loss", color="#eb6834", linewidth=2)
         if best_epoch is not None:
-            axes[0].axvline(epochs[best_epoch], color="red", linestyle="--", alpha=0.5)
+            axes[0].axvline(epochs[best_epoch], color=_MUTED, linestyle="--", alpha=0.7)
         axes[0].set_title(f"Loss — {key}")
         axes[0].legend()
-        axes[1].plot(epochs, val_mae)
+        axes[1].plot(epochs, val_mae, color="#008300", linewidth=2)
         if best_epoch is not None:
-            axes[1].axvline(epochs[best_epoch], color="red", linestyle="--", alpha=0.5,
+            axes[1].axvline(epochs[best_epoch], color=_MUTED, linestyle="--", alpha=0.7,
                             label=f"best={best_mae:.3f}")
         axes[1].set_title("val_MAE")
         axes[1].legend()
-        axes[2].plot(epochs, lr)
+        axes[2].plot(epochs, lr, color="#4a3aa7", linewidth=2)
         axes[2].set_title("Learning rate")
         for ax in axes:
             ax.set_xlabel("Epoka")
+            _style_ax(ax)
         fig.tight_layout()
         html += _img_tag(_fig_to_b64(fig))
         plt.close(fig)
@@ -197,14 +234,17 @@ def _section_c(results: dict) -> str:
             "Bias": f"{m['Bias']:+.3f}",
         })
 
-        # Scatter
+        # Scatter — colour = condition (consistent with all other charts)
         fig, ax = plt.subplots(figsize=(4, 4))
-        ax.scatter(y_true, y_pred, alpha=0.4, s=8)
+        ax.scatter(y_true, y_pred, alpha=0.5, s=16,
+                   color=_COND_COLORS.get(cond_key, "#2a78d6"), edgecolor="none")
         lo, hi = min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())
-        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1)
-        ax.set_xlabel("True age")
-        ax.set_ylabel("Predicted age")
+        ax.plot([lo, hi], [lo, hi], color=_MUTED, linestyle="--", linewidth=1)
+        ax.set_xlabel("Wiek rzeczywisty")
+        ax.set_ylabel("Wiek przewidziany")
         ax.set_title(f"{label}\nMAE={m['MAE']:.2f}")
+        _style_ax(ax)
+        fig.tight_layout()
         scatter_figs.append(_fig_to_b64(fig))
         plt.close(fig)
 
@@ -249,41 +289,65 @@ def _plots_per_condition(results: dict, condition_labels: dict) -> str:
         all_mae_per_age[label] = mae_per_age
 
     if all_errors:
-        # Error histogram
-        fig, ax = plt.subplots(figsize=(7, 3))
-        for label, errs in all_errors.items():
-            ax.hist(errs, bins=20, alpha=0.5, label=label)
-        ax.axvline(0, color="black", linewidth=1)
-        ax.set_xlabel("Predicted − True (lata)")
-        ax.set_title("Rozkład błędów")
-        ax.legend(fontsize=7)
+        # Signed-error distribution per condition. Grouped (side-by-side) bars on
+        # integer-year bins — no overlap, so systematic bias (over/under-estimation)
+        # and spread are legible. 0 = trafienie; ujemne = zaniżanie wieku.
+        all_vals = np.concatenate([np.asarray(v, dtype=float) for v in all_errors.values()])
+        lo = int(np.floor(all_vals.min()))
+        hi = int(np.ceil(all_vals.max()))
+        edges = np.arange(lo - 0.5, hi + 1.5, 1.0)   # bins centred on integers
+        data = [np.asarray(all_errors[l], dtype=float) for l in all_errors]
+
+        colors = [_LABEL_COLORS.get(l, "#888888") for l in all_errors]
+        fig, ax = plt.subplots(figsize=(9, 3.4))
+        ax.hist(data, bins=edges, label=list(all_errors.keys()), color=colors)
+        ax.axvline(0, color=_INK, linewidth=1.2)
+        ax.set_xlabel("Błąd = przewidziany − rzeczywisty wiek (lata)")
+        ax.set_ylabel("Liczba obrazów")
+        ax.set_title("Rozkład błędów per warunek (0 = trafienie)")
+        ax.set_xticks(range(lo, hi + 1))
+        ax.legend(fontsize=7, loc="upper right", framealpha=0.9)
+        _style_ax(ax)
+        fig.tight_layout()
         html += _img_tag(_fig_to_b64(fig))
         plt.close(fig)
 
-        # Box plot
+        # Box plot of |error| — box fill = condition colour
         fig, ax = plt.subplots(figsize=(7, 4))
         labels_list = list(all_errors.keys())
         box_data = [np.abs(all_errors[l]) for l in labels_list]
         box_ticks = [l.replace(" ★ CROSS", "\n★CROSS") for l in labels_list]
         try:
-            ax.boxplot(box_data, tick_labels=box_ticks)   # Matplotlib >= 3.9
+            bp = ax.boxplot(box_data, tick_labels=box_ticks, patch_artist=True)
         except TypeError:
-            ax.boxplot(box_data, labels=box_ticks)        # older Matplotlib
-        ax.set_ylabel("|error| (lata)")
+            bp = ax.boxplot(box_data, labels=box_ticks, patch_artist=True)
+        for patch, l in zip(bp["boxes"], labels_list):
+            patch.set_facecolor(_LABEL_COLORS.get(l, "#888888"))
+            patch.set_alpha(0.75)
+        for med in bp["medians"]:
+            med.set_color(_INK)
+        ax.set_ylabel("|błąd| (lata)")
         ax.set_title("Rozkład błędów bezwzględnych")
+        _style_ax(ax)
         fig.tight_layout()
         html += _img_tag(_fig_to_b64(fig))
         plt.close(fig)
 
     if all_mae_per_age:
+        age_union = sorted({a for d in all_mae_per_age.values() for a in d})
         fig, ax = plt.subplots(figsize=(8, 4))
         for label, mae_dict in all_mae_per_age.items():
             ages = sorted(mae_dict.keys())
-            ax.plot(ages, [mae_dict[a] for a in ages], marker="o", markersize=4, label=label)
-        ax.set_xlabel("Klasa wiekowa")
+            ax.plot(ages, [mae_dict[a] for a in ages], marker="o", markersize=5,
+                    linewidth=2, color=_LABEL_COLORS.get(label, "#888888"), label=label)
+        ax.set_xlabel("Klasa wiekowa (lata)")
         ax.set_ylabel("MAE (lata)")
         ax.set_title("MAE per klasa wiekowa")
+        if age_union:
+            ax.set_xticks(age_union)
         ax.legend(fontsize=7)
+        _style_ax(ax)
+        fig.tight_layout()
         html += _img_tag(_fig_to_b64(fig))
         plt.close(fig)
 
@@ -361,12 +425,12 @@ od jądra (centroid) do najdalszej krawędzi konturu (zwykle post-rostralnej):</
       dół = brzeg), oś pozioma = wartość ważności. <i>Czerwone kropki + przerywane
       poziome linie</i> w tej wstawce = wykryte peaki profilu (kandydaci na
       przyrosty roczne).</li>
-  <li><b>Strefy roczne</b> — obszary <i>między kolejnymi peakami</i>, każdy w
-      innym kolorze (czerwony / niebieski / zielony / fioletowy …). Tu widać
-      <i>jak duży obszar otolitu</i> model przypisuje każdemu rocznemu
-      przyrostowi. <b>Jeśli model nie wykrył ani jednego peaku, cały otolit
-      jest zalany jednym kolorem</b> — to nie jest brakujący render, to
-      sygnał, że profil 1D był płaski.</li>
+  <li><b>Pierścienie roczne</b> — <i>koncentryczne kontury</i> (skalowane kopie
+      obrysu otolitu) w promieniach wykrytych przyrostów, każdy w innym kolorze;
+      <b>każdy pierścień przechodzi przez ponumerowaną kropkę na osi pomiaru</b>.
+      Przybliżają rzeczywiste, mniej więcej samopodobne pierścienie roczne (rosną
+      na zewnątrz zachowując kształt otolitu). <b>Brak pierścieni = model nie
+      wykrył peaków</b> (profil 1D płaski) — to sygnał, nie brakujący render.</li>
   <li><b>Werdykt</b> — końcowa anotacja: żółta oś + <i>ponumerowane żółte
       kropki</i> w pozycjach peaków + przewidziany wiek (zielona ramka = trafny,
       czerwona = błąd). <b>Brak ponumerowanych kropek na osi = peak-detector
@@ -490,7 +554,6 @@ def build_comparison_report(
 
     if model_info is None:
         model_info = {}
-    model_info.setdefault("Wygenerowano", datetime.now().strftime("%Y-%m-%d %H:%M"))
 
     body = (
         _section_a(dataset_stats)

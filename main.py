@@ -20,6 +20,9 @@ SKIP_SCAN  = False   # True  = używaj istniejących data/labels_*.csv
 
 SKIP_TRAIN = False  # True  = pomija trening; używa istniejących checkpoints
 
+FRESH      = False  # True  = kasuje pipeline_state.json i robi pełny re-run od zera
+                    #         (użyj, gdy „wszystkie kroki pominięte bo już wykonane”)
+
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -46,6 +49,8 @@ if SKIP_SCAN:
     ARGV.append("--skip-scan")
 if SKIP_TRAIN:
     ARGV.append("--skip-train")
+if FRESH:
+    ARGV.append("--fresh")
 
 sys.path.insert(0, str(PROJECT_ROOT))
 

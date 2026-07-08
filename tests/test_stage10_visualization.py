@@ -182,6 +182,29 @@ def test_compute_ring_zones_no_peaks_collapses_to_zone_zero():
     assert int(zones[0, 0]) == 255
 
 
+def test_draw_concentric_rings_draws_when_peaks_present():
+    """Rings are drawn for detected peaks, and nothing when there are no peaks."""
+    import cv2
+    from src.visualization import _draw_concentric_rings
+
+    H, W = 100, 80
+    mask = np.zeros((H, W), np.uint8)
+    cv2.ellipse(mask, (W // 2, H // 2), (25, 40), 0, 0, 360, 255, -1)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    axis_info = {"centroid": (W // 2, H // 2), "far_edge": (W // 2, H // 2 - 40),
+                 "contour": max(cnts, key=cv2.contourArea)}
+    line_xy = np.array([[W // 2, H // 2 - int(40 * i / 49)] for i in range(50)])
+
+    base = np.full((H, W, 3), 200, np.uint8)
+    with_rings = base.copy()
+    _draw_concentric_rings(with_rings, axis_info, np.array([10, 30]), line_xy, thickness=2)
+    assert not np.array_equal(base, with_rings)          # rings modified the panel
+
+    no_peaks = base.copy()
+    _draw_concentric_rings(no_peaks, axis_info, np.array([], dtype=int), line_xy, thickness=2)
+    assert np.array_equal(base, no_peaks)                # no peaks → untouched
+
+
 def test_draw_reasoning_card_shape_with_axis():
     from src.visualization import draw_reasoning_card
     H, W = 120, 200

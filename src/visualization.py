@@ -6,7 +6,7 @@ Each card shows the model's path from raw image to age verdict in 6 panels:
   2. Otolith segmentation           — silhouette + nucleus (classical CV)
   3. Attention heatmap              — inferno colormap, masked to otolith
   4. Measurement axis + 1D profile  — biological axis with importance along it
-  5. Annual ring zones              — bands between consecutive profile peaks
+  5. Annual rings                   — concentric contours at detected peak radii
   6. Final verdict                  — numbered dots on axis + predicted age
 
 If segmentation or axis detection fails for an image, panels 2 / 4 / 5 are
@@ -168,12 +168,30 @@ def _title_height(H: int) -> int:
     return max(28, H // 22)
 
 
+def _fit_font_scale(text: str, max_w: int, start_scale: float,
+                    thickness_ratio: float = 2.0, min_scale: float = 0.3,
+                    step: float = 0.05) -> float:
+    """Largest FONT_HERSHEY_SIMPLEX scale (≤ start_scale) whose text fits ``max_w`` px.
+
+    Single source of truth for "shrink text until it fits the panel" — used by the
+    verdict label and the panel title bars so nothing spills off the print-out.
+    """
+    scale = start_scale
+    while scale > min_scale:
+        thickness = max(1, int(scale * thickness_ratio))
+        (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        if tw <= max_w:
+            break
+        scale = max(min_scale, scale - step)
+    return scale
+
+
 def _add_title(img: np.ndarray, title: str) -> np.ndarray:
     """Stack a dark title bar (with white text) above the image."""
     H, W = img.shape[:2]
     th = _title_height(H)
     bar = np.full((th, W, 3), _TITLE_BG, dtype=np.uint8)
-    font_scale = max(0.45, th / 55.0)
+    font_scale = _fit_font_scale(title, W - 16, max(0.45, th / 55.0), thickness_ratio=1.8)
     thickness = max(1, int(font_scale * 1.8))
     (tw, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
     tx = max(8, (W - tw) // 2)
@@ -198,27 +216,36 @@ def _placeholder_panel(H: int, W: int, message: str) -> np.ndarray:
 
 def _draw_colorbar(panel: np.ndarray, label_low: str = "niski", label_high: str = "wysoki",
                    colormap: int = DEFAULT_COLORMAP) -> np.ndarray:
-    """Render an inferno colorbar in the right ~10% of ``panel`` (in place)."""
+    """Render an inferno colorbar inside the right edge of ``panel`` (in place).
+
+    Labels are drawn to the LEFT of the bar (right-aligned) on a dark background,
+    so neither the bar nor the text ever spills outside the panel on print-outs.
+    """
     H, W = panel.shape[:2]
-    bar_w = max(12, W // 14)
-    margin = max(6, W // 80)
-    bar_h = max(40, int(H * 0.55))
+    bar_w = max(10, W // 22)
+    margin = max(6, W // 60)
+    bar_h = max(40, int(H * 0.50))
     x0 = W - bar_w - margin
     y0 = (H - bar_h) // 2
 
-    ramp = np.linspace(255, 0, bar_h, dtype=np.uint8).reshape(-1, 1)
-    ramp = np.repeat(ramp, bar_w, axis=1)
-    bgr = cv2.applyColorMap(ramp, colormap)
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    panel[y0:y0 + bar_h, x0:x0 + bar_w] = rgb
-    cv2.rectangle(panel, (x0 - 1, y0 - 1), (x0 + bar_w, y0 + bar_h),
-                  _TITLE_FG, 1)
-    font_scale = max(0.35, H / 900.0)
+    ramp = np.repeat(np.linspace(255, 0, bar_h, dtype=np.uint8).reshape(-1, 1), bar_w, axis=1)
+    panel[y0:y0 + bar_h, x0:x0 + bar_w] = cv2.cvtColor(
+        cv2.applyColorMap(ramp, colormap), cv2.COLOR_BGR2RGB)
+    cv2.rectangle(panel, (x0 - 1, y0 - 1), (x0 + bar_w, y0 + bar_h), _TITLE_FG, 1)
+
+    font_scale = max(0.3, H / 1300.0)
     thickness = max(1, int(font_scale * 2))
-    cv2.putText(panel, label_high, (x0 - 2, max(12, y0 - 4)),
-                cv2.FONT_HERSHEY_SIMPLEX, font_scale, _TITLE_FG, thickness, cv2.LINE_AA)
-    cv2.putText(panel, label_low, (x0 - 2, min(H - 4, y0 + bar_h + int(font_scale * 28))),
-                cv2.FONT_HERSHEY_SIMPLEX, font_scale, _TITLE_FG, thickness, cv2.LINE_AA)
+
+    def _label_left(text: str, y_baseline: int) -> None:
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        tx = max(2, x0 - 4 - tw)                       # right-align to the LEFT of the bar
+        ty = int(np.clip(y_baseline, th + 2, H - 2))
+        cv2.rectangle(panel, (tx - 2, ty - th - 2), (tx + tw + 2, ty + 2), _TITLE_BG, -1)
+        cv2.putText(panel, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, _TITLE_FG, thickness, cv2.LINE_AA)
+
+    _label_left(label_high, y0 + 14)                   # near top of bar (high)
+    _label_left(label_low, y0 + bar_h - 2)             # near bottom of bar (low)
     return panel
 
 
@@ -285,8 +312,13 @@ def _draw_axis_overlay(
     axis_info: dict,
     line_thickness: int,
     cross_size: int,
+    draw_axis: bool = True,
 ) -> None:
-    """Draw contour + centroid cross + axis line on ``panel`` (in place)."""
+    """Draw contour + centroid cross (+ measurement axis if ``draw_axis``) in place.
+
+    Panel 2 (segmentation) sets ``draw_axis=False`` — the measurement axis belongs
+    to panels 4/5/6, not to the pure segmentation view.
+    """
     contour = axis_info.get("contour")
     if contour is not None:
         cv2.drawContours(panel, [contour], -1, _CONTOUR_COLOR, line_thickness)
@@ -296,7 +328,8 @@ def _draw_axis_overlay(
              _CENTROID_COLOR, line_thickness)
     cv2.line(panel, (cx, cy - cross_size), (cx, cy + cross_size),
              _CENTROID_COLOR, line_thickness)
-    cv2.line(panel, (cx, cy), (fx, fy), _AXIS_COLOR, line_thickness)
+    if draw_axis:
+        cv2.line(panel, (cx, cy), (fx, fy), _AXIS_COLOR, line_thickness)
 
 
 def _draw_numbered_dots(
@@ -323,6 +356,39 @@ def _draw_numbered_dots(
                         font_scale, _DOT_BORDER, thickness, cv2.LINE_AA)
 
 
+def _draw_concentric_rings(
+    panel: np.ndarray,
+    axis_info: dict,
+    peak_indices: np.ndarray,
+    line_xy: np.ndarray,
+    thickness: int,
+) -> None:
+    """Draw one concentric ring per detected peak (in place).
+
+    Each ring is the otolith contour scaled about the nucleus (centroid) by the
+    peak's fractional distance along the measurement axis, so the ring passes
+    exactly through the numbered dot on that axis. This approximates the roughly
+    self-similar annual growth rings — far more faithful than the old
+    perpendicular "zone" bands (which sliced the otolith into stripes).
+    """
+    contour = axis_info.get("contour")
+    if contour is None or line_xy is None or len(line_xy) < 2:
+        return
+    centroid = np.asarray(axis_info["centroid"], dtype=np.float32)
+    cpts = contour.reshape(-1, 2).astype(np.float32)
+    n = len(line_xy)
+    for i, idx in enumerate(peak_indices):
+        idx = int(idx)
+        if not (0 <= idx < n):
+            continue
+        t = idx / max(1, n - 1)                        # fraction of axis = scale factor
+        if t <= 0.0:
+            continue
+        ring = (centroid + t * (cpts - centroid)).astype(np.int32).reshape(-1, 1, 2)
+        color = _ZONE_PALETTE[i % len(_ZONE_PALETTE)]
+        cv2.polylines(panel, [ring], isClosed=True, color=color, thickness=thickness)
+
+
 # ---------------------------------------------------------------------------
 # Reasoning card
 # ---------------------------------------------------------------------------
@@ -346,7 +412,7 @@ def draw_reasoning_card(
       2. Otolith segmentation         — contour + nucleus cross
       3. Attention heatmap            — inferno colormap, masked to otolith
       4. Measurement axis + 1D profile
-      5. Annual ring zones            — bands between consecutive peaks
+      5. Annual rings                 — concentric contours at detected peak radii
       6. Final verdict                — numbered dots + age label + frame
 
     Each panel keeps the original-image dimensions ``(H, W, 3)`` and is topped
@@ -361,10 +427,10 @@ def draw_reasoning_card(
     # --- Panel 1: raw ---
     panel1 = original_rgb.copy()
 
-    # --- Panel 2: segmentation ---
+    # --- Panel 2: segmentation (contour + nucleus only, NO measurement axis) ---
     if axis_info is not None and mask is not None:
         panel2 = original_rgb.copy()
-        _draw_axis_overlay(panel2, axis_info, line_thickness, cross_size)
+        _draw_axis_overlay(panel2, axis_info, line_thickness, cross_size, draw_axis=False)
     else:
         panel2 = _placeholder_panel(H, W, "Segmentacja nieudana")
 
@@ -384,20 +450,16 @@ def draw_reasoning_card(
     else:
         panel4 = _placeholder_panel(H, W, "Oś niedostępna")
 
-    # --- Panel 5: ring zones ---
+    # --- Panel 5: concentric annual rings (model-detected) ---
     n_peaks = int(len(peak_indices)) if peak_indices is not None else 0
-    if (axis_info is not None and mask is not None and line_xy is not None
-            and peak_indices is not None):
-        n_samples = len(line_xy)
-        peak_t = [float(int(k)) / max(1, n_samples - 1) for k in peak_indices]
-        zones = compute_ring_zones(mask, axis_info["centroid"],
-                                    axis_info["far_edge"], peak_t)
-        panel5 = _colorize_zones(original_rgb, zones, alpha=0.45)
+    if axis_info is not None and line_xy is not None and peak_indices is not None:
+        panel5 = original_rgb.copy()
+        ring_thickness = max(2, line_thickness + 1)
+        _draw_concentric_rings(panel5, axis_info, peak_indices, line_xy, ring_thickness)
         _draw_axis_overlay(panel5, axis_info, line_thickness, cross_size)
-        if line_xy is not None:
-            _draw_numbered_dots(panel5, peak_indices, line_xy, dot_radius)
+        _draw_numbered_dots(panel5, peak_indices, line_xy, dot_radius)
     else:
-        panel5 = _placeholder_panel(H, W, "Strefy niedostępne")
+        panel5 = _placeholder_panel(H, W, "Pierscienie niedostepne")
 
     # --- Panel 6: final verdict ---
     panel6 = original_rgb.copy()
@@ -406,15 +468,15 @@ def draw_reasoning_card(
         fx, fy = axis_info["far_edge"]
         cv2.line(panel6, (cx, cy), (fx, fy), _AXIS_COLOR, line_thickness)
         _draw_numbered_dots(panel6, peak_indices, line_xy, dot_radius)
-    # Age label (always rendered)
+    # Age label (always rendered) — shrink font until it fits the panel width
     label = f"Wiek: {int(predicted_age)} (true: {int(true_age)})"
-    font_scale = max(0.6, H / 480.0)
-    thickness = max(1, int(font_scale * 2))
-    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
-                                   font_scale, thickness)
     pad = max(6, H // 80)
+    max_w = W - 2 * pad
+    font_scale = _fit_font_scale(label, max_w, max(0.5, H / 480.0))
+    thickness = max(1, int(font_scale * 2))
+    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
     cv2.rectangle(panel6, (pad - 4, H - th - 3 * pad),
-                   (pad + tw + 8, H - pad), (0, 0, 0), -1)
+                   (min(pad + tw + 8, W - 2), H - pad), (0, 0, 0), -1)
     cv2.putText(panel6, label, (pad + 2, H - 2 * pad),
                 cv2.FONT_HERSHEY_SIMPLEX, font_scale, _DOT_FILL, thickness, cv2.LINE_AA)
     frame_color = _OK_FRAME if int(predicted_age) == int(true_age) else _BAD_FRAME
@@ -426,7 +488,7 @@ def draw_reasoning_card(
         "2. Segmentacja otolitu",
         "3. Mapa uwagi (inferno)",
         "4. Os pomiaru + profil 1D",
-        f"5. Strefy roczne (N={n_peaks})",
+        f"5. Pierscienie roczne (N={n_peaks})",
         f"6. Werdykt: wiek = {int(predicted_age)}",
     ]
     panels = [panel1, panel2, panel3, panel4, panel5, panel6]

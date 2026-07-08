@@ -103,6 +103,9 @@ class InterpretationConfig(BaseModel):
 class CandidatesConfig(BaseModel):
     min_peak_distance: int = Field(5, ge=1)
     prominence_threshold: float = Field(0.1, ge=0.0)
+    # Experimental: also detect annual rings directly from the image (alternating
+    # light/dark bands) and save an overlay. Off by default; needs tuning on real data.
+    detect_image_rings: bool = False
 
 
 class DemoConfig(BaseModel):

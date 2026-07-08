@@ -299,6 +299,19 @@ def run_candidates(
             save_candidates_overlay(orig_rgb, peak_idx, line_xy, overlay_path,
                                     axis_info=axis_info)
 
+            # Experimental: rings read straight from the image (light/dark bands),
+            # independent of the model. Off unless cfg.candidates.detect_image_rings.
+            if getattr(cfg.candidates, "detect_image_rings", False) and axis_info is not None:
+                from src.ring_detection import detect_and_draw_rings
+                ring_dir = output_dir / "image_rings_overlays"
+                ring_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    _, ring_overlay = detect_and_draw_rings(orig_rgb, axis_info)
+                    PILImage.fromarray(ring_overlay, mode="RGB").save(
+                        ring_dir / f"{stem}_image_rings.png")
+                except Exception as e:  # experimental — never break the pipeline
+                    print(f"    [image-rings] {stem}: {e}")
+
             results.append({
                 "image_id":                image_id,
                 "num_candidates":          int(len(peak_idx)),

@@ -641,6 +641,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Skip step 1; use existing labels CSVs in output-dir/data/")
     p.add_argument("--skip-train", action="store_true",
                    help="Skip steps 2-3; use existing checkpoints")
+    p.add_argument("--fresh", action="store_true",
+                   help="Delete output-dir/pipeline_state.json first (force a full re-run)")
     p.add_argument("--dry-run", action="store_true",
                    help="Print planned steps without executing them")
     return p.parse_args(argv)
@@ -651,6 +653,10 @@ def main(argv: list[str] | None = None) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     state_path = output_dir / "pipeline_state.json"
+    if args.fresh and state_path.exists():
+        state_path.unlink()
+        print(f"[fresh] Usunięto {state_path} — wymuszam pełny re-run")
+    print(f"State: {state_path}")
     completed = _load_state(state_path)
 
     base_cfg_path = Path(args.base_config)

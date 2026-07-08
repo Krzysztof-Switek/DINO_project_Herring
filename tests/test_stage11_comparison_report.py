@@ -143,7 +143,7 @@ def test_section_e_has_reasoning_card_caption(tmp_path):
     assert "Karty rozumowania" in content
     assert "<ol>" in content
     assert "Surowe zdjęcie" in content
-    assert "Strefy roczne" in content
+    assert "Pierścienie roczne" in content
     # Section D caption about heatmaps/overlays distinction
     assert "inferno" in content.lower()
     assert "overlays" in content

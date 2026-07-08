@@ -199,6 +199,22 @@ def test_collect_candidate_overlays(tmp_path):
     assert "NotEmb → NotEmb" not in got   # no overlays dir → omitted
 
 
+def test_fresh_flag_clears_state(tmp_path, capsys):
+    """--fresh deletes pipeline_state.json so a completed run re-runs from scratch."""
+    from scripts.run_pipeline import main as rp_main, _save_state
+
+    state = tmp_path / "pipeline_state.json"
+    _save_state(state, ["scan", "train_e"])
+    rp_main([
+        "--output-dir", str(tmp_path),
+        "--base-config", str(PROJECT_ROOT / "configs" / "config_demo.yaml"),
+        "--fresh", "--dry-run",
+    ])
+    out = capsys.readouterr().out
+    assert not state.exists()             # state removed by --fresh
+    assert "(completed)" not in out       # nothing is marked done anymore
+
+
 # ---------------------------------------------------------------------------
 # test_pipeline_state_file
 # ---------------------------------------------------------------------------
