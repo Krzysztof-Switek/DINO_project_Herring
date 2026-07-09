@@ -88,3 +88,6 @@ if __name__ == "__main__":
         )
     print(f"[main] IMAGE_DIR = {IMAGE_DIR}")
     main(ARGV)
+
+
+test
