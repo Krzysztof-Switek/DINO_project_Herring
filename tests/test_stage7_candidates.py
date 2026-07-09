@@ -1,7 +1,6 @@
 """Stage 7 tests: candidates pipeline — profile, peaks, JSON, overlay, run_candidates.
 
 Updated for the biological-axis API:
-  - extract_radial_profile returns the bottom-half centre-column profile (legacy fallback)
   - candidates use sample_profile_along_axis from src/otolith_axis.py
   - JSON saves peak_profile_indices (not peak_pixel_positions)
   - save_candidates_overlay takes line_xy + axis_info, not heatmap
@@ -102,40 +101,6 @@ def _make_model(cfg):
 
 def _make_loader(n: int = 6) -> DataLoader:
     return DataLoader(_SyntheticDataset(n=n), batch_size=2, shuffle=False)
-
-
-# ---------------------------------------------------------------------------
-# extract_radial_profile — legacy fallback (centre column, bottom half)
-# ---------------------------------------------------------------------------
-
-def test_radial_profile_returns_bottom_half():
-    """For axis='vertical', profile = bottom half of centre-column values."""
-    from src.candidates import extract_radial_profile
-    grid = np.random.rand(4, 4).astype(np.float32)
-    profile = extract_radial_profile(grid, axis="vertical")
-    assert profile.shape == (2,)            # bottom half of 4 rows
-
-
-def test_radial_profile_horizontal_returns_right_half():
-    from src.candidates import extract_radial_profile
-    grid = np.random.rand(4, 6).astype(np.float32)
-    profile = extract_radial_profile(grid, axis="horizontal")
-    assert profile.shape == (3,)            # right half of 6 cols
-
-
-def test_radial_profile_accepts_tensor():
-    from src.candidates import extract_radial_profile
-    grid = torch.rand(4, 4)
-    profile = extract_radial_profile(grid)
-    assert isinstance(profile, np.ndarray)
-    assert profile.shape == (2,)
-
-
-def test_radial_profile_dtype_is_float32():
-    from src.candidates import extract_radial_profile
-    grid = np.ones((4, 4), dtype=np.float64)
-    profile = extract_radial_profile(grid)
-    assert profile.dtype == np.float32
 
 
 # ---------------------------------------------------------------------------

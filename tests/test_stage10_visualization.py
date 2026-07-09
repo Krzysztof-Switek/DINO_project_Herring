@@ -65,76 +65,6 @@ def test_select_top_k(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# test_draw_card_shape
-# ---------------------------------------------------------------------------
-
-def test_draw_card_shape():
-    from src.visualization import draw_increment_card
-    H, W = 56, 42
-    original = np.zeros((H, W, 3), dtype=np.uint8)
-    grid = np.random.rand(4, 3).astype(np.float32)
-    dot_positions = [10, 25, 40]
-    card = draw_increment_card(original, dot_positions, grid, predicted_age=3, true_age=3)
-    assert card.ndim == 3
-    assert card.shape[2] == 3
-    # 3 panels side by side → width = W*2 + panel_c_width; height = H
-    assert card.shape[0] == H
-    assert card.shape[1] > W  # at least wider than one panel
-
-
-# ---------------------------------------------------------------------------
-# test_draw_card_last_sigmoid_hollow
-# ---------------------------------------------------------------------------
-
-def test_draw_card_last_sigmoid_hollow():
-    """When last_sigmoid > 0.3 the last dot should be hollow (not solid yellow fill)."""
-    from src.visualization import draw_increment_card
-    H, W = 100, 80
-    original = np.zeros((H, W, 3), dtype=np.uint8)
-    grid = np.ones((7, 6), dtype=np.float32)
-    dot_positions = [30, 70]
-
-    card_solid = draw_increment_card(
-        original, dot_positions, grid, predicted_age=2, true_age=2, last_sigmoid=0.0
-    )
-    card_hollow = draw_increment_card(
-        original, dot_positions, grid, predicted_age=2, true_age=2, last_sigmoid=0.5
-    )
-    # The two cards should differ (hollow vs solid last dot)
-    assert not np.array_equal(card_solid, card_hollow)
-
-
-# ---------------------------------------------------------------------------
-# test_draw_card_saves_file
-# ---------------------------------------------------------------------------
-
-def test_draw_card_saves_file(tmp_path):
-    from src.visualization import save_increment_cards, load_original_image
-    H, W = 56, 42
-    img_name = "fish42.png"
-    (tmp_path / "images").mkdir()
-    _make_synth_image(tmp_path / "images", img_name, h=H, w=W)
-
-    samples = [{"image_id": img_name, "age": 4, "predicted_age": 4}]
-    grid = np.random.rand(4, 3).astype(np.float32)
-    importance_grids = {img_name: grid}
-    last_sigmoids = {img_name: 0.1}
-
-    saved = save_increment_cards(
-        samples=samples,
-        image_dir=tmp_path / "images",
-        importance_grids=importance_grids,
-        last_sigmoids=last_sigmoids,
-        output_dir=tmp_path / "cards",
-        label="best",
-    )
-    assert len(saved) == 1
-    assert saved[0].exists()
-    img = PILImage.open(saved[0])
-    assert img.mode == "RGB"
-
-
-# ---------------------------------------------------------------------------
 # Reasoning-card pipeline (6 panels)
 # ---------------------------------------------------------------------------
 
@@ -158,51 +88,6 @@ def _make_axis_payload(H: int, W: int):
     profile_1d = np.linspace(0.0, 1.0, n_samples).astype(np.float32)
     peak_indices = np.array([5, 12, 17], dtype=np.int64)
     return mask, axis_info, line_xy, profile_1d, peak_indices
-
-
-def test_compute_ring_zones_label_count():
-    from src.visualization import compute_ring_zones
-    H, W = 80, 200
-    mask, axis_info, line_xy, profile_1d, peak_indices = _make_axis_payload(H, W)
-    peak_t = [int(k) / (len(line_xy) - 1) for k in peak_indices]
-    zones = compute_ring_zones(mask, axis_info["centroid"], axis_info["far_edge"], peak_t)
-    inside = zones[zones != 255]
-    # With 3 peaks we get 4 zones (0..3); should see at least 2 of them inside the mask
-    assert len(set(int(v) for v in inside)) >= 2
-    # Pixels outside the mask remain sentinel 255
-    assert int(zones[0, 0]) == 255
-
-
-def test_compute_ring_zones_no_peaks_collapses_to_zone_zero():
-    from src.visualization import compute_ring_zones
-    mask = np.zeros((40, 40), dtype=np.uint8)
-    mask[10:30, 10:30] = 255
-    zones = compute_ring_zones(mask, (15, 20), (35, 20), peak_t_values=[])
-    assert int(zones[20, 20]) == 0
-    assert int(zones[0, 0]) == 255
-
-
-def test_draw_concentric_rings_draws_when_peaks_present():
-    """Rings are drawn for detected peaks, and nothing when there are no peaks."""
-    import cv2
-    from src.visualization import _draw_concentric_rings
-
-    H, W = 100, 80
-    mask = np.zeros((H, W), np.uint8)
-    cv2.ellipse(mask, (W // 2, H // 2), (25, 40), 0, 0, 360, 255, -1)
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    axis_info = {"centroid": (W // 2, H // 2), "far_edge": (W // 2, H // 2 - 40),
-                 "contour": max(cnts, key=cv2.contourArea)}
-    line_xy = np.array([[W // 2, H // 2 - int(40 * i / 49)] for i in range(50)])
-
-    base = np.full((H, W, 3), 200, np.uint8)
-    with_rings = base.copy()
-    _draw_concentric_rings(with_rings, axis_info, np.array([10, 30]), line_xy, thickness=2)
-    assert not np.array_equal(base, with_rings)          # rings modified the panel
-
-    no_peaks = base.copy()
-    _draw_concentric_rings(no_peaks, axis_info, np.array([], dtype=int), line_xy, thickness=2)
-    assert np.array_equal(base, no_peaks)                # no peaks → untouched
 
 
 def test_draw_reasoning_card_shape_with_axis():

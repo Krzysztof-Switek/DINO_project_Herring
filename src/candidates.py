@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -51,33 +51,6 @@ def _fallback_axis(image_h: int, image_w: int) -> tuple[tuple[int, int], tuple[i
     """Vertical line from image centre to bottom edge."""
     cx, cy = image_w // 2, image_h // 2
     return (cx, cy), (cx, image_h - 1)
-
-
-def extract_radial_profile(
-    importance_grid: Union["torch.Tensor", np.ndarray],
-    axis: str = "vertical",
-) -> np.ndarray:
-    """Legacy fallback profile — centre column, bottom half.
-
-    Kept for backwards compatibility. The biological-axis profile is now
-    computed via ``otolith_axis.sample_profile_along_axis``.
-    """
-    if hasattr(importance_grid, "cpu"):
-        importance_grid = importance_grid.cpu().numpy()
-    importance_grid = np.asarray(importance_grid, dtype=np.float32)
-    H_p, W_p = importance_grid.shape
-
-    if axis == "vertical":
-        col = W_p // 2
-        col_s = max(0, col - 1)
-        col_e = min(W_p, col + 2)
-        full_col = importance_grid[:, col_s:col_e].mean(axis=1)
-        return full_col[H_p // 2:].astype(np.float32)
-    row = H_p // 2
-    row_s = max(0, row - 1)
-    row_e = min(H_p, row + 2)
-    full_row = importance_grid[row_s:row_e, :].mean(axis=0)
-    return full_row[W_p // 2:].astype(np.float32)
 
 
 # ---------------------------------------------------------------------------

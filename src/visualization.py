@@ -18,9 +18,6 @@ from pathlib import Path
 from typing import Optional, Union
 
 import cv2
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from PIL import Image as PILImage
@@ -30,7 +27,6 @@ from src.interpretation import (
     apply_colormap_with_mask,
     importance_to_heatmap_2d,
 )
-from src.otolith_axis import project_distance_to_axis
 
 # Colors (RGB)
 _AXIS_COLOR     = (255, 220, 0)     # yellow — measurement axis
@@ -44,20 +40,6 @@ _OK_FRAME       = (0, 200, 0)       # green — correct verdict
 _BAD_FRAME      = (220, 0, 0)       # red — incorrect verdict
 _PLACEHOLDER_BG = (20, 20, 20)
 _PLACEHOLDER_FG = (180, 60, 60)
-
-# Qualitative palette for ring zones (RGB) — cycled if more zones than colors
-_ZONE_PALETTE = [
-    (228,  26,  28),   # red
-    ( 55, 126, 184),   # blue
-    ( 77, 175,  74),   # green
-    (152,  78, 163),   # purple
-    (255, 127,   0),   # orange
-    (255, 255,  51),   # yellow
-    (166,  86,  40),   # brown
-    (247, 129, 191),   # pink
-    (153, 153, 153),   # gray
-    ( 23, 190, 207),   # cyan
-]
 
 
 # ---------------------------------------------------------------------------
@@ -95,69 +77,6 @@ def select_top_k_samples(
     best = df_sorted.head(k_best).to_dict(orient="records")
     worst = df_sorted.tail(k_worst).sort_values("abs_error", ascending=False).to_dict(orient="records")
     return best, worst
-
-
-# ---------------------------------------------------------------------------
-# Ring zones
-# ---------------------------------------------------------------------------
-
-def compute_ring_zones(
-    mask: np.ndarray,
-    centroid: tuple[int, int],
-    far_edge: tuple[int, int],
-    peak_t_values: list[float],
-) -> np.ndarray:
-    """Label each mask pixel with a ring-zone index.
-
-    A zone is the band between two consecutive peaks on the measurement axis.
-    Zone 0 covers pixels from the centroid up to the first peak; zone k spans
-    between peak ``k-1`` and peak ``k``; the final zone reaches the far edge.
-
-    Args:
-        mask:           (H, W) uint8 — otolith silhouette
-        centroid:       (cx, cy) — nucleus
-        far_edge:       (fx, fy) — terminus of the measurement axis
-        peak_t_values:  list of axis positions t ∈ [0, 1] (0 = nucleus, 1 = far edge)
-
-    Returns:
-        ``(H, W)`` uint8. Inside-mask pixels carry their zone index (0..N).
-        Outside-mask pixels are set to 255 (sentinel).
-    """
-    distance = project_distance_to_axis(mask, centroid, far_edge)
-    out = np.full(mask.shape[:2], 255, dtype=np.uint8)
-    inside = mask > 0
-    if not inside.any():
-        return out
-    if not peak_t_values:
-        out[inside] = 0
-        return out
-    thresholds = sorted(float(t) for t in peak_t_values)
-    t = distance.copy()
-    t[~inside] = np.nan
-    zone = np.zeros(mask.shape[:2], dtype=np.int32)
-    for thr in thresholds:
-        zone += (t > thr).astype(np.int32)
-    out[inside] = np.clip(zone[inside], 0, 254).astype(np.uint8)
-    return out
-
-
-def _colorize_zones(
-    original_rgb: np.ndarray,
-    zones: np.ndarray,
-    alpha: float = 0.45,
-) -> np.ndarray:
-    """Blend a per-zone categorical colour overlay onto the original image."""
-    out = original_rgb.copy().astype(np.float32)
-    inside = zones != 255
-    if not inside.any():
-        return original_rgb.copy()
-    overlay = np.zeros_like(original_rgb, dtype=np.float32)
-    for z in np.unique(zones[inside]):
-        color = _ZONE_PALETTE[int(z) % len(_ZONE_PALETTE)]
-        overlay[zones == z] = color
-    blended = alpha * overlay + (1.0 - alpha) * out
-    out[inside] = blended[inside]
-    return out.clip(0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -356,39 +275,6 @@ def _draw_numbered_dots(
                         font_scale, _DOT_BORDER, thickness, cv2.LINE_AA)
 
 
-def _draw_concentric_rings(
-    panel: np.ndarray,
-    axis_info: dict,
-    peak_indices: np.ndarray,
-    line_xy: np.ndarray,
-    thickness: int,
-) -> None:
-    """Draw one concentric ring per detected peak (in place).
-
-    Each ring is the otolith contour scaled about the nucleus (centroid) by the
-    peak's fractional distance along the measurement axis, so the ring passes
-    exactly through the numbered dot on that axis. This approximates the roughly
-    self-similar annual growth rings — far more faithful than the old
-    perpendicular "zone" bands (which sliced the otolith into stripes).
-    """
-    contour = axis_info.get("contour")
-    if contour is None or line_xy is None or len(line_xy) < 2:
-        return
-    centroid = np.asarray(axis_info["centroid"], dtype=np.float32)
-    cpts = contour.reshape(-1, 2).astype(np.float32)
-    n = len(line_xy)
-    for i, idx in enumerate(peak_indices):
-        idx = int(idx)
-        if not (0 <= idx < n):
-            continue
-        t = idx / max(1, n - 1)                        # fraction of axis = scale factor
-        if t <= 0.0:
-            continue
-        ring = (centroid + t * (cpts - centroid)).astype(np.int32).reshape(-1, 1, 2)
-        color = _ZONE_PALETTE[i % len(_ZONE_PALETTE)]
-        cv2.polylines(panel, [ring], isClosed=True, color=color, thickness=thickness)
-
-
 # ---------------------------------------------------------------------------
 # Reasoning card
 # ---------------------------------------------------------------------------
@@ -412,7 +298,7 @@ def draw_reasoning_card(
       2. Otolith segmentation         — contour + nucleus cross
       3. Attention heatmap            — inferno colormap, masked to otolith
       4. Measurement axis + 1D profile
-      5. Annual rings                 — concentric contours at detected peak radii
+      5. Annual rings                 — ring curves from the prob map (dots = axis crossings)
       6. Final verdict                — numbered dots + age label + frame
 
     Each panel keeps the original-image dimensions ``(H, W, 3)`` and is topped
@@ -423,6 +309,25 @@ def draw_reasoning_card(
     line_thickness = max(2, H // 250)
     cross_size = max(8, H // 80)
     dot_radius = max(8, H // 60)
+
+    # --- Model-derived rings (shared by panels 4/5/6 so they stay consistent) ---
+    # Ring curves come from the 2-D probability map; the numbered dots are placed
+    # where each curve crosses the measurement axis (ring t → axis index), so the
+    # dot count always equals the curve count. Fall back to the incoming axis peaks
+    # only when no curves are found (e.g. an untrained model with a flat map).
+    ring_curves: list = []
+    dots_idx = (np.asarray(peak_indices, dtype=int)
+                if peak_indices is not None else np.array([], dtype=int))
+    if axis_info is not None:
+        from src.ring_extraction import extract_rings, draw_ring_curves
+        rings = extract_rings(importance_grid, axis_info, H, W)
+        ring_curves = [c for (_t, c) in rings]
+        if rings and line_xy is not None and len(line_xy) > 0:
+            n = len(line_xy)
+            dots_idx = np.clip(
+                np.array([int(round(t * (n - 1))) for (t, _c) in rings], dtype=int),
+                0, n - 1)
+    n_rings = len(ring_curves)
 
     # --- Panel 1: raw ---
     panel1 = original_rgb.copy()
@@ -441,39 +346,31 @@ def draw_reasoning_card(
     )
     _draw_colorbar(panel3)
 
-    # --- Panel 4: axis + 1D profile ---
+    # --- Panel 4: axis + 1D profile (peaks = ring axis-crossings) ---
     if axis_info is not None and line_xy is not None and profile_1d is not None:
         panel4 = original_rgb.copy()
         _draw_axis_overlay(panel4, axis_info, line_thickness, cross_size)
-        _draw_profile_inset(panel4, profile_1d,
-                            peak_indices if peak_indices is not None else np.array([], dtype=int))
+        _draw_profile_inset(panel4, profile_1d, dots_idx)
     else:
         panel4 = _placeholder_panel(H, W, "Oś niedostępna")
 
-    # --- Panel 5: model-derived ring CURVES (locus of high MIL probability) ---
-    # Extract real ring lines from the 2-D probability map (radial peaks per
-    # direction → clustered → connected), instead of the old scaled-contour
-    # approximation. Empty on an untrained model (flat map) — expected.
+    # --- Panel 5: model-derived ring CURVES + the same numbered dots ---
     if axis_info is not None:
-        from src.ring_extraction import extract_ring_curves, draw_ring_curves
         panel5 = original_rgb.copy()
-        ring_curves = extract_ring_curves(importance_grid, axis_info, H, W)
         draw_ring_curves(panel5, ring_curves, thickness=max(2, line_thickness + 1))
         _draw_axis_overlay(panel5, axis_info, line_thickness, cross_size)
-        if line_xy is not None and peak_indices is not None:
-            _draw_numbered_dots(panel5, peak_indices, line_xy, dot_radius)
-        n_rings = len(ring_curves)
+        if line_xy is not None and len(dots_idx) > 0:
+            _draw_numbered_dots(panel5, dots_idx, line_xy, dot_radius)
     else:
         panel5 = _placeholder_panel(H, W, "Pierscienie niedostepne")
-        n_rings = 0
 
-    # --- Panel 6: final verdict ---
+    # --- Panel 6: final verdict (same dots as panel 5) ---
     panel6 = original_rgb.copy()
-    if axis_info is not None and line_xy is not None and peak_indices is not None:
+    if axis_info is not None and line_xy is not None and len(dots_idx) > 0:
         cx, cy = axis_info["centroid"]
         fx, fy = axis_info["far_edge"]
         cv2.line(panel6, (cx, cy), (fx, fy), _AXIS_COLOR, line_thickness)
-        _draw_numbered_dots(panel6, peak_indices, line_xy, dot_radius)
+        _draw_numbered_dots(panel6, dots_idx, line_xy, dot_radius)
     # Age label (always rendered) — shrink font until it fits the panel width
     label = f"Wiek: {int(predicted_age)} (true: {int(true_age)})"
     pad = max(6, H // 80)
@@ -569,157 +466,3 @@ def save_reasoning_cards(
 
     return saved
 
-
-# ---------------------------------------------------------------------------
-# Backwards-compatible shims (legacy 3-panel card — kept for old tests)
-# ---------------------------------------------------------------------------
-
-def compute_dot_positions(
-    importance_grid: np.ndarray,
-    predicted_age: int,
-    image_height: int,
-    profile: np.ndarray | None = None,
-) -> list[int]:
-    """Legacy helper: detect N peaks in the vertical importance profile.
-
-    Kept for the old `draw_increment_card` path used by `save_increment_cards`.
-    New code should use the biological-axis peaks from `src/candidates.py`.
-    """
-    from scipy.signal import find_peaks
-
-    if profile is None:
-        profile = importance_grid.mean(axis=1).astype(np.float32)
-
-    H_p = len(profile)
-    n = max(1, int(predicted_age))
-
-    peaks, props = find_peaks(profile, distance=max(1, H_p // (n + 1)))
-    if len(peaks) >= n:
-        prom = props.get("prominences", profile[peaks])
-        top_n_idx = np.argsort(prom)[-n:]
-        selected = np.sort(peaks[top_n_idx])
-    else:
-        selected = np.linspace(0, H_p - 1, n).astype(int)
-
-    patch_h = image_height / H_p
-    y_pixels = [int((idx + 0.5) * patch_h) for idx in selected]
-    return sorted(y_pixels)
-
-
-def draw_increment_card(
-    original_rgb: np.ndarray,
-    dot_y_positions: list[int],
-    importance_grid: np.ndarray,
-    predicted_age: int,
-    true_age: int,
-    last_sigmoid: float = 0.0,
-) -> np.ndarray:
-    """Legacy 3-panel card (original+dots | heatmap+dots | profile).
-
-    Retained for backwards compatibility with older tests. New pipeline uses
-    :func:`draw_reasoning_card` (6 panels).
-    """
-    H_orig, W_orig = original_rgb.shape[:2]
-    H_p, W_p = importance_grid.shape
-
-    panel_a = original_rgb.copy()
-    x_mid = W_orig // 2
-    cv2.line(panel_a, (x_mid, 0), (x_mid, H_orig - 1), (220, 30, 30), 1)
-
-    n_dots = len(dot_y_positions)
-    for i, y in enumerate(dot_y_positions):
-        is_last = (i == n_dots - 1)
-        is_partial = is_last and last_sigmoid > 0.3
-        number = str(i + 1)
-        if is_partial:
-            cv2.circle(panel_a, (x_mid, y), 8, _DOT_FILL, 1)
-            cv2.putText(panel_a, f"{number}+", (x_mid + 10, y + 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
-        else:
-            cv2.circle(panel_a, (x_mid, y), 9, _DOT_BORDER, -1)
-            cv2.circle(panel_a, (x_mid, y), 8, _DOT_FILL, -1)
-            cv2.putText(panel_a, number, (x_mid - 3, y + 3),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 1)
-
-    error = abs(predicted_age - true_age)
-    frame_color = (0, 200, 0) if error == 0 else (200, 0, 0)
-    cv2.putText(panel_a, f"Pred:{predicted_age} True:{true_age}", (4, H_orig - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-    cv2.rectangle(panel_a, (0, 0), (W_orig - 1, H_orig - 1), frame_color, 2)
-
-    norm_grid = importance_grid.astype(np.float32).copy()
-    if norm_grid.max() > norm_grid.min():
-        norm_grid = (norm_grid - norm_grid.min()) / (norm_grid.max() - norm_grid.min())
-    heatmap_full = cv2.resize((norm_grid * 255).astype(np.uint8), (W_orig, H_orig),
-                              interpolation=cv2.INTER_LINEAR)
-    bgr = cv2.applyColorMap(heatmap_full, DEFAULT_COLORMAP)
-    rgb_map = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
-    panel_b = (0.5 * rgb_map + 0.5 * original_rgb.astype(np.float32)).clip(0, 255).astype(np.uint8)
-    for i, y in enumerate(dot_y_positions):
-        is_partial = (i == n_dots - 1) and last_sigmoid > 0.3
-        if is_partial:
-            cv2.circle(panel_b, (x_mid, y), 8, _DOT_FILL, 1)
-        else:
-            cv2.circle(panel_b, (x_mid, y), 9, _DOT_BORDER, -1)
-            cv2.circle(panel_b, (x_mid, y), 8, _DOT_FILL, -1)
-
-    profile = importance_grid.mean(axis=1).astype(np.float32)
-    fig_h = H_orig / 100
-    fig, ax = plt.subplots(figsize=(2.0, fig_h))
-    y_positions = np.linspace(0, H_orig, len(profile))
-    ax.plot(profile, y_positions, color="steelblue", linewidth=1)
-    for y in dot_y_positions:
-        ax.axhline(y, color="gold", linestyle="--", linewidth=0.8, alpha=0.9)
-    ax.set_ylim(H_orig, 0)
-    ax.set_xlabel("Importance", fontsize=6)
-    ax.set_ylabel("y-pixel", fontsize=6)
-    ax.tick_params(labelsize=5)
-    fig.tight_layout(pad=0.3)
-    fig.canvas.draw()
-    w_fig, h_fig = fig.canvas.get_width_height()
-    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
-    panel_c_raw = buf.reshape(h_fig, w_fig, 4)[:, :, :3]
-    plt.close(fig)
-    panel_c = cv2.resize(panel_c_raw, (panel_c_raw.shape[1], H_orig))
-
-    return np.concatenate([panel_a, panel_b, panel_c], axis=1)
-
-
-def save_increment_cards(
-    samples: list[dict],
-    image_dir: Path,
-    importance_grids: dict,
-    last_sigmoids: dict,
-    output_dir: Path,
-    label: str,
-) -> list[Path]:
-    """Legacy 3-panel card saver. Use :func:`save_reasoning_cards` for the new pipeline."""
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    saved: list[Path] = []
-
-    for sample in samples:
-        image_id = sample["image_id"]
-        predicted_age = int(sample["predicted_age"])
-        true_age = int(sample["age"])
-        try:
-            original = load_original_image(image_id, image_dir)
-        except FileNotFoundError:
-            continue
-
-        grid = importance_grids.get(image_id)
-        if grid is None:
-            continue
-
-        profile = grid.mean(axis=1).astype(np.float32)
-        dot_positions = compute_dot_positions(grid, predicted_age, original.shape[0],
-                                               profile=profile)
-        last_sig = last_sigmoids.get(image_id, 0.0)
-        card = draw_increment_card(original, dot_positions, grid,
-                                    predicted_age, true_age, last_sig)
-        stem = Path(image_id).stem
-        out_path = output_dir / f"{label}_{stem}_card.png"
-        PILImage.fromarray(card, mode="RGB").save(out_path)
-        saved.append(out_path)
-
-    return saved

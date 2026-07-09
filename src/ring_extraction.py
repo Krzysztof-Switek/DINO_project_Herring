@@ -63,7 +63,7 @@ def _radial_peaks(prob_grid, centroid, contour_pt, image_h, image_w,
     return out
 
 
-def extract_ring_curves(
+def extract_rings(
     prob_grid,
     axis_info: dict,
     image_h: int,
@@ -77,12 +77,15 @@ def extract_ring_curves(
     edge_margin: float = 0.08,
     t_tol: float = 0.06,
     min_dir_frac: float = 0.5,
-) -> List[np.ndarray]:
-    """Extract ring curves from a per-patch probability map.
+) -> List[Tuple[float, np.ndarray]]:
+    """Extract rings from a per-patch probability map.
 
-    Returns a list of curves ordered inner→outer; each curve is an ``(M, 2)`` int
-    array of image-pixel points (one per direction that saw the ring), ordered by
-    angle — draw as a closed polygon. Empty list when no rings are found.
+    Returns a list of ``(mean_t, curve)`` ordered inner→outer, where ``mean_t`` is
+    the ring's normalised radius along the measurement axis (0 = nucleus, 1 = edge)
+    and ``curve`` is an ``(M, 2)`` int array of image-pixel points (one per direction
+    that saw the ring), ordered by angle — draw as a closed polygon. ``mean_t`` gives
+    the axis crossing (``centroid + t·(far_edge − centroid)``) so the numbered dots
+    and the ring curves stay consistent. Empty list when no rings are found.
     """
     contour = axis_info.get("contour")
     centroid = axis_info.get("centroid")
@@ -132,7 +135,14 @@ def extract_ring_curves(
         curves.append((mean_t, curve))
 
     curves.sort(key=lambda c: c[0])        # inner → outer
-    return [c for (_, c) in curves]
+    return curves
+
+
+def extract_ring_curves(prob_grid, axis_info: dict, image_h: int, image_w: int,
+                        **kwargs) -> List[np.ndarray]:
+    """Convenience wrapper of :func:`extract_rings` returning only the curves."""
+    return [curve for (_t, curve) in
+            extract_rings(prob_grid, axis_info, image_h, image_w, **kwargs)]
 
 
 def draw_ring_curves(panel: np.ndarray, curves: List[np.ndarray],

@@ -12,7 +12,6 @@ from src.otolith_axis import (
     find_centroid,
     find_farthest_edge,
     load_mask,
-    project_distance_to_axis,
     sample_profile_along_axis,
     save_mask,
     segment_otolith,
@@ -157,41 +156,6 @@ def test_sample_profile_endpoints_match_pixel_coords():
     # First and last sample should land on the centroid and far_edge respectively
     assert tuple(line_xy[0])  == (100, 200)
     assert tuple(line_xy[-1]) == (700, 500)
-
-
-# ---------------------------------------------------------------------------
-# project_distance_to_axis
-# ---------------------------------------------------------------------------
-
-def test_project_distance_to_axis_endpoints():
-    """At the centroid t≈0, at the far edge t≈1."""
-    mask = np.zeros((100, 100), dtype=np.uint8)
-    cv2.rectangle(mask, (10, 40), (90, 60), 255, -1)
-    centroid = (20, 50)
-    far_edge = (80, 50)
-    t = project_distance_to_axis(mask, centroid, far_edge)
-    # Pixel at centroid → ~0; pixel at far_edge → ~1
-    assert abs(float(t[50, 20])) < 1e-3
-    assert abs(float(t[50, 80]) - 1.0) < 1e-3
-
-
-def test_project_distance_to_axis_outside_mask_is_nan():
-    mask = np.zeros((50, 60), dtype=np.uint8)
-    mask[20:30, 10:50] = 255
-    t = project_distance_to_axis(mask, (15, 25), (45, 25))
-    # Pixel outside the mask must be NaN
-    assert np.isnan(t[0, 0])
-    # Pixel inside the mask must be finite
-    assert np.isfinite(t[25, 25])
-
-
-def test_project_distance_to_axis_increases_along_axis():
-    """t values grow monotonically as we walk from centroid to far edge."""
-    mask = np.zeros((40, 80), dtype=np.uint8)
-    mask[15:25, 5:75] = 255
-    t = project_distance_to_axis(mask, (10, 20), (70, 20))
-    row = t[20, 10:71]   # walk along the axis
-    assert row[0] < row[10] < row[30] < row[60]
 
 
 # ---------------------------------------------------------------------------

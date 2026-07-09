@@ -12,7 +12,6 @@ Generates a self-contained HTML file with sections:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import matplotlib
 matplotlib.use("Agg")
@@ -416,26 +415,32 @@ od jądra (centroid) do najdalszej krawędzi konturu (zwykle post-rostralnej):</
       ogóle złapała otolit; jeśli nie, panele 4/5/6 pokażą placeholder
       „Segmentacja nieudana”.</li>
   <li><b>Mapa uwagi modelu</b> — kolormap <i>inferno</i> wewnątrz otolitu:
-      ciemne = niski sygnał, jasno-żółte = wysoki sygnał. Wartość = norma L2
-      tokenów DINOv2 (heurystyka — model w obecnej wersji nie jest jeszcze
-      trenowany do bezpośredniej lokalizacji przyrostów).</li>
+      ciemne = niski sygnał, jasno-żółte = wysoki. Po treningu wartość =
+      <b>prawdopodobieństwo przyrostu na patch</b> (głowica MIL, słabo nadzorowana
+      wiekiem); dla modelu bez głowicy MIL — norma L2 tokenów DINOv2 (heurystyka).</li>
   <li><b>Oś pomiaru + profil 1D</b> — żółta oś biologiczna na zdjęciu, a w
       <b>prawym górnym rogu mała wstawka 1D</b> z profilem ważności wzdłuż tej
       osi. Wstawkę czyta się od góry: oś pionowa = pozycja na osi (góra = jądro,
       dół = brzeg), oś pozioma = wartość ważności. <i>Czerwone kropki + przerywane
       poziome linie</i> w tej wstawce = wykryte peaki profilu (kandydaci na
       przyrosty roczne).</li>
-  <li><b>Pierścienie roczne</b> — <i>koncentryczne kontury</i> (skalowane kopie
-      obrysu otolitu) w promieniach wykrytych przyrostów, każdy w innym kolorze;
-      <b>każdy pierścień przechodzi przez ponumerowaną kropkę na osi pomiaru</b>.
-      Przybliżają rzeczywiste, mniej więcej samopodobne pierścienie roczne (rosną
-      na zewnątrz zachowując kształt otolitu). <b>Brak pierścieni = model nie
-      wykrył peaków</b> (profil 1D płaski) — to sygnał, nie brakujący render.</li>
+  <li><b>Pierścienie roczne</b> — <i>krzywe pierścieni</i> wyznaczone z mapy
+      prawdopodobieństwa modelu: radialne peaki w wielu kierunkach → połączone
+      w zamkniętą linię (locus wysokiego prawdopodobieństwa), każdy pierścień
+      w innym kolorze. <b>Każdy pierścień przechodzi przez ponumerowaną kropkę na
+      osi pomiaru</b> — panele 5 i 6 to ten sam sygnał (kropki = przecięcia krzywych
+      z osią). <b>Brak krzywych = model nie zlokalizował przyrostów</b> (mapa
+      płaska) — to sygnał, nie brak renderu.</li>
   <li><b>Werdykt</b> — końcowa anotacja: żółta oś + <i>ponumerowane żółte
-      kropki</i> w pozycjach peaków + przewidziany wiek (zielona ramka = trafny,
-      czerwona = błąd). <b>Brak ponumerowanych kropek na osi = peak-detector
-      zwrócił pustą listę</b> (zob. uwaga niżej).</li>
+      kropki</i> w miejscach przecięcia krzywych pierścieni z osią + przewidziany
+      wiek (zielona ramka = trafny, czerwona = błąd).</li>
 </ol>
+<p style="font-size:90%;color:#444;">
+  <b>Wiek (werdykt) vs liczba pierścieni.</b> Werdykt wiekowy pochodzi z głowicy
+  <b>liczącej</b> (CORAL), a pierścienie/kropki z głowicy <b>lokalizującej</b> (MIL)
+  — to dwa różne sygnały. Mogą się nieznacznie różnić (np. wiek = 3, a zlokalizowane
+  2 pierścienie); po dobrym treningu powinny się zgadzać.
+</p>
 <p style="font-size:90%;color:#666;background:#f8f8f0;padding:8px;border-left:3px solid #c8b400;">
   <b>Dlaczego niektóre karty mają puste panele 4/5/6?</b><br>
   Peaki w profilu 1D wykrywa <code>scipy.signal.find_peaks</code> z progiem
@@ -443,7 +448,7 @@ od jądra (centroid) do najdalszej krawędzi konturu (zwykle post-rostralnej):</
   (np. po 1 epoce w trybie <code>demo</code>, na kilkunastu obrazach), mapa
   ważności DINOv2 jest praktycznie jednorodnym szumem, profil wzdłuż osi jest
   płaski i detector zwraca pustą tablicę. <b>To zachowanie oczekiwane,
-  nie błąd</b> — peaki, strefy i ponumerowane kropki pojawią się dopiero
+  nie błąd</b> — krzywe pierścieni i ponumerowane kropki pojawią się dopiero
   po pełnym treningu (<code>config.yaml</code>, 50 epok na model).
 </p>
 """

@@ -309,43 +309,6 @@ def sample_profile_along_axis(
 
 
 # ---------------------------------------------------------------------------
-# Axis projection (for ring-zone visualization)
-# ---------------------------------------------------------------------------
-
-def project_distance_to_axis(
-    mask: np.ndarray,
-    centroid: tuple[int, int],
-    far_edge: tuple[int, int],
-) -> np.ndarray:
-    """Scalar projection of every mask pixel onto the centroid → far_edge axis.
-
-    For each pixel ``p`` in the mask, returns the parametric position ``t`` on the
-    axis where ``t = 0`` at the centroid and ``t = 1`` at the far edge::
-
-        t = ((p - centroid) · (far_edge - centroid)) / |far_edge - centroid|²
-
-    Pixels outside the mask are set to NaN. Values <0 or >1 are kept (the
-    projection of mask pixels off the axis endpoints).
-
-    Used by ``compute_ring_zones`` to colour the otolith silhouette with one
-    colour per annual zone (band between two consecutive peaks).
-    """
-    H, W = mask.shape[:2]
-    cx, cy = float(centroid[0]), float(centroid[1])
-    fx, fy = float(far_edge[0]), float(far_edge[1])
-    vx, vy = fx - cx, fy - cy
-    norm_sq = vx * vx + vy * vy
-    if norm_sq <= 0:
-        return np.full((H, W), np.nan, dtype=np.float32)
-
-    ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
-    t = ((xs - cx) * vx + (ys - cy) * vy) / norm_sq
-    out = t.astype(np.float32)
-    out[mask == 0] = np.nan
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Mask cache I/O
 # ---------------------------------------------------------------------------
 
