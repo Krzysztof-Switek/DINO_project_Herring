@@ -55,6 +55,77 @@ def test_segment_returns_none_for_uniform_image():
     assert segment_otolith(img) is None
 
 
+# ---------------------------------------------------------------------------
+# Radial fade-detection segmentation (bright otolith on dark background)
+# ---------------------------------------------------------------------------
+
+def _make_faded_disk(H=400, W=400, center=(200, 200), r_core=80, r_outer=140,
+                     bg=10, fg=220) -> np.ndarray:
+    """Bright disk that FADES to background between r_core and r_outer.
+
+    Mimics a transilluminated embedded otolith: opaque core → thinning translucent
+    rim → dark background. The strong edge sits inside r_outer, the true edge at r_outer.
+    """
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = np.hypot(xx - center[0], yy - center[1])
+    inten = np.full((H, W), float(bg), dtype=np.float32)
+    inten[d <= r_core] = fg
+    ramp = (d > r_core) & (d <= r_outer)
+    inten[ramp] = fg - (fg - bg) * (d[ramp] - r_core) / (r_outer - r_core)
+    img = np.clip(inten, 0, 255).astype(np.uint8)
+    return np.stack([img] * 3, axis=2)
+
+
+def test_radial_captures_faded_margin():
+    """Radial method must reach INTO the faint fading rim, past the bright core."""
+    img = _make_faded_disk(r_core=80, r_outer=140)
+    mask = segment_otolith(img, method="radial")
+    assert mask is not None
+    area = int((mask > 0).sum())
+    core_area = np.pi * 80 ** 2       # bright opaque core  ≈ 20 106
+    outer_area = np.pi * 140 ** 2     # true faded edge     ≈ 61 575
+    assert area > 1.5 * core_area, f"radial didn't reach the fade: {area}"
+    assert area < outer_area,      f"radial blew past the true edge: {area}"
+
+
+def _contour_jaggedness(mask: np.ndarray) -> float:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    c = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(c)
+    per = cv2.arcLength(c, True)
+    return (per * per) / (4.0 * np.pi * area + 1e-9)
+
+
+def test_radial_smoothing_knob_reduces_jaggedness():
+    """Higher smooth_sigma yields a smoother (lower-jaggedness) radial outline.
+
+    smooth_sigma is the "follow the scalloped teeth (low) vs smooth envelope
+    (high)" knob — this checks the mechanism directly, independent of the default.
+    """
+    rng = np.random.default_rng(0)
+    H = W = 400
+    yy, xx = np.mgrid[0:H, 0:W]
+    d = np.hypot(xx - 200, yy - 200)
+    img = np.where(d <= 120, 210.0, 15.0)
+    band = (d > 105) & (d < 135)                       # speckle only near the edge
+    img[band] += rng.normal(0, 60, (H, W))[band]
+    img = np.clip(img, 0, 255).astype(np.uint8)
+    img = np.stack([img] * 3, axis=2)
+
+    sharp = segment_otolith(img, method="radial", smooth_sigma=2.0)
+    smooth = segment_otolith(img, method="radial", smooth_sigma=20.0)
+    assert sharp is not None and smooth is not None
+    assert _contour_jaggedness(smooth) < _contour_jaggedness(sharp)
+
+
+def test_threshold_method_still_works():
+    """The old method remains available as a fallback via method='threshold'."""
+    img = _make_dark_ellipse(center=(400, 300), axes=(100, 200))
+    mask = segment_otolith(img, method="threshold")
+    assert mask is not None
+    assert 56_000 <= int((mask > 0).sum()) <= 72_000
+
+
 def test_segment_picks_largest_component():
     """Two ellipses (small + large) → mask covers only the large one."""
     img = np.full((600, 800, 3), 255, dtype=np.uint8)

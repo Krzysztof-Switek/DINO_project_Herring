@@ -282,7 +282,7 @@ def run_interpretation(
             # Resolve otolith mask: cache first, then segment (saved for reuse by run_candidates)
             mask_arr = load_mask(mask_path)
             if mask_arr is None:
-                info = detect_axis(orig_rgb)
+                info = detect_axis(orig_rgb, seg_params=cfg.segmentation.as_params())
                 if info is not None:
                     mask_arr = info["mask"]
                     save_mask(mask_arr, mask_path)

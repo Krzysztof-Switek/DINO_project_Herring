@@ -78,12 +78,13 @@ def _sample_images(df: pd.DataFrame, n: int, seed: int,
     return df.sample(n=min(n, len(df)), random_state=seed).copy()
 
 
-def _draw_overlay(rgb: np.ndarray, info: dict) -> np.ndarray:
+def _draw_overlay(rgb: np.ndarray, info: dict,
+                  contour_color: tuple[int, int, int] = (0, 255, 255)) -> np.ndarray:
     """Draw contour + centroid cross + axis line on a copy of rgb."""
     img = rgb.copy()
     H = img.shape[0]
     lw = max(2, H // 250)
-    cv2.drawContours(img, [info["contour"]], -1, (0, 255, 255), lw)  # cyan
+    cv2.drawContours(img, [info["contour"]], -1, contour_color, lw)
     cx, cy = info["centroid"]
     fx, fy = info["far_edge"]
     cv2.line(img, (cx, cy), (fx, fy), (255, 220, 0), lw)             # yellow axis
@@ -91,6 +92,13 @@ def _draw_overlay(rgb: np.ndarray, info: dict) -> np.ndarray:
     cv2.line(img, (cx - cross, cy), (cx + cross, cy), (0, 100, 255), lw)  # blue cross
     cv2.line(img, (cx, cy - cross), (cx, cy + cross), (0, 100, 255), lw)
     return img
+
+
+def _jaggedness(contour: np.ndarray) -> float:
+    """Isoperimetric index perimeter²/(4π·area): 1=circle, higher=more squiggly."""
+    area = cv2.contourArea(contour)
+    per = cv2.arcLength(contour, True)
+    return (per * per) / (4.0 * np.pi * area + 1e-9)
 
 
 def _mask_to_rgb(mask: np.ndarray) -> np.ndarray:
@@ -106,27 +114,38 @@ def _label_panel(panel: np.ndarray, text: str) -> np.ndarray:
     return np.vstack([bar, panel])
 
 
-def _make_grid(rgb: np.ndarray, info: dict | None) -> np.ndarray:
-    """3-panel grid: original | mask | overlay."""
-    if info is None:
-        # Empty mask + warning overlay
-        H, W = rgb.shape[:2]
-        empty = np.zeros((H, W, 3), dtype=np.uint8)
-        warning = rgb.copy()
-        cv2.putText(warning, "SEGMENTATION FAILED", (W // 6, H // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 0, 0), 3, cv2.LINE_AA)
-        panels = [
-            _label_panel(rgb,     "1. original"),
-            _label_panel(empty,   "2. mask (FAILED)"),
-            _label_panel(warning, "3. overlay (FAILED)"),
-        ]
+def _fail_panel(rgb: np.ndarray, label: str) -> np.ndarray:
+    warning = rgb.copy()
+    W = rgb.shape[1]
+    cv2.putText(warning, "FAILED", (W // 4, rgb.shape[0] // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 0, 0), 3, cv2.LINE_AA)
+    return _label_panel(warning, label)
+
+
+def _make_grid(rgb: np.ndarray, info_thr: dict | None,
+               info_rad: dict | None) -> np.ndarray:
+    """4-panel grid: original | threshold (old, cyan) | radial (new, green) | radial mask.
+
+    Lets you eyeball whether the radial outline reaches the faint rim and is
+    smoother than the old threshold contour (jaggedness index in the label).
+    """
+    if info_thr is not None:
+        j = _jaggedness(info_thr["contour"])
+        p_thr = _label_panel(_draw_overlay(rgb, info_thr, (0, 255, 255)),
+                             f"2. threshold OLD (jag={j:.2f})")
     else:
-        panels = [
-            _label_panel(rgb,                       "1. original"),
-            _label_panel(_mask_to_rgb(info["mask"]), "2. mask"),
-            _label_panel(_draw_overlay(rgb, info),  "3. contour + centroid + axis"),
-        ]
-    return np.hstack(panels)
+        p_thr = _fail_panel(rgb, "2. threshold OLD")
+
+    if info_rad is not None:
+        j = _jaggedness(info_rad["contour"])
+        p_rad = _label_panel(_draw_overlay(rgb, info_rad, (0, 255, 0)),
+                             f"3. radial NEW (jag={j:.2f})")
+        p_mask = _label_panel(_mask_to_rgb(info_rad["mask"]), "4. radial mask")
+    else:
+        p_rad = _fail_panel(rgb, "3. radial NEW")
+        p_mask = _label_panel(np.zeros_like(rgb), "4. radial mask (FAILED)")
+
+    return np.hstack([_label_panel(rgb, "1. original"), p_thr, p_rad, p_mask])
 
 
 def main() -> None:
@@ -174,16 +193,20 @@ def main() -> None:
             print(f"  [{i:3d}] SKIP — read error ({e}): {iid}")
             continue
 
-        info = detect_axis(rgb)
+        info_thr = detect_axis(rgb, seg_params={"method": "threshold"})
+        info_rad = detect_axis(rgb, seg_params={"method": "radial"})
+        info = info_rad if info_rad is not None else info_thr
         if info is None:
             n_failed += 1
             status = "FAIL"
         else:
             n_success += 1
             lengths.append(info["length_px"])
-            status = f"OK  axis={info['length_px']:.0f}px"
+            jr = _jaggedness(info_rad["contour"]) if info_rad is not None else float("nan")
+            jt = _jaggedness(info_thr["contour"]) if info_thr is not None else float("nan")
+            status = f"OK  axis={info['length_px']:.0f}px  jag old={jt:.2f}→new={jr:.2f}"
 
-        grid = _make_grid(rgb, info)
+        grid = _make_grid(rgb, info_thr, info_rad)
         out_path = output_dir / f"grid_{i:03d}_{Path(iid).stem}.png"
         PILImage.fromarray(grid, mode="RGB").save(out_path)
         print(f"  [{i:3d}] {status}  → {out_path.name}")

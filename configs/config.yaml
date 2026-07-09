@@ -63,3 +63,11 @@ interpretation:
 candidates:
   min_peak_distance: 5            # min patch-distance between candidate increments
   prominence_threshold: 0.1
+
+segmentation:                     # otolith outline detection (src/otolith_axis.py)
+  method: radial                  # radial (smooth, reaches faint rim) | threshold (Otsu+hysteresis fallback)
+  frac: 0.18                      # per-ray reach = fraction of that ray's body brightness (↓ = capture more faint margin)
+  background_k: 3.0               # background floor = bg_mean + k·bg_std
+  n_angles: 720                   # rays cast from the nucleus
+  smooth_sigma: 4.0               # periodic r(θ) smoothing — low = follow the scalloped teeth, high = smooth envelope
+  gap_tolerance: 8                # px a ray may dip below threshold before the boundary commits

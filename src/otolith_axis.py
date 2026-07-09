@@ -105,31 +105,42 @@ def _hysteresis_mask(
     return strong, final
 
 
+# Default radial-segmentation parameters (overridable via SegmentationConfig).
+_RADIAL_DEFAULTS = {
+    "frac":          0.18,   # per-ray threshold = this fraction of the ray's body brightness
+    "background_k":  3.0,    # background floor = bg_mean + k·bg_std
+    "n_angles":      720,    # rays cast from the nucleus
+    "smooth_sigma":  4.0,    # Gaussian sigma for periodic r(θ) smoothing (low = follow scalloped teeth)
+    "gap_tolerance": 8,      # pixels a ray may dip below threshold before the boundary commits
+}
+
+
 def segment_otolith(
     rgb: np.ndarray,
+    method: str = "radial",
     weak_offset: int = 30,
+    **radial_params,
 ) -> Optional[np.ndarray]:
     """Binary mask of the otolith (largest connected blob).
 
-    Auto-detects polarity from corner pixels:
-      - dark background (e.g. NotEmbedded on black) → otolith is the bright region
-      - light background (Embedded in transmitted light) → otolith is the dark region
+    Two methods (``method``):
+      * ``"radial"`` (default) — cast rays from the nucleus and place the boundary
+        where each ray fades into the background; produces a SMOOTH outline that
+        reaches the faint, thinning rim (see ``_segment_radial``). Best for
+        transilluminated embedded otoliths whose edge dissolves into the dark
+        background and whose late increments sit in that faint margin.
+      * ``"threshold"`` — the original Otsu + hysteresis region-growing
+        (``_segment_threshold``). Kept as a fallback and for light-background /
+        high-contrast cases.
 
-    Uses HYSTERESIS thresholding (two thresholds with region-growing) to capture
-    the thin, low-contrast edges typical of transmitted-light embedded otoliths.
-
-    Pipeline:
-      1. RGB → grayscale + Gaussian blur (5×5)
-      2. Polarity detection from image corners
-      3. Otsu (strong) + Otsu±offset (weak) thresholds
-      4. Hysteresis: keep weak-mask components overlapping the strong mask
-      5. Morphological close (15×15) + light open (5×5) — fills holes,
-         preserves thin edges
-      6. Largest external contour → filled mask
+    The radial method falls back to the threshold method (then ``None``) if it
+    cannot find a core. ``**radial_params`` overrides ``_RADIAL_DEFAULTS``.
 
     Args:
         rgb         : (H, W, 3) uint8 RGB
-        weak_offset : how far below/above Otsu to set the weak threshold
+        method      : "radial" | "threshold"
+        weak_offset : threshold-method weak-band offset from Otsu
+        radial_params: frac, background_k, n_angles, smooth_sigma, gap_tolerance
 
     Returns ``None`` for uniform images or when segmentation collapses.
     """
@@ -138,6 +149,29 @@ def segment_otolith(
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         return None
 
+    if method == "radial":
+        params = {**_RADIAL_DEFAULTS, **radial_params}
+        mask = _segment_radial(rgb, **params)
+        if mask is not None:
+            return mask
+        # radial could not find a core → fall back to the threshold method
+    return _segment_threshold(rgb, weak_offset=weak_offset)
+
+
+def _segment_threshold(
+    rgb: np.ndarray,
+    weak_offset: int = 30,
+) -> Optional[np.ndarray]:
+    """Otsu-strong + adaptive-weak hysteresis segmentation (original method).
+
+    Pipeline:
+      1. RGB → grayscale + Gaussian blur (5×5)
+      2. Polarity detection from image corners
+      3. Otsu (strong) + Otsu±offset (weak) thresholds
+      4. Hysteresis: keep weak-mask components overlapping the strong mask
+      5. Morphological close (15×15) + light open (5×5)
+      6. Largest external contour → filled mask
+    """
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -165,6 +199,111 @@ def segment_otolith(
     final = np.zeros_like(mask)
     cv2.drawContours(final, [largest], -1, color=255, thickness=-1)
     return final
+
+
+def _segment_radial(
+    rgb: np.ndarray,
+    frac: float = 0.18,
+    background_k: float = 3.0,
+    n_angles: int = 720,
+    smooth_sigma: float = 4.0,
+    gap_tolerance: int = 8,
+) -> Optional[np.ndarray]:
+    """Smooth otolith mask by casting rays from the nucleus to the fade edge.
+
+    Transilluminated embedded otoliths are opaque at the core and fade toward a
+    thin, translucent rim before meeting the dark background. A contrast-based
+    threshold stops at the opaque core (outline too small) and wiggles along the
+    ring structure (squiggles). Instead:
+
+      1. Estimate the background level (``bg_mean``/``bg_std``) from the four image
+         corners; detect polarity and invert so the otolith is the *bright* region.
+      2. Find a coarse core (strong Otsu → largest component) and its centroid
+         (the nucleus).
+      3. Cast ``n_angles`` rays from the centroid. Along each ray, the boundary is
+         the OUTERMOST radius whose intensity exceeds a PER-RAY threshold
+         ``max(bg_mean + k·bg_std, bg_mean + frac·(ray_peak − bg_mean))`` — a
+         fraction of *that ray's* own body brightness, floored at the background.
+         This keeps genuinely faint tissue but rejects dim scatter/smoke where the
+         body is bright. A short run below threshold (``gap_tolerance`` px) is
+         tolerated so a faint bridge isn't cut early.
+      4. Smooth ``r(θ)`` periodically (Gaussian) → removes squiggles, keeps lobes.
+      5. Rasterise the smooth radial polygon into a filled mask.
+
+    Returns ``None`` if no core is found (caller falls back to the threshold method).
+    """
+    H, W = rgb.shape[:2]
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (0, 0), 3).astype(np.float32)
+
+    # Background from corners + polarity (invert so otolith is bright).
+    polarity = _detect_polarity(blur.astype(np.uint8))
+    if polarity == "dark":                       # otolith darker than background
+        blur = 255.0 - blur
+    s = max(10, min(H, W) // 20)
+    corners = np.concatenate([
+        blur[:s, :s].ravel(), blur[:s, -s:].ravel(),
+        blur[-s:, :s].ravel(), blur[-s:, -s:].ravel(),
+    ])
+    bg_mean = float(corners.mean())
+    bg_std = float(corners.std()) + 1e-3
+    bg_floor = bg_mean + background_k * bg_std
+
+    # Coarse core → centroid (nucleus).
+    core_t, _ = cv2.threshold(
+        cv2.GaussianBlur(blur.astype(np.uint8), (5, 5), 0),
+        0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+    )
+    core = (blur > core_t).astype(np.uint8) * 255
+    core = cv2.morphologyEx(
+        core, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    )
+    contours, _ = cv2.findContours(core, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    core_mask = np.zeros_like(core)
+    cv2.drawContours(core_mask, [max(contours, key=cv2.contourArea)], -1, 255, -1)
+    centroid = find_centroid(core_mask)
+    if centroid is None:
+        return None
+    cx, cy = centroid
+
+    # Cast rays; find the fade-to-background radius per angle.
+    angles = np.linspace(0.0, 2.0 * np.pi, n_angles, endpoint=False)
+    r_max = int(np.hypot(max(cx, W - cx), max(cy, H - cy)))
+    radii = np.arange(3, max(r_max, 4))
+    rs = np.full(n_angles, 6.0, dtype=np.float32)
+    for i, a in enumerate(angles):
+        xs = np.clip((cx + radii * np.cos(a)).astype(np.int64), 0, W - 1)
+        ys = np.clip((cy + radii * np.sin(a)).astype(np.int64), 0, H - 1)
+        prof = blur[ys, xs]
+        thr = max(bg_floor, bg_mean + frac * (float(prof.max()) - bg_mean))
+        last = 0
+        below = 0
+        for j in range(len(radii)):
+            if prof[j] > thr:
+                last = j
+                below = 0
+            else:
+                below += 1
+                if below > gap_tolerance and last > 0:
+                    break
+        rs[i] = radii[last]
+
+    # Periodic Gaussian smoothing of r(θ) → smooth outline, no squiggles.
+    ksize = int(smooth_sigma * 4) | 1
+    g = cv2.getGaussianKernel(ksize, smooth_sigma).ravel()
+    rs = np.convolve(np.concatenate([rs] * 3), g, mode="same")[n_angles:2 * n_angles]
+
+    pts = np.stack([cx + rs * np.cos(angles), cy + rs * np.sin(angles)], axis=1)
+    pts = pts.astype(np.int32).reshape(-1, 1, 2)
+    mask = np.zeros((H, W), dtype=np.uint8)
+    cv2.drawContours(mask, [pts], -1, color=255, thickness=-1)
+
+    area = float((mask > 0).sum())
+    if area < 100 or area > 0.98 * H * W:
+        return None
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +365,12 @@ def find_farthest_edge(
 # High-level entry point
 # ---------------------------------------------------------------------------
 
-def detect_axis(rgb: np.ndarray) -> Optional[dict]:
+def detect_axis(rgb: np.ndarray, seg_params: Optional[dict] = None) -> Optional[dict]:
     """Run full pipeline: segment → centroid → farthest edge.
+
+    ``seg_params`` (optional): keyword overrides forwarded to ``segment_otolith``
+    (e.g. ``{"method": "radial", "frac": 0.2}``). Typically built from
+    ``ProjectConfig.segmentation`` — see ``SegmentationConfig.as_params``.
 
     Returns:
         dict with keys:
@@ -238,7 +381,7 @@ def detect_axis(rgb: np.ndarray) -> Optional[dict]:
           - ``length_px`` : Euclidean axis length in pixels
         or ``None`` if any stage fails.
     """
-    mask = segment_otolith(rgb)
+    mask = segment_otolith(rgb, **(seg_params or {}))
     if mask is None:
         return None
     centroid = find_centroid(mask)

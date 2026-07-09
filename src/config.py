@@ -111,6 +111,29 @@ class CandidatesConfig(BaseModel):
     detect_image_rings: bool = False
 
 
+class SegmentationConfig(BaseModel):
+    """Otolith outline detection (``src/otolith_axis.py::segment_otolith``).
+
+    ``radial`` (default) casts rays from the nucleus and stops each where the
+    otolith fades into the background, giving a SMOOTH outline that reaches the
+    faint, thinning rim (where late increments live). ``threshold`` is the
+    original Otsu + hysteresis method, kept as a fallback / for high-contrast
+    light-background cases.
+    """
+    method: Literal["radial", "threshold"] = "radial"
+    # per-ray reach: boundary = fraction of THAT ray's body brightness (↓ = capture
+    # more faint margin, ↑ = tighter to the opaque body)
+    frac: float = Field(0.18, ge=0.0, le=1.0)
+    background_k: float = Field(3.0, ge=0.0)      # background floor = bg_mean + k·bg_std
+    n_angles: int = Field(720, ge=32)             # rays cast from the nucleus
+    smooth_sigma: float = Field(4.0, ge=0.0)      # periodic r(θ) smoothing: low = follow teeth, high = smooth envelope
+    gap_tolerance: int = Field(8, ge=0)           # px below threshold tolerated before commit
+
+    def as_params(self) -> dict:
+        """Kwargs for ``segment_otolith`` / ``detect_axis(seg_params=...)``."""
+        return self.model_dump()
+
+
 class DemoConfig(BaseModel):
     """Demo mode — szybki test końcowy pipeline na ograniczonej próbce.
 
@@ -133,6 +156,7 @@ class OtolithConfig(BaseModel):
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
     interpretation: InterpretationConfig = Field(default_factory=InterpretationConfig)
     candidates: CandidatesConfig = Field(default_factory=CandidatesConfig)
+    segmentation: SegmentationConfig = Field(default_factory=SegmentationConfig)
     demo: DemoConfig = Field(default_factory=DemoConfig)
 
 

@@ -401,7 +401,7 @@ def _compute_axis_data_for_samples(
                                                      far[1] - cent[1])),
                     }
         if axis_info is None:
-            axis_info = detect_axis(orig_rgb)
+            axis_info = detect_axis(orig_rgb, seg_params=cfg.segmentation.as_params())
             if axis_info is not None:
                 mask_arr = axis_info["mask"]
                 save_mask(mask_arr, mask_path)

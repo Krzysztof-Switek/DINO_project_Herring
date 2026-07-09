@@ -246,7 +246,7 @@ def run_candidates(
                             "length_px": float(np.hypot(far[0] - cent[0], far[1] - cent[1])),
                         }
             if axis_info is None:
-                axis_info = detect_axis(orig_rgb)
+                axis_info = detect_axis(orig_rgb, seg_params=cfg.segmentation.as_params())
                 if axis_info is not None:
                     save_mask(axis_info["mask"], mask_path)
 
