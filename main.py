@@ -31,20 +31,21 @@ EMBEDDED_ONLY = True  # True = trenuj/raportuj TYLKO Embedded (szybciej;
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-# Zdjęcia leżą na dysku sieciowym Windows (Z:) lokalnie, a pod home na serwerze.
-# Bierzemy PIERWSZĄ istniejącą ścieżkę (env var ma pierwszeństwo), więc TEN SAM
-# main.py działa na obu maszynach bez edycji. UWAGA: "Z:/..." na Linuxie to
-# ścieżka WZGLĘDNA — doklejała się do PROJECT_ROOT (stąd błąd
-# ".../DINO_project_Herring/Z:/Photo/..."). Nadpisz w dowolnej chwili:
-#   export OTOLITH_IMAGE_DIR=/pełna/ścieżka/do/Processed
+# Zdjęcia leżą na dysku sieciowym Windows (Z:, z podkatalogiem Processed) lokalnie,
+# a bezpośrednio pod home na serwerze (BEZ Processed). Bierzemy PIERWSZĄ istniejącą
+# ścieżkę (env var ma pierwszeństwo), więc TEN SAM main.py działa na obu maszynach
+# bez edycji. UWAGA: "Z:/..." na Linuxie to ścieżka WZGLĘDNA — doklejała się do
+# PROJECT_ROOT (stąd błąd ".../DINO_project_Herring/Z:/Photo/..."). Nadpisz kiedy chcesz:
+#   export OTOLITH_IMAGE_DIR=/pełna/ścieżka/do/zdjęć
+_SERVER_IMAGE_DIR  = "/home/kswitek/Documents/Photo/Otolithes/HER"   # serwer (potwierdzone)
+_WINDOWS_IMAGE_DIR = "Z:/Photo/Otolithes/HER/Processed"             # dysk sieciowy Windows
 _IMAGE_DIR_CANDIDATES = [
     os.environ.get("OTOLITH_IMAGE_DIR"),
-    "/home/kswitek/Documents/Photo/Otolithes/HER/Processed",
-    "/home/kswitek/Documents/Photo/Otolithes/HER",
-    "Z:/Photo/Otolithes/HER/Processed",
+    _SERVER_IMAGE_DIR,
+    _WINDOWS_IMAGE_DIR,
 ]
 IMAGE_DIR = next((p for p in _IMAGE_DIR_CANDIDATES if p and Path(p).is_dir()),
-                 "Z:/Photo/Otolithes/HER/Processed")
+                 _SERVER_IMAGE_DIR)
 EXCEL_PATH = str(PROJECT_ROOT / "data" / "analysisWithOtolithPhoto.xlsx")
 
 if MODE == "demo":
@@ -88,6 +89,3 @@ if __name__ == "__main__":
         )
     print(f"[main] IMAGE_DIR = {IMAGE_DIR}")
     main(ARGV)
-
-
-test
