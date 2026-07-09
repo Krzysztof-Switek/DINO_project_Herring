@@ -111,6 +111,7 @@ def build_combined_labels(
     seed: int = 42,
     _image_filenames: list[str] | None = None,
     _excel_df: "pd.DataFrame | None" = None,
+    stats_out: "Path | None" = None,
 ) -> pd.DataFrame:
     """Scan image directory, match to Excel metadata, assign splits.
 
@@ -209,6 +210,31 @@ def build_combined_labels(
         if col not in img_df.columns:
             img_df[col] = None
 
+    # --- Data funnel for the report (disk → parsed → labeled → orphans) ---
+    if stats_out is not None:
+        import json
+        n_disk = len(filenames)
+        per_split = {}
+        for ptype in ["Embedded", "NotEmbedded"]:
+            sub = img_df[img_df["preprocessing_type"] == ptype]
+            per_split[ptype] = {
+                s: int((sub["split"] == s).sum()) for s in ["train", "val", "test"]
+            }
+        stats = {
+            "on_disk": int(n_disk),
+            "parsed": int(len(img_df)),
+            "embedded": int((img_df.preprocessing_type == "Embedded").sum()),
+            "notembedded": int((img_df.preprocessing_type == "NotEmbedded").sum()),
+            "labeled": int((~img_df["orphan"]).sum()),
+            "orphans": int(img_df["orphan"].sum()),
+            "per_split": per_split,
+        }
+        try:
+            Path(stats_out).parent.mkdir(parents=True, exist_ok=True)
+            Path(stats_out).write_text(json.dumps(stats, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
     return img_df[[
         "image_id", "neutral_fish_key", "preprocessing_type",
         "age", "length_mm", "weight_g", "sex", "population",
@@ -262,6 +288,7 @@ if __name__ == "__main__":
         train=args.train,
         val=args.val,
         seed=args.seed,
+        stats_out=output_path.parent / "scan_stats.json",
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

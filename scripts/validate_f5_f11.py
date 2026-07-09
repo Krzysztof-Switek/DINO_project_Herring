@@ -141,8 +141,9 @@ def collect_outputs(cfg, ckpt_path: Path, split: str):
                 probs = torch.sigmoid(out["coral_logits"]).cpu().numpy()
                 coral_chunks.append(probs)
                 pred_chunks.append(decode_age_ordinal(out["coral_logits"]).cpu().numpy())
-            elif "patch_count" in out:
-                pred_chunks.append(out["patch_count"].round().long().cpu().numpy())
+            elif "patch_probs" in out:
+                # top-k MIL loss: age = #active patches (prob>0.5), not the sum
+                pred_chunks.append((out["patch_probs"] > 0.5).sum(dim=1).long().cpu().numpy())
 
             if "patch_probs" in out:
                 patch_chunks.append(out["patch_probs"].cpu().numpy())

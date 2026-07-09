@@ -79,10 +79,16 @@ def assign_split_by_fish(
     """Assign train/val/test splits at the fish level (not image level).
 
     All images belonging to the same fish always land in the same split.
-    Groups are sorted by median age, then shuffled within blocks of 10
-    (age-stratified shuffle) before round-robin assignment.
 
-    Returns a Series indexed like df with split labels.
+    **Age-stratified**: fish are sorted by median age, then within each block of
+    similar-age fish a jittered within-block quantile decides the split. Every age
+    band is therefore represented in all three splits. (The previous version sliced
+    the sorted list globally, which put the OLDEST fish entirely in test — so the
+    model trained on young fish only and failed catastrophically on the older test
+    set. See plans and summaries/09.07_after_training_TO.DO.md.)
+
+    Prints a per-split age summary and warns loudly if the splits are still
+    age-imbalanced. Returns a Series indexed like df with split labels.
     """
     rng = np.random.default_rng(seed)
 
@@ -95,24 +101,33 @@ def assign_split_by_fish(
         .reset_index(drop=True)
     )
     n = len(groups)
-    n_train = int(round(n * train))
-    n_val   = int(round(n * val))
 
-    # Shuffle within age strata (blocks of 10)
-    parts = []
-    for start in range(0, n, 10):
-        blk = groups.iloc[start : start + 10].copy()
-        parts.append(blk.iloc[rng.permutation(len(blk))].reset_index(drop=True))
-    groups = pd.concat(parts, ignore_index=True)
+    # Within each age block, assign a jittered within-block quantile u∈[0,1),
+    # then split by u. u is ~uniform per block and independent of age → the split
+    # is age-stratified AND converges to the train/val/test ratios over the blocks.
+    block = 10
+    u = np.empty(n, dtype=float)
+    for start in range(0, n, block):
+        idx = np.arange(start, min(start + block, n))
+        b = len(idx)
+        u[idx] = (rng.permutation(b) + rng.random(b)) / b
+    groups["split"] = np.where(u < train, "train",
+                               np.where(u < train + val, "val", "test"))
 
-    def _label(i: int) -> str:
-        if i < n_train:
-            return "train"
-        if i < n_train + n_val:
-            return "val"
-        return "test"
+    # Defensive sanity check: the split must be age-balanced. Warn if not.
+    stats = groups.groupby("split")["med_age"].agg(["mean", "median", "min", "max", "count"])
+    print("  Rozkład wieku per split (mediana wieku ryby):")
+    for sp in ("train", "val", "test"):
+        if sp in stats.index:
+            r = stats.loc[sp]
+            print(f"    {sp:5s}: n_ryb={int(r['count']):5d}  mean={r['mean']:.2f}  "
+                  f"median={r['median']:.1f}  min={r['min']:.0f}  max={r['max']:.0f}")
+    if {"train", "test"}.issubset(stats.index):
+        gap = abs(float(stats.loc["train", "mean"]) - float(stats.loc["test", "mean"]))
+        if gap > 0.5:
+            print(f"  UWAGA: sredni wiek train vs test rozni sie o {gap:.2f} roku "
+                  f"- podzial moze byc NIEZBALANSOWANY wiekowo!")
 
-    groups["split"] = [_label(i) for i in range(n)]
     split_map = groups.set_index(fish_col)["split"]
     return df[fish_col].map(split_map)
 

@@ -52,11 +52,13 @@ def run_inference(
 
             out = model(images, metadata=metadata)
             # Prefer CORAL when present (continuity with prior reports);
-            # fall back to rounded MIL count for mil-only models.
+            # fall back to the MIL count for mil-only models. With the top-k
+            # concentration loss the age is the number of ACTIVE patches
+            # (prob>0.5) ≈ age, not the (slightly inflated) sum of probs.
             if "coral_logits" in out:
                 pred_ages = decode_age_ordinal(out["coral_logits"])
             else:
-                pred_ages = out["patch_count"].round().long().clamp(0, K - 1)
+                pred_ages = (out["patch_probs"] > 0.5).sum(dim=1).long().clamp(0, K - 1)
 
             has_labels = "age" in batch
             batch_size = images.size(0)

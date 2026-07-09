@@ -359,21 +359,45 @@ def test_mil_count_equals_sum_of_probs():
     assert torch.allclose(out["patch_count"], out["patch_probs"].sum(dim=1))
 
 
-def test_mil_count_loss_minimises_to_age():
-    """MIL count loss: optimising patch_probs so their sum equals target age."""
+def test_mil_count_loss_concentrates_to_age():
+    """MIL top-k loss: exactly ~age patches converge to high prob, the rest to ~0.
+
+    Regression for F11 (the diffuse-map bug): the old sum-MSE + weak sparsity
+    left every patch at ~age/N (nothing to localise). The top-k loss must break
+    the symmetry so #active(prob>0.5) == age.
+    """
     from src.model import mil_count_loss
     torch.manual_seed(0)
-    logits = torch.zeros(1, 100, requires_grad=True)
+    logits = (torch.randn(1, 100) * 0.5).requires_grad_(True)
     opt = torch.optim.Adam([logits], lr=0.1)
     target_age = torch.tensor([7.0])
-    for _ in range(200):
+    for _ in range(400):
         opt.zero_grad()
         probs = torch.sigmoid(logits)
-        loss = mil_count_loss(probs, target_age, sparsity_weight=0.0)
+        loss = mil_count_loss(probs, target_age, sparsity_weight=1.0)
         loss.backward()
         opt.step()
-    final_count = torch.sigmoid(logits).sum().item()
-    assert abs(final_count - 7.0) < 0.2
+    probs = torch.sigmoid(logits).detach()[0]
+    n_active = int((probs > 0.5).sum())
+    assert n_active == 7                                   # exactly age patches fire
+    top = probs.sort(descending=True).values
+    assert top[6] > 0.5 and top[7] < 0.2                  # 7 on, 8th is background
+
+
+def test_mil_count_loss_age_zero_is_empty():
+    """age 0 → no patch should fire (k=0, background suppression only)."""
+    from src.model import mil_count_loss
+    torch.manual_seed(0)
+    logits = (torch.randn(1, 100) * 0.5).requires_grad_(True)
+    opt = torch.optim.Adam([logits], lr=0.1)
+    for _ in range(300):
+        opt.zero_grad()
+        probs = torch.sigmoid(logits)
+        loss = mil_count_loss(probs, torch.tensor([0.0]), sparsity_weight=1.0)
+        loss.backward()
+        opt.step()
+    probs = torch.sigmoid(logits).detach()[0]
+    assert int((probs > 0.5).sum()) == 0
 
 
 def test_get_patch_probs_raises_when_no_mil_head():

@@ -44,6 +44,8 @@ _LABEL_COLORS = {
     "NotEmb → Emb ★ CROSS": "#4a3aa7",
 }
 _PTYPE_COLORS = {"Embedded": "#2a78d6", "NotEmbedded": "#eb6834"}
+# Split identity — reuses the same validated categorical hues (train/val/test).
+_SPLIT_COLORS = {"train": "#2a78d6", "val": "#eb6834", "test": "#008300"}
 _INK, _MUTED, _GRID = "#0b0b0b", "#898781", "#e1e0d9"
 
 
@@ -114,47 +116,97 @@ def _img_tag(b64: str, width: str = "100%") -> str:
 # Section builders
 # ---------------------------------------------------------------------------
 
-def _section_a(dataset_stats: dict) -> str:
-    counts = dataset_stats.get("counts", {})
-    rows = ""
-    for ptype in ["Embedded", "NotEmbedded"]:
-        for split in ["train", "val", "test"]:
-            n = counts.get(ptype, {}).get(split, 0)
-            rows += f"<tr><td>{ptype}</td><td>{split}</td><td>{n}</td></tr>"
-    orphans = dataset_stats.get("orphan_count", "N/A")
+def _section_a(dataset_stats: dict, active_ptypes: list[str] | None = None) -> str:
+    counts       = dataset_stats.get("counts", {})
+    fish_counts  = dataset_stats.get("fish_counts", {})
+    age_by_split = dataset_stats.get("age_by_split", {})
+    age_dists    = dataset_stats.get("age_distributions", {})
+    funnel       = dataset_stats.get("funnel")
+    orphans      = dataset_stats.get("orphan_count", "N/A")
 
-    # Age histogram
-    age_data = dataset_stats.get("age_distributions", {})
-    plots_html = ""
-    if age_data:
-        present = [(p, ages) for p, ages in age_data.items() if ages]
-        if present:
+    ptypes = active_ptypes or dataset_stats.get("active_ptypes") or ["Embedded", "NotEmbedded"]
+    # keep only preparation types that actually carry data
+    present_ptypes = [p for p in ptypes
+                      if counts.get(p) or age_by_split.get(p) or age_dists.get(p)]
+    ptypes = present_ptypes or ptypes
+
+    html = '<section id="A"><h2>A. Statystyki zbioru danych</h2>'
+
+    # 1) Data funnel: disk → parsed → labeled → orphans
+    if funnel:
+        html += ('<p class="cap">Lejek danych — ile zdjęć przeszło z dysku do zbioru '
+                 'uczącego (gdzie i dlaczego ubywa).</p>')
+        steps = [
+            ("Na dysku (zeskanowane)",        funnel.get("on_disk")),
+            ("Sparsowane (poprawna nazwa)",   funnel.get("parsed")),
+            ("Z metadanymi = labeled",        funnel.get("labeled")),
+            ("Sieroty (bez metadanych)",      funnel.get("orphans")),
+        ]
+        html += '<table border="1" cellpadding="4" cellspacing="0"><tr>'
+        html += "".join(f"<th>{name}</th>" for name, _ in steps) + "</tr><tr>"
+        html += "".join(f"<td>{'—' if v is None else v}</td>" for _, v in steps)
+        html += "</tr></table>"
+        html += (f'<p class="cap">Sparsowane wg typu: Embedded '
+                 f'<b>{funnel.get("embedded", "?")}</b>, NotEmbedded '
+                 f'<b>{funnel.get("notembedded", "?")}</b>.</p>')
+    else:
+        html += f'<p>Sieroty (bez metadanych w Excel): <b>{orphans}</b></p>'
+
+    # 2) Per-split counts — images AND unique fish
+    html += ('<p class="cap">Liczności per split — obrazy i unikalne ryby '
+             '(podział per-ryba, bez wycieku między splitami).</p>')
+    html += ('<table border="1" cellpadding="4" cellspacing="0">'
+             '<tr><th>Typ</th><th>Split</th><th>Obrazy</th><th>Ryby</th></tr>')
+    for ptype in ptypes:
+        for split in ["train", "val", "test"]:
+            n_img = counts.get(ptype, {}).get(split, 0)
+            n_fish = fish_counts.get(ptype, {}).get(split)
+            html += (f"<tr><td>{ptype}</td><td>{split}</td><td>{n_img}</td>"
+                     f"<td>{'—' if n_fish is None else n_fish}</td></tr>")
+    html += "</table>"
+
+    # 3) Age distribution per split — small multiples (makes a split skew obvious)
+    html += _section_a_age_charts(ptypes, age_by_split, age_dists)
+
+    html += "</section>"
+    return html
+
+
+def _section_a_age_charts(ptypes, age_by_split: dict, age_dists: dict) -> str:
+    """Per-split age histograms (small multiples), or a single-histogram fallback."""
+    html = ""
+    for ptype in ptypes:
+        by_split = age_by_split.get(ptype)
+        if by_split and any(by_split.get(s) for s in ("train", "val", "test")):
+            fig, axes = plt.subplots(1, 3, figsize=(11, 2.8), sharey=True)
+            for ax, split in zip(axes, ("train", "val", "test")):
+                ages = by_split.get(split, [])
+                ax.hist(ages, bins=range(0, 21), color=_SPLIT_COLORS[split])
+                mean = float(np.mean(ages)) if ages else float("nan")
+                ax.set_title(f"{split} (n={len(ages)}, śr={mean:.1f})")
+                ax.set_xlabel("Wiek (lata)")
+                ax.set_xticks(range(0, 21, 4))
+                _style_ax(ax)
+            axes[0].set_ylabel("Liczba obrazów")
+            fig.suptitle(f"Rozkład wieku per split — {ptype}", color=_INK)
+            fig.tight_layout()
+            html += _img_tag(_fig_to_b64(fig))
+            plt.close(fig)
+            html += ('<p class="cap">Rozkłady train/val/test powinny się pokrywać; '
+                     'rozjazd (np. test = tylko stare ryby) sygnalizuje zły podział.</p>')
+        elif age_dists.get(ptype):
             fig, ax = plt.subplots(figsize=(7, 3))
-            ax.hist([ages for _, ages in present],
-                    bins=range(0, 21),
-                    label=[p for p, _ in present],
-                    color=[_PTYPE_COLORS.get(p, "#888888") for p, _ in present])
+            ax.hist(age_dists[ptype], bins=range(0, 21),
+                    color=_PTYPE_COLORS.get(ptype, "#888888"))
             ax.set_xlabel("Wiek (lata)")
-            ax.set_ylabel("Liczba zdjęć")
-            ax.set_title("Rozkład wiekowy: Embedded vs NotEmbedded")
+            ax.set_ylabel("Liczba obrazów")
+            ax.set_title(f"Rozkład wieku — {ptype}")
             ax.set_xticks(range(0, 21, 2))
-            ax.legend()
             _style_ax(ax)
             fig.tight_layout()
-            plots_html = _img_tag(_fig_to_b64(fig))
+            html += _img_tag(_fig_to_b64(fig))
             plt.close(fig)
-
-    return f"""
-<section id="A">
-<h2>A. Statystyki zbioru danych</h2>
-<table border="1" cellpadding="4" cellspacing="0">
-<tr><th>Typ</th><th>Split</th><th>N zdjęć</th></tr>
-{rows}
-</table>
-<p>Sieroty (not-embedded bez metadanych): <b>{orphans}</b></p>
-{plots_html}
-</section>
-"""
+    return html
 
 
 def _section_b(training_logs: dict) -> str:
@@ -162,21 +214,34 @@ def _section_b(training_logs: dict) -> str:
     for key, logs in training_logs.items():
         if not logs:
             continue
-        epochs = [r.get("epoch", i) for i, r in enumerate(logs)]
+        epochs     = [r.get("epoch", i) for i, r in enumerate(logs)]
         train_loss = [r.get("train_loss", float("nan")) for r in logs]
-        val_loss = [r.get("val_loss", float("nan")) for r in logs]
-        val_mae = [r.get("val_mae", float("nan")) for r in logs]
-        lr = [r.get("lr", float("nan")) for r in logs]
+        val_loss   = [r.get("val_loss", float("nan")) for r in logs]
+        val_mae    = [r.get("val_mae", float("nan")) for r in logs]
+        lr         = [r.get("lr", float("nan")) for r in logs]
+
+        def _col(name):
+            return [r.get(name, float("nan")) for r in logs]
+        coral_loss = _col("coral_loss")
+        mil_loss   = _col("mil_loss")
+        mil_active = _col("mil_active")
+        mean_age   = _col("mean_age")
+        has_components = any(not np.isnan(v) for v in coral_loss) or \
+                         any(not np.isnan(v) for v in mil_loss)
+        has_localise = any(not np.isnan(v) for v in mil_active)
 
         best_epoch = int(np.nanargmin(val_mae)) if any(not np.isnan(v) for v in val_mae) else None
         best_mae = val_mae[best_epoch] if best_epoch is not None else float("nan")
 
+        html += f"<h3>{key}</h3>"
+
+        # Row 1: train/val loss, val_MAE, LR (always available)
         fig, axes = plt.subplots(1, 3, figsize=(12, 3))
         axes[0].plot(epochs, train_loss, label="train_loss", color="#2a78d6", linewidth=2)
         axes[0].plot(epochs, val_loss, label="val_loss", color="#eb6834", linewidth=2)
         if best_epoch is not None:
             axes[0].axvline(epochs[best_epoch], color=_MUTED, linestyle="--", alpha=0.7)
-        axes[0].set_title(f"Loss — {key}")
+        axes[0].set_title("Loss: train vs val")
         axes[0].legend()
         axes[1].plot(epochs, val_mae, color="#008300", linewidth=2)
         if best_epoch is not None:
@@ -192,6 +257,39 @@ def _section_b(training_logs: dict) -> str:
         fig.tight_layout()
         html += _img_tag(_fig_to_b64(fig))
         plt.close(fig)
+        html += ('<p class="cap">Loss: rozjazd train↓ / val↑ = przeuczenie. '
+                 'val_MAE: linia = najlepsza epoka. LR: harmonogram uczenia.</p>')
+
+        # Row 2: CORAL vs MIL loss, #active-vs-age (only if trainer logged them)
+        if has_components or has_localise:
+            n = int(has_components) + int(has_localise)
+            fig, axes = plt.subplots(1, n, figsize=(4.2 * n, 3), squeeze=False)
+            axes = axes[0]
+            i = 0
+            if has_components:
+                axes[i].plot(epochs, coral_loss, label="CORAL (liczy wiek)",
+                             color="#2a78d6", linewidth=2)
+                axes[i].plot(epochs, mil_loss, label="MIL (lokalizuje)",
+                             color="#eb6834", linewidth=2)
+                axes[i].set_title("Strata CORAL vs MIL")
+                axes[i].legend()
+                axes[i].set_xlabel("Epoka")
+                _style_ax(axes[i])
+                i += 1
+            if has_localise:
+                axes[i].plot(epochs, mil_active, label="#aktywnych (p>0.5)",
+                             color="#008300", linewidth=2)
+                axes[i].plot(epochs, mean_age, label="średni wiek", color=_MUTED,
+                             linewidth=2, linestyle="--")
+                axes[i].set_title("Lokalizacja MIL: #aktywnych vs wiek")
+                axes[i].legend()
+                axes[i].set_xlabel("Epoka")
+                _style_ax(axes[i])
+            fig.tight_layout()
+            html += _img_tag(_fig_to_b64(fig))
+            plt.close(fig)
+            html += ('<p class="cap">Która głowica się uczy (CORAL vs MIL) oraz czy MIL '
+                     '<b>lokalizuje</b>: #aktywnych patchy powinno zbiegać do średniego wieku.</p>')
 
         html += f"""
 <table border="1" cellpadding="4"><tr>
@@ -204,14 +302,21 @@ def _section_b(training_logs: dict) -> str:
     return html
 
 
-def _section_c(results: dict) -> str:
+def _section_c(results: dict, single: bool = False) -> str:
     condition_labels = {
         "emb_on_emb":       "Emb → Emb",
         "notemb_on_notemb": "NotEmb → NotEmb",
         "emb_on_notemb":    "Emb → NotEmb ★ CROSS",
         "notemb_on_emb":    "NotEmb → Emb ★ CROSS",
     }
-    html = '<section id="C"><h2>C. Metryki ewaluacyjne (4 warunki)</h2>'
+    if single:
+        # Only keep conditions that carry data (embedded-only → Emb → Emb).
+        condition_labels = {
+            k: v.replace(" ★ CROSS", "") for k, v in condition_labels.items()
+            if results.get(k) is not None and not results[k].empty
+        }
+    heading = "C. Metryki ewaluacyjne" + ("" if single else " (4 warunki)")
+    html = f'<section id="C"><h2>{heading}</h2>'
 
     metric_rows = []
     scatter_figs = []
@@ -272,6 +377,7 @@ def _plots_per_condition(results: dict, condition_labels: dict) -> str:
     html = ""
     all_errors = {}
     all_mae_per_age = {}
+    all_acc_per_age = {}
 
     for cond_key, label in condition_labels.items():
         df = results.get(cond_key)
@@ -282,10 +388,13 @@ def _plots_per_condition(results: dict, condition_labels: dict) -> str:
 
         ages = sorted(df["age"].unique())
         mae_per_age = {}
+        acc_per_age = {}
         for a in ages:
-            mask = df["age"] == a
+            mask = (df["age"] == a).values
             mae_per_age[a] = float(np.mean(np.abs(errors[mask])))
+            acc_per_age[a] = float(np.mean(errors[mask] == 0))   # exact-match accuracy
         all_mae_per_age[label] = mae_per_age
+        all_acc_per_age[label] = acc_per_age
 
     if all_errors:
         # Signed-error distribution per condition. Grouped (side-by-side) bars on
@@ -349,6 +458,29 @@ def _plots_per_condition(results: dict, condition_labels: dict) -> str:
         fig.tight_layout()
         html += _img_tag(_fig_to_b64(fig))
         plt.close(fig)
+        html += ('<p class="cap">MAE per klasa wiekowa — gdzie model myli się najbardziej '
+                 '(zwykle rzadkie, starsze roczniki).</p>')
+
+    if all_acc_per_age:
+        age_union = sorted({a for d in all_acc_per_age.values() for a in d})
+        fig, ax = plt.subplots(figsize=(8, 4))
+        for label, acc_dict in all_acc_per_age.items():
+            ages = sorted(acc_dict.keys())
+            ax.plot(ages, [acc_dict[a] for a in ages], marker="o", markersize=5,
+                    linewidth=2, color=_LABEL_COLORS.get(label, "#888888"), label=label)
+        ax.set_xlabel("Klasa wiekowa (lata)")
+        ax.set_ylabel("Dokładność (pred = prawda)")
+        ax.set_ylim(0, 1)
+        ax.set_title("Accuracy per klasa wiekowa")
+        if age_union:
+            ax.set_xticks(age_union)
+        ax.legend(fontsize=7)
+        _style_ax(ax)
+        fig.tight_layout()
+        html += _img_tag(_fig_to_b64(fig))
+        plt.close(fig)
+        html += ('<p class="cap">Dokładność dokładnego trafienia (pred = prawda) '
+                 'per klasa wiekowa.</p>')
 
     return html
 
@@ -441,16 +573,6 @@ od jądra (centroid) do najdalszej krawędzi konturu (zwykle post-rostralnej):</
   — to dwa różne sygnały. Mogą się nieznacznie różnić (np. wiek = 3, a zlokalizowane
   2 pierścienie); po dobrym treningu powinny się zgadzać.
 </p>
-<p style="font-size:90%;color:#666;background:#f8f8f0;padding:8px;border-left:3px solid #c8b400;">
-  <b>Dlaczego niektóre karty mają puste panele 4/5/6?</b><br>
-  Peaki w profilu 1D wykrywa <code>scipy.signal.find_peaks</code> z progiem
-  prominencji <code>0.1</code>. Gdy model jest jeszcze niewytrenowany
-  (np. po 1 epoce w trybie <code>demo</code>, na kilkunastu obrazach), mapa
-  ważności DINOv2 jest praktycznie jednorodnym szumem, profil wzdłuż osi jest
-  płaski i detector zwraca pustą tablicę. <b>To zachowanie oczekiwane,
-  nie błąd</b> — krzywe pierścieni i ponumerowane kropki pojawią się dopiero
-  po pełnym treningu (<code>config.yaml</code>, 50 epok na model).
-</p>
 """
     for label, paths in increment_cards.items():
         html += f"<h3>{label.capitalize()}</h3>"
@@ -484,23 +606,36 @@ def _thumb_b64(path) -> str | None:
         return None
 
 
-def _section_g(candidate_overlays: dict | None) -> str:
+_SPLIT_BADGE = {
+    "train": ("#2a78d6", "train"),
+    "val":   ("#eb6834", "val"),
+    "test":  ("#008300", "test"),
+}
+
+
+def _section_g(candidate_overlays: dict | None,
+               split_lookup: dict | None = None) -> str:
     """Gallery of model-drawn increment-dot overlays for every annotated image.
 
     ``candidate_overlays``: ``{label -> [png Path, ...]}``. Empty/None → section omitted.
+    ``split_lookup``: optional ``{image_id -> split}`` to badge each tile.
     Which images appear is governed by ``inference.increment_samples.annotate_all``
     (all test images when True, otherwise only the top-k best/worst).
     """
     if not candidate_overlays:
         return ""
+    split_lookup = split_lookup or {}
     html = (
         '<section id="G">'
         '<h2>G. Galeria: kropki przyrostów wykryte przez model</h2>'
         '<p>Każdy kafelek to zdjęcie otolitu z konturem, żółtą osią biologiczną i '
-        '<b>czerwonymi kropkami</b> w miejscach przyrostów wykrytych przez model '
-        '(peaki profilu ważności wzdłuż osi). Odpowiednik anotacji SmartDots — '
-        'z tą różnicą, że kropki stawia <b>model</b>, nie technik. Liczba i pozycje '
-        'kropek stają się wiarygodne dopiero po pełnym treningu.</p>'
+        '<b>czerwonymi kropkami</b> w miejscach przyrostów wykrytych przez model.</p>'
+        '<p class="cap"><b>Dlaczego kropki są właśnie tu?</b> Model dla każdego '
+        'patcha (fragmentu ~14×14 px) zwraca <b>prawdopodobieństwo przyrostu</b> '
+        '(głowica MIL, uczona słabo — tylko wiekiem ryby). Wzdłuż osi pomiaru '
+        '(jądro → brzeg) odczytujemy profil tej mapy i bierzemy jego <b>lokalne '
+        'maksima</b> — w tych punktach stawiamy kropki. Kropka = miejsce, które '
+        'model uznał za najbardziej „pierścieniowe”, nie ręczna anotacja.</p>'
     )
     for label, paths in candidate_overlays.items():
         paths = list(paths)
@@ -511,16 +646,38 @@ def _section_g(candidate_overlays: dict | None) -> str:
             if not b64:
                 continue
             stem = Path(p).stem.replace("_candidates_overlay", "")
+            image_id = _match_split_key(stem, split_lookup)
+            split = split_lookup.get(image_id) if image_id else None
+            badge = ""
+            if split in _SPLIT_BADGE:
+                color, text = _SPLIT_BADGE[split]
+                badge = (f'<span style="display:inline-block;background:{color};'
+                         'color:#fff;font-size:9px;padding:1px 5px;border-radius:3px;'
+                         f'margin-bottom:2px;">{text}</span><br>')
             html += (
                 '<figure style="width:230px;margin:0;">'
                 f'<img src="data:image/png;base64,{b64}" '
                 'style="width:100%;border:1px solid #ccc;border-radius:3px;">'
                 f'<figcaption style="font-size:10px;color:#666;word-break:break-all;">'
-                f'{stem}</figcaption></figure>'
+                f'{badge}{stem}</figcaption></figure>'
             )
         html += '</div>'
     html += '</section>'
     return html
+
+
+def _match_split_key(stem: str, split_lookup: dict) -> str | None:
+    """Find the labels image_id whose stem matches the overlay stem.
+
+    Overlay files are ``<image_id-stem>_candidates_overlay.png``; labels use the
+    full filename (with extension). Match by stem so extensions/dirs don't matter.
+    """
+    if stem in split_lookup:
+        return stem
+    for image_id in split_lookup:
+        if Path(image_id).stem == stem:
+            return image_id
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +692,7 @@ def build_comparison_report(
     output_path: Path,
     model_info: dict | None = None,
     candidate_overlays: dict | None = None,
+    split_lookup: dict | None = None,
 ) -> None:
     """Build and write a self-contained HTML comparison report.
 
@@ -560,34 +718,39 @@ def build_comparison_report(
     if model_info is None:
         model_info = {}
 
-    # Embedded-only runs deliver a single condition — flag it so the report isn't
-    # mistaken for a broken cross-domain comparison.
+    # Embedded-only runs deliver a single condition — the report becomes a
+    # single-model "Raport treningu" (no cross-domain Section D, no Emb-vs-NotEmb).
     n_present = sum(1 for k in CANONICAL_CONDITIONS
                     if results.get(k) is not None and not results[k].empty)
-    single_note = ""
-    if n_present <= 1:
+    active_ptypes = dataset_stats.get("active_ptypes")
+    single = n_present <= 1
+
+    if single:
+        ptype = (active_ptypes or ["Embedded"])[0]
+        title = f"OtolithDino — Raport treningu ({ptype})"
         single_note = (
             '<p style="background:#eef2ff;padding:8px;border-left:3px solid #2a78d6;">'
-            'Tryb <b>Embedded-only</b> — trenowany i oceniany tylko jeden model; '
-            'brak porównania cross-domain (Embedded vs NotEmbedded).</p>'
+            f'Tryb <b>{ptype}-only</b> — trenowany i oceniany jeden model; '
+            'brak porównania cross-domain.</p>'
         )
+    else:
+        title = "OtolithDino — Raport porównawczy Embedded vs NotEmbedded"
+        single_note = ""
 
-    body = (
-        single_note
-        + _section_a(dataset_stats)
-        + _section_b(training_logs)
-        + _section_c(results)
-        + _section_d(results)
-        + _section_e(increment_cards)
-        + _section_f(model_info)
-        + _section_g(candidate_overlays)
-    )
+    body = single_note + _section_a(dataset_stats, active_ptypes)
+    body += _section_b(training_logs)
+    body += _section_c(results, single=single)
+    if not single:
+        body += _section_d(results)     # cross-evaluation is meaningless for 1 condition
+    body += _section_e(increment_cards)
+    body += _section_f(model_info)
+    body += _section_g(candidate_overlays, split_lookup=split_lookup)
 
     html = f"""<!DOCTYPE html>
 <html lang="pl">
 <head>
 <meta charset="UTF-8">
-<title>OtolithDino — Raport porównawczy Embedded vs NotEmbedded</title>
+<title>{title}</title>
 <style>
 body {{font-family:sans-serif;max-width:1400px;margin:auto;padding:16px;}}
 section {{margin-bottom:2em;border-top:2px solid #ccc;padding-top:1em;}}
@@ -595,10 +758,11 @@ table {{border-collapse:collapse;margin-bottom:1em;}}
 td,th {{padding:4px 8px;}}
 h2 {{color:#1a237e;}}
 h3 {{color:#283593;}}
+p.cap {{font-size:88%;color:#555;margin:2px 0 12px;}}
 </style>
 </head>
 <body>
-<h1>OtolithDino — Raport porównawczy Embedded vs NotEmbedded</h1>
+<h1>{title}</h1>
 {body}
 </body>
 </html>"""

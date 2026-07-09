@@ -65,28 +65,51 @@ def ordinal_loss(logits: Tensor, targets: Tensor) -> Tensor:
 def mil_count_loss(
     patch_probs: Tensor,
     age: Tensor,
-    sparsity_weight: float = 0.01,
+    sparsity_weight: float = 1.0,
 ) -> Tensor:
-    """MIL count-regression loss.
+    """MIL top-k concentration loss for weak increment localisation.
 
-    L = MSE(sum_of_patch_probs, age) + sparsity_weight * mean(patch_probs)
+    Shapes the patch-probability map so that EXACTLY ~age patches fire strongly
+    and the rest go to 0 — the two regions are decided per sample by ranking:
 
-    The MSE term forces the total patch activation to match the true age.
-    The sparsity term encourages most patches to be near zero, so only a
-    small number of patches (≈ age) end up with high probability — those
-    are the candidate increment locations.
+      * the ``⌈age⌉`` largest patch probs are pulled toward 1   (increments)
+      * every remaining patch prob is pushed toward 0            (background)
+
+    Why not the old ``MSE(sum, age) + sparsity`` form? A global sum-regression is
+    satisfied by a diffuse ~age/N micro-probability on every one of the 1369
+    patches (max prob ≈ 0.004 — nothing to localise), and adding a weak sparsity
+    term does NOT escape that basin: at N=1369 the sum constraint's uniform
+    gradient dominates and the map stays flat (verified empirically, see
+    ``plans and summaries/09.07_after_training_TO.DO.md`` F11). The fix is to
+    normalise the *on* region over only ~age patches, so its gradient is strong
+    enough to break the patch symmetry. Result: #active(prob>0.5) ≈ age →
+    localisable increments (dots / ring curves).
+
+    Note: because the on/off targets come from the current ranking (not a global
+    sum), ``sum(patch_probs)`` may sit slightly above ``age`` while the
+    background decays; decode age from CORAL, or from #active, not from the sum.
 
     Args:
         patch_probs     : (B, N) probabilities ∈ [0, 1]
-        age             : (B,)   true integer ages (will be cast to float)
-        sparsity_weight : non-negative weight on the mean-activation penalty
+        age             : (B,)   true integer ages (top-k count per sample)
+        sparsity_weight : weight of the background (off-region) term relative to
+                          the increment (on-region) term. #active ≈ age holds for
+                          any value ≥ 0; higher values clear the low-probability
+                          background faster.
 
-    Returns scalar.
+    Returns scalar loss.
     """
-    count = patch_probs.sum(dim=1)                       # (B,)
-    l_count  = F.mse_loss(count, age.float())
-    l_sparse = patch_probs.mean()
-    return l_count + sparsity_weight * l_sparse
+    B, N = patch_probs.shape
+    sorted_p, _ = torch.sort(patch_probs, dim=1, descending=True)      # (B, N) desc
+    ranks = torch.arange(N, device=patch_probs.device).unsqueeze(0)    # (1, N)
+    k = age.long().clamp(min=0, max=N).unsqueeze(1)                    # (B, 1) = ⌈age⌉ on
+    on = (ranks < k).float()                                          # top-k → target 1
+    off = 1.0 - on                                                    # rest   → target 0
+    n_on = on.sum(dim=1).clamp(min=1.0)                              # ≈ age (avoid /0)
+    n_off = off.sum(dim=1).clamp(min=1.0)                            # ≈ N - age
+    l_on = (((1.0 - sorted_p) ** 2) * on).sum(dim=1) / n_on           # pull top-k → 1
+    l_off = ((sorted_p ** 2) * off).sum(dim=1) / n_off               # push rest  → 0
+    return (l_on + sparsity_weight * l_off).mean()
 
 
 # ---------------------------------------------------------------------------

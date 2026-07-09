@@ -46,6 +46,7 @@ class Trainer:
         self.coral_w    = cfg.model.coral_loss_weight
         self.count_w    = cfg.model.mil_count_weight
         self.sparsity_w = cfg.model.mil_sparsity_weight
+        self.last_val_metrics: dict = {}   # Section-B diagnostics from validate()
 
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
@@ -99,30 +100,41 @@ class Trainer:
     # Train / validate
     # ------------------------------------------------------------------
 
-    def _combined_loss(self, out: dict, targets: torch.Tensor,
-                       ages: torch.Tensor) -> torch.Tensor:
-        """Combined CORAL + MIL loss based on which heads are active."""
-        parts: list[torch.Tensor] = []
+    def _loss_parts(self, out: dict, targets: torch.Tensor,
+                    ages: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Weighted CORAL / MIL components + their sum, keyed by name.
+
+        Returned so the trainer can log the two head losses separately (report
+        Section B — "which head is learning"). ``total`` is what we backprop.
+        """
+        parts: dict[str, torch.Tensor] = {}
         if "coral_logits" in out:
-            parts.append(self.coral_w * ordinal_loss(out["coral_logits"], targets))
+            parts["coral"] = self.coral_w * ordinal_loss(out["coral_logits"], targets)
         if "patch_probs" in out:
-            parts.append(self.count_w * mil_count_loss(
+            parts["mil"] = self.count_w * mil_count_loss(
                 out["patch_probs"], ages, self.sparsity_w
-            ))
+            )
         if not parts:
             raise RuntimeError("Model produced no recognised head outputs")
-        return torch.stack(parts).sum()
+        parts["total"] = torch.stack(list(parts.values())).sum()
+        return parts
+
+    def _combined_loss(self, out: dict, targets: torch.Tensor,
+                       ages: torch.Tensor) -> torch.Tensor:
+        """Combined CORAL + MIL loss (the scalar we optimise)."""
+        return self._loss_parts(out, targets, ages)["total"]
 
     @staticmethod
     def _predict_age(out: dict) -> torch.Tensor:
         """Decode integer age from dict output.
 
         Prefers CORAL when available (matches existing val_mae semantics);
-        falls back to rounded MIL count when only MIL is active.
+        falls back to the MIL count when only MIL is active. With the top-k
+        concentration loss the age is #active patches (prob>0.5), not the sum.
         """
         if "coral_logits" in out:
             return decode_age_ordinal(out["coral_logits"])
-        return out["patch_count"].round().long()
+        return (out["patch_probs"] > 0.5).sum(dim=1).long()
 
     def train_one_epoch(self) -> float:
         """One full pass over train_loader. Returns mean loss."""
@@ -150,13 +162,25 @@ class Trainer:
         return total_loss / max(n, 1)
 
     def validate(self) -> tuple[float, float]:
-        """Run validation. Returns (val_loss, val_mae)."""
+        """Run validation. Returns (val_loss, val_mae).
+
+        Also stashes report Section-B diagnostics on ``self.last_val_metrics``:
+        the weighted CORAL and MIL component losses, and the MIL localisation
+        metric (mean #active patches at prob>0.5 vs mean age — they should
+        converge as the MIL head learns to fire ~age patches).
+        """
+        self.last_val_metrics = {}
         if self.val_loader is None:
             return float("nan"), float("nan")
 
         self.model.eval()
         total_loss = 0.0
         total_mae  = 0.0
+        coral_sum = 0.0
+        mil_sum   = 0.0
+        active_sum = 0.0
+        age_sum    = 0.0
+        has_coral = has_mil = False
         n = 0
         with torch.no_grad():
             for batch in self.val_loader:
@@ -169,14 +193,28 @@ class Trainer:
                     metadata = metadata.to(self.device)
 
                 out = self.model(images, metadata=metadata)
-                loss = self._combined_loss(out, targets, ages)
+                parts = self._loss_parts(out, targets, ages)
                 pred_ages = self._predict_age(out)
 
-                total_loss += loss.item() * images.size(0)
+                bs = images.size(0)
+                total_loss += parts["total"].item() * bs
                 total_mae  += (pred_ages - ages).abs().float().sum().item()
-                n += images.size(0)
+                if "coral" in parts:
+                    coral_sum += parts["coral"].item() * bs; has_coral = True
+                if "mil" in parts:
+                    mil_sum += parts["mil"].item() * bs; has_mil = True
+                    active_sum += (out["patch_probs"] > 0.5).sum(dim=1).float().sum().item()
+                age_sum += ages.float().sum().item()
+                n += bs
 
-        return total_loss / max(n, 1), total_mae / max(n, 1)
+        denom = max(n, 1)
+        if has_coral:
+            self.last_val_metrics["coral_loss"] = coral_sum / denom
+        if has_mil:
+            self.last_val_metrics["mil_loss"] = mil_sum / denom
+            self.last_val_metrics["mil_active"] = active_sum / denom
+            self.last_val_metrics["mean_age"] = age_sum / denom
+        return total_loss / denom, total_mae / denom
 
     # ------------------------------------------------------------------
     # Full fit loop
@@ -213,7 +251,8 @@ class Trainer:
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            self._log_epoch(epoch, train_loss, val_loss, val_mae, current_lr)
+            self._log_epoch(epoch, train_loss, val_loss, val_mae, current_lr,
+                            getattr(self, "last_val_metrics", None))
             self.save_checkpoint(epoch, val_loss)
 
             current = val_mae if metric_name == "val_mae" else val_loss
@@ -285,7 +324,7 @@ class Trainer:
 
     def _log_epoch(
         self, epoch: int, train_loss: float, val_loss: float, val_mae: float,
-        lr: float | None = None,
+        lr: float | None = None, extra: dict | None = None,
     ) -> None:
         line = (
             f"epoch={epoch:3d}  "
@@ -295,4 +334,9 @@ class Trainer:
         )
         if lr is not None:
             line += f"  lr={lr:.2e}"
+        # Section-B diagnostics (only present with the relevant heads active).
+        if extra:
+            for key in ("coral_loss", "mil_loss", "mil_active", "mean_age"):
+                if key in extra and extra[key] == extra[key]:   # skip NaN
+                    line += f"  {key}={extra[key]:.4f}"
         self._log(line)

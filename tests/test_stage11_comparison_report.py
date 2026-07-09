@@ -144,15 +144,15 @@ def test_section_e_has_reasoning_card_caption(tmp_path):
     assert "<ol>" in content
     assert "Surowe zdjęcie" in content
     assert "Pierścienie roczne" in content
-    # Section D caption about heatmaps/overlays distinction
+    # Section D caption about heatmaps/overlays distinction (present in the
+    # 4-condition comparison; Section D is dropped only for single-condition).
     assert "inferno" in content.lower()
     assert "overlays" in content
     # Doprecyzowanie opisu (post-fix sekcji E):
     # — panel 4: jasno wskazana wstawka 1D w rogu zdjęcia
     assert "wstawka" in content.lower()
-    # — panele 5/6 i adnotacja: brak peaków w demo to oczekiwane zachowanie
-    assert "oczekiwane" in content.lower()
-    assert "find_peaks" in content
+    # Nota „puste panele 4/5/6 = oczekiwane / find_peaks" USUNIĘTA (Faza C, sekcja E)
+    assert "Dlaczego niektóre karty mają puste panele" not in content
 
 
 # ---------------------------------------------------------------------------
@@ -240,3 +240,104 @@ def test_no_gallery_section_without_overlays(tmp_path):
     out = tmp_path / "report.html"
     build_comparison_report(output_path=out, **_base_kwargs())
     assert 'id="G"' not in out.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Faza C — condition-aware (embedded-only) report
+# ---------------------------------------------------------------------------
+
+def test_single_condition_report_drops_cross(tmp_path):
+    """One condition ⇒ 'Raport treningu (Embedded)', no Section D, no ★ CROSS."""
+    from src.comparison_report import build_comparison_report
+    out = tmp_path / "report.html"
+    build_comparison_report(
+        results={"emb_on_emb": _make_predictions(seed=0)},
+        training_logs={},
+        increment_cards={},
+        dataset_stats={"counts": {"Embedded": {"train": 100, "val": 20, "test": 20}},
+                       "orphan_count": 3, "age_distributions": {},
+                       "active_ptypes": ["Embedded"]},
+        output_path=out,
+        model_info={"backbone": "dinov2_vits14"},
+    )
+    content = out.read_text(encoding="utf-8")
+    assert "Raport treningu (Embedded)" in content
+    assert 'id="D"' not in content        # cross-eval dropped for a single condition
+    assert "★ CROSS" not in content
+    for sec in ["A", "B", "C", "E", "F"]:
+        assert f'id="{sec}"' in content
+
+
+def test_section_a_funnel_and_per_split_ages(tmp_path):
+    """Section A renders the data funnel, a fish column, and per-split age charts."""
+    from src.comparison_report import build_comparison_report
+    out = tmp_path / "report.html"
+    dataset_stats = {
+        "counts": {"Embedded": {"train": 60, "val": 12, "test": 12}},
+        "fish_counts": {"Embedded": {"train": 30, "val": 6, "test": 6}},
+        "age_by_split": {"Embedded": {
+            "train": list(range(0, 16)) * 3,
+            "val":   list(range(0, 16)),
+            "test":  list(range(0, 16)),
+        }},
+        "age_distributions": {"Embedded": list(range(0, 16)) * 5},
+        "orphan_count": 4,
+        "active_ptypes": ["Embedded"],
+        "funnel": {"on_disk": 200, "parsed": 180, "labeled": 150, "orphans": 30,
+                   "embedded": 100, "notembedded": 80},
+    }
+    build_comparison_report(
+        results={"emb_on_emb": _make_predictions(seed=0)},
+        training_logs={}, increment_cards={},
+        dataset_stats=dataset_stats, output_path=out,
+    )
+    content = out.read_text(encoding="utf-8")
+    assert "Lejek danych" in content       # funnel present
+    assert "200" in content and "Ryby" in content   # disk count + fish column
+    # per-split small-multiples caption (chart titles live inside the PNG)
+    assert "powinny się pokrywać" in content
+
+
+def test_section_b_component_charts(tmp_path):
+    """Section B renders the CORAL-vs-MIL and #active-vs-age charts when logged."""
+    from src.comparison_report import build_comparison_report
+    out = tmp_path / "report.html"
+    logs = {"embedded": [
+        {"epoch": i, "train_loss": 1.0 / (i + 1), "val_loss": 1.1 / (i + 1),
+         "val_mae": 2.0 / (i + 1), "lr": 1e-4,
+         "coral_loss": 0.6 / (i + 1), "mil_loss": 0.4 / (i + 1),
+         "mil_active": float(i), "mean_age": 4.0}
+        for i in range(5)
+    ]}
+    build_comparison_report(
+        results={"emb_on_emb": _make_predictions(seed=0)},
+        training_logs=logs, increment_cards={},
+        dataset_stats={"counts": {}, "orphan_count": 0, "age_distributions": {},
+                       "active_ptypes": ["Embedded"]},
+        output_path=out,
+    )
+    content = out.read_text(encoding="utf-8")
+    # caption text (chart titles live inside the PNG)
+    assert "(CORAL vs MIL)" in content
+    assert "lokalizuje" in content.lower()
+
+
+def test_section_g_split_badge(tmp_path):
+    """Section G badges each tile with its split from split_lookup."""
+    import numpy as np
+    from PIL import Image
+    from src.comparison_report import build_comparison_report
+
+    ov = tmp_path / "fishA_candidates_overlay.png"
+    Image.fromarray(np.zeros((24, 24, 3), dtype=np.uint8)).save(ov)
+    out = tmp_path / "report.html"
+    build_comparison_report(
+        output_path=out,
+        candidate_overlays={"Emb → Emb": [ov]},
+        split_lookup={"fishA.jpg": "test"},
+        **_base_kwargs(),
+    )
+    content = out.read_text(encoding="utf-8")
+    assert ">test<" in content              # split badge rendered
+    assert "Dlaczego kropki są właśnie tu?" in content
+    assert "SmartDots" not in content       # removed per Faza C

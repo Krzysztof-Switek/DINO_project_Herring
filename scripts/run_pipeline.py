@@ -138,6 +138,10 @@ def _parse_train_log(log_path: Path) -> list[dict]:
         r"val_mae=([\d.]+)"
         r"(?:\s+lr=([\d.eE+-]+))?"
     )
+    # Optional Section-B diagnostics (only present in newer logs / with the
+    # relevant heads active) — parsed independently so older logs still work.
+    extra_keys = ("coral_loss", "mil_loss", "mil_active", "mean_age")
+    extra_pat = {k: re.compile(rf"{k}=([\d.eE+-]+)") for k in extra_keys}
     rows: list[dict] = []
     try:
         lines = log_path.read_text(encoding="utf-8").splitlines()
@@ -157,6 +161,10 @@ def _parse_train_log(log_path: Path) -> list[dict]:
                 # Trainer; keep the row shape unchanged for older logs.
                 if m.group(5) is not None:
                     row["lr"] = float(m.group(5))
+                for k, pat in extra_pat.items():
+                    em = pat.search(line)
+                    if em:
+                        row[k] = float(em.group(1))
                 rows.append(row)
             except ValueError:
                 continue
@@ -526,9 +534,21 @@ def _step_cards(
     return cards
 
 
-def _compute_dataset_stats(labels_combined_csv: Path) -> dict:
-    """Compute dataset statistics from labels_combined.csv for Section A of the report."""
+def _compute_dataset_stats(
+    labels_combined_csv: Path,
+    active_ptypes: list[str] | None = None,
+) -> dict:
+    """Compute dataset statistics from labels_combined.csv for Section A.
+
+    ``active_ptypes`` limits which preparation types the report focuses on
+    (``["Embedded"]`` for an embedded-only run); ``None`` → both. Also reads a
+    sibling ``scan_stats.json`` (written by ``scan_labels``) for the data funnel.
+    """
+    import json
     import pandas as pd
+
+    SPLITS = ["train", "val", "test"]
+    PTYPES = ["Embedded", "NotEmbedded"]
 
     # Try pipeline output dir first, then project data/ directory
     candidates = [
@@ -538,34 +558,70 @@ def _compute_dataset_stats(labels_combined_csv: Path) -> dict:
     csv_path = next((p for p in candidates if p.exists()), None)
 
     if csv_path is None:
-        return {"counts": {}, "orphan_count": "N/A", "age_distributions": {}}
+        return {"counts": {}, "orphan_count": "N/A", "age_distributions": {},
+                "fish_counts": {}, "age_by_split": {}, "active_ptypes": active_ptypes or PTYPES}
 
     df = pd.read_csv(csv_path)
 
     counts: dict = {}
-    for ptype in ["Embedded", "NotEmbedded"]:
-        sub = df[df["preprocessing_type"] == ptype]
-        counts[ptype] = {
-            s: int((sub["split"] == s).sum()) for s in ["train", "val", "test"]
-        }
-
+    fish_counts: dict = {}
+    age_by_split: dict = {}
     age_distributions: dict = {}
-    for ptype in ["Embedded", "NotEmbedded"]:
-        sub = df[
-            (df["preprocessing_type"] == ptype)
-            & (df["split"].notna())
-            & (df["age"] >= 0)
-        ]
-        if not sub.empty:
-            age_distributions[ptype] = sub["age"].dropna().astype(int).tolist()
+    for ptype in PTYPES:
+        sub = df[df["preprocessing_type"] == ptype]
+        counts[ptype] = {s: int((sub["split"] == s).sum()) for s in SPLITS}
+        # fish (neutral_fish_key) counts per split — an image count double-counts
+        # the two sides / preparations of one fish.
+        fish_counts[ptype] = {
+            s: int(sub.loc[sub["split"] == s, "neutral_fish_key"].nunique())
+            for s in SPLITS
+        }
+        labeled = sub[(sub["split"].notna()) & (sub["age"] >= 0)]
+        if not labeled.empty:
+            age_distributions[ptype] = labeled["age"].dropna().astype(int).tolist()
+            age_by_split[ptype] = {
+                s: labeled.loc[labeled["split"] == s, "age"].dropna().astype(int).tolist()
+                for s in SPLITS
+            }
 
     orphan_count = int(df["orphan"].sum()) if "orphan" in df.columns else "N/A"
 
+    # Data funnel from scan_stats.json (disk → parsed → labeled → orphans), if present.
+    funnel = None
+    for cand in (csv_path.parent / "scan_stats.json",
+                 PROJECT_ROOT / "data" / "scan_stats.json"):
+        if cand.exists():
+            try:
+                funnel = json.loads(cand.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                funnel = None
+            break
+
     return {
         "counts": counts,
+        "fish_counts": fish_counts,
         "orphan_count": orphan_count,
         "age_distributions": age_distributions,
+        "age_by_split": age_by_split,
+        "active_ptypes": active_ptypes or PTYPES,
+        "funnel": funnel,
     }
+
+
+def _build_split_lookup(labels_combined_csv: Path) -> dict:
+    """Return {image_id -> split} from labels_combined.csv for Section G tile badges."""
+    import pandas as pd
+    for p in (labels_combined_csv, PROJECT_ROOT / "data" / "labels_combined.csv"):
+        if Path(p).exists():
+            try:
+                df = pd.read_csv(p)
+            except (OSError, ValueError):
+                return {}
+            if "image_id" in df.columns and "split" in df.columns:
+                sub = df.dropna(subset=["split"])
+                return dict(zip(sub["image_id"].astype(str), sub["split"].astype(str)))
+            return {}
+    return {}
 
 
 def _write_pipeline_summary(
@@ -820,11 +876,15 @@ def main(argv: list[str] | None = None) -> None:
             "ckpt_not_embedded": str(ckpt_notemb),
         }
 
-        dataset_stats = _compute_dataset_stats(data_dir / "labels_combined.csv")
+        active_ptypes = ["Embedded"] if args.embedded_only else ["Embedded", "NotEmbedded"]
+        dataset_stats = _compute_dataset_stats(
+            data_dir / "labels_combined.csv", active_ptypes=active_ptypes,
+        )
 
         report_path = output_dir / "comparison_report.html"
         training_logs = {"embedded": logs_emb, "not_embedded": logs_notemb}
         candidate_overlays = _collect_candidate_overlays(output_dir, pred_csvs.keys())
+        split_lookup = _build_split_lookup(data_dir / "labels_combined.csv")
         build_comparison_report(
             results=results_dfs,
             training_logs=training_logs,
@@ -833,6 +893,7 @@ def main(argv: list[str] | None = None) -> None:
             output_path=report_path,
             model_info=model_info,
             candidate_overlays=candidate_overlays,
+            split_lookup=split_lookup,
         )
         completed.append("report")
         _save_state(state_path, completed)

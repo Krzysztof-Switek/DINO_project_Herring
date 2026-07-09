@@ -130,3 +130,33 @@ def test_build_combined_orphan_flag():
     orphan_rows = df[df["image_id"] == NOTEMB_ORPHAN]
     assert len(orphan_rows) == 1
     assert orphan_rows.iloc[0]["orphan"] is True or orphan_rows.iloc[0]["orphan"] == True
+
+
+def test_assign_split_is_age_balanced():
+    """train/val/test must have similar age distributions and each span the full
+    age range — regression for the age-sorted-split bug (test = oldest fish only)."""
+    import numpy as np
+    import pandas as pd
+    from scripts.prepare_labels import assign_split_by_fish
+
+    rng = np.random.default_rng(0)
+    n_fish = 600
+    ages = rng.integers(0, 17, n_fish)          # ages 0..16
+    rows = []
+    for i, a in enumerate(ages):
+        rows += [{"fish": f"fish_{i}", "age": int(a)}] * 2   # 2 images/fish
+    df = pd.DataFrame(rows)
+
+    df["split"] = assign_split_by_fish(
+        df, fish_col="fish", age_col="age", train=0.7, val=0.15, seed=42).values
+
+    means = df.groupby("split")["age"].mean()
+    assert means.max() - means.min() < 1.0                  # balanced, no age skew
+
+    test_ages = df[df["split"] == "test"]["age"]
+    assert test_ages.min() <= 2 and test_ages.max() >= 14   # test spans full range
+
+    fish_frac = df.groupby("fish")["split"].first().value_counts(normalize=True)
+    assert 0.6 < fish_frac["train"] < 0.8
+    assert 0.08 < fish_frac["val"] < 0.22
+    assert 0.08 < fish_frac["test"] < 0.22

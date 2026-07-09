@@ -11,8 +11,8 @@ model:
   dropout: 0.1
   # MIL weakly-supervised localisation (per-patch increment scoring)
   head_type: both                 # coral | mil | both
-  mil_count_weight: 1.0           # weight of MSE(sum_patch_probs, age)
-  mil_sparsity_weight: 0.01       # weight of mean(patch_probs) penalty
+  mil_count_weight: 1.0           # weight of the MIL top-k concentration loss in the combined loss
+  mil_sparsity_weight: 1.0        # weight of the background (off-region) term; higher = cleaner map
   mil_hidden_dim: 64              # patch head hidden layer width
   coral_loss_weight: 0.5          # weight of CORAL loss when head_type='both'
 
