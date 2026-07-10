@@ -5,7 +5,6 @@ Zmień MODE poniżej przed uruchomieniem:
   "full"  — 50 epok, outputs/         (pełny trening Embedded + NotEmbedded)
 """
 from __future__ import annotations
-import os
 import sys
 from pathlib import Path
 
@@ -16,12 +15,15 @@ from pathlib import Path
 MODE = "full"   # "demo"  → 1 epoka, szybki test pipeline'u
                 # "full"  → pełny trening (50 epok na model)
 
+LOCATION = "server"   # "server" → serwer (Linux)  |  "local" → Twój komp (Windows, Z:)
+                      # ↑ TO JEST PRZEŁĄCZNIK ścieżki do zdjęć — zmień gdy zmieniasz maszynę
+
 SKIP_SCAN  = False   # True  = używaj istniejących data/labels_*.csv
                     # False = skanuj Z: od nowa (kilka minut)
 
 SKIP_TRAIN = False  # True  = pomija trening; używa istniejących checkpoints
 
-FRESH      = False  # True  = kasuje pipeline_state.json i robi pełny re-run od zera
+FRESH      = True  # True  = kasuje pipeline_state.json i robi pełny re-run od zera
                     #         (użyj, gdy „wszystkie kroki pominięte bo już wykonane”)
 
 EMBEDDED_ONLY = True  # True = trenuj/raportuj TYLKO Embedded (szybciej;
@@ -31,21 +33,10 @@ EMBEDDED_ONLY = True  # True = trenuj/raportuj TYLKO Embedded (szybciej;
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-# Zdjęcia leżą na dysku sieciowym Windows (Z:, z podkatalogiem Processed) lokalnie,
-# a bezpośrednio pod home na serwerze (BEZ Processed). Bierzemy PIERWSZĄ istniejącą
-# ścieżkę (env var ma pierwszeństwo), więc TEN SAM main.py działa na obu maszynach
-# bez edycji. UWAGA: "Z:/..." na Linuxie to ścieżka WZGLĘDNA — doklejała się do
-# PROJECT_ROOT (stąd błąd ".../DINO_project_Herring/Z:/Photo/..."). Nadpisz kiedy chcesz:
-#   export OTOLITH_IMAGE_DIR=/pełna/ścieżka/do/zdjęć
-_SERVER_IMAGE_DIR  = "/home/kswitek/Documents/Photo/Otolithes/HER"   # serwer (potwierdzone)
-_WINDOWS_IMAGE_DIR = "Z:/Photo/Otolithes/HER/Processed"             # dysk sieciowy Windows
-_IMAGE_DIR_CANDIDATES = [
-    os.environ.get("OTOLITH_IMAGE_DIR"),
-    _SERVER_IMAGE_DIR,
-    _WINDOWS_IMAGE_DIR,
-]
-IMAGE_DIR = next((p for p in _IMAGE_DIR_CANDIDATES if p and Path(p).is_dir()),
-                 _SERVER_IMAGE_DIR)
+# Ścieżka do zdjęć — dwie stałe, LOCATION wybiera jedną. Nic więcej.
+IMAGE_DIR_SERVER = "/home/kswitek/Documents/Photo/Otolithes/HER/Processed"  # serwer (Linux)
+IMAGE_DIR_LOCAL  = "Z:/Photo/Otolithes/HER/Processed"                       # Twój komp (Windows)
+IMAGE_DIR = IMAGE_DIR_SERVER if LOCATION == "server" else IMAGE_DIR_LOCAL
 EXCEL_PATH = str(PROJECT_ROOT / "data" / "analysisWithOtolithPhoto.xlsx")
 
 if MODE == "demo":
@@ -82,10 +73,8 @@ if __name__ == "__main__":
     if not Path(IMAGE_DIR).is_dir():
         sys.exit(
             f"[main] Katalog zdjęć nie istnieje: {IMAGE_DIR!r}\n"
-            f"       Ustaw poprawną ścieżkę serwerową:\n"
-            f"         export OTOLITH_IMAGE_DIR=/pełna/ścieżka/do/Processed\n"
-            f"       (albo popraw listę _IMAGE_DIR_CANDIDATES w main.py).\n"
-            f"       Znajdź katalog ze zdjęciami np.:  find ~ -type d -name Processed"
+            f"       LOCATION = {LOCATION!r} — sprawdź czy to właściwa maszyna,\n"
+            f"       albo popraw IMAGE_DIR_SERVER / IMAGE_DIR_LOCAL w main.py."
         )
-    print(f"[main] IMAGE_DIR = {IMAGE_DIR}")
+    print(f"[main] LOCATION={LOCATION}  IMAGE_DIR={IMAGE_DIR}")
     main(ARGV)
