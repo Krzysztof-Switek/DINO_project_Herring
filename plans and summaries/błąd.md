@@ -1,12 +1,31 @@
 /home/kswitek/Documents/DINO_project_Herring/.venv/bin/python /home/kswitek/Documents/DINO_project_Herring/main.py 
+[main] LOCATION=server  IMAGE_DIR=/home/kswitek/Documents/Photo/Otolithes/HER/Processed
+[fresh] Usunięto /home/kswitek/Documents/DINO_project_Herring/outputs/pipeline_state.json — wymuszam pełny re-run
 State: /home/kswitek/Documents/DINO_project_Herring/outputs/pipeline_state.json
 ============================================================
 OtolithDino — pipeline Embedded vs NotEmbedded
 ============================================================
 
-[1/9] SCAN — pominięty
-  Embedded labels:    /home/kswitek/Documents/DINO_project_Herring/outputs/data/labels_embedded.csv
-  NotEmbedded labels: /home/kswitek/Documents/DINO_project_Herring/outputs/data/labels_not_embedded.csv
+[1/9] SCAN — budowanie labels CSVs
+  Zdjecia na dysku: 18727
+  Unikalne tokeny [4] (typ preparacji): ['Embedded', 'NotEmbedded']
+  Unikalne tokeny [5] (postproc):       ['Sharpest', 'WithoutPostproc']
+  Sparsowane pliki: 18387
+  Embedded:    9310
+  NotEmbedded: 9077
+
+  Wczytywanie metadanych z Excel ...
+  Sieroty (brak metadanych w Excel): 4453
+  Rozkład wieku per split (mediana wieku ryby):
+    train: n_ryb= 2720  mean=3.75  median=4.0  min=0  max=16
+    val  : n_ryb=  588  mean=3.78  median=4.0  min=0  max=15
+    test : n_ryb=  578  mean=3.73  median=4.0  min=0  max=15
+
+  Rozkład wiekowy (labeled, n=12496):
+    Embedded: wiek 0–16, mediana=4.0, n=7588
+    NotEmbedded: wiek 0–15, mediana=4.0, n=4908
+  Ryby w >1 zbiorze: 0 (brak wycieku)
+  Saved: /home/kswitek/Documents/DINO_project_Herring/outputs/data/labels_embedded.csv, /home/kswitek/Documents/DINO_project_Herring/outputs/data/labels_not_embedded.csv
 
 [2/9] TRAIN — Embedded
 Using cache found in /home/kswitek/.cache/torch/hub/facebookresearch_dinov2_main
@@ -16,9 +35,9 @@ Using cache found in /home/kswitek/.cache/torch/hub/facebookresearch_dinov2_main
   warnings.warn("xFormers is not available (Attention)")
 /home/kswitek/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
   warnings.warn("xFormers is not available (Block)")
-[2026-07-09 21:55:52] Backbone frozen for first 5 epochs
+[2026-07-10 09:02:48] Backbone frozen for first 5 epochs
 Traceback (most recent call last):
-  File "/home/kswitek/Documents/DINO_project_Herring/main.py", line 65, in <module>
+  File "/home/kswitek/Documents/DINO_project_Herring/main.py", line 80, in <module>
     main(ARGV)
   File "/home/kswitek/Documents/DINO_project_Herring/scripts/run_pipeline.py", line 787, in main
     ckpt_emb, logs_emb = _step_train(cfg_emb, emb_labels)
@@ -42,6 +61,4 @@ Traceback (most recent call last):
     image = Image.open(path).convert("RGB")
   File "/home/kswitek/Documents/DINO_project_Herring/.venv/lib/python3.10/site-packages/PIL/Image.py", line 3635, in open
     fp = builtins.open(filename, "rb")
-FileNotFoundError: [Errno 2] No such file or directory: '/home/kswitek/Documents/DINO_project_Herring/Z:/Photo/Otolithes/HER/Processed/2023_BITS4q_HER_LawicaSrodkowa_Embedded_Sharpest_FishIndex4_Single1_Left.jpg'
-
-Process finished with exit code 1
+FileNotFoundError: [Errno 2] No such file or directory: '/home/kswitek/Documents/DINO_project_Herring/Z:/Photo/Otolithes/HER/Processed/2023_BITS4q_HER_Wladyslawowskie_Embedded_Sharpest_FishIndex128_Single1_Right.jpg'
