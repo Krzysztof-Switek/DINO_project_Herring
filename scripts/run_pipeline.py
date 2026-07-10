@@ -722,6 +722,15 @@ def main(argv: list[str] | None = None) -> None:
     cfg_emb = load_merged_config(base_cfg_path, Path(args.config_embedded))
     cfg_notemb = load_merged_config(base_cfg_path, Path(args.config_not_embedded))
 
+    # --image-dir is authoritative for EVERY step (scan, train, inference, cards).
+    # Without this, only the scan used args.image_dir; train/inference fell back to
+    # cfg.data.image_dir from the YAML (e.g. "Z:/..."), which on Linux is resolved
+    # relative to the project root → ".../DINO_project_Herring/Z:/Photo/..." →
+    # FileNotFoundError mid-training (see plans and summaries/błąd.md).
+    if args.image_dir:
+        cfg_emb.data.image_dir = args.image_dir
+        cfg_notemb.data.image_dir = args.image_dir
+
     if args.dry_run:
         skip_set: set[str] = set()
         if args.skip_scan:
