@@ -230,8 +230,12 @@ def _section_b(training_logs: dict) -> str:
                          any(not np.isnan(v) for v in mil_loss)
         has_localise = any(not np.isnan(v) for v in mil_active)
 
-        best_epoch = int(np.nanargmin(val_mae)) if any(not np.isnan(v) for v in val_mae) else None
-        best_mae = val_mae[best_epoch] if best_epoch is not None else float("nan")
+        best_idx = int(np.nanargmin(val_mae)) if any(not np.isnan(v) for v in val_mae) else None
+        best_mae = val_mae[best_idx] if best_idx is not None else float("nan")
+        # best_idx is the POSITION in this run's log; the real epoch NUMBER is
+        # epochs[best_idx]. Show the epoch number (not the list index) in the table —
+        # a concatenated train.log used to make them differ (11.07 TO-DO Punkt 5).
+        best_epoch_num = epochs[best_idx] if best_idx is not None else None
 
         html += f"<h3>{key}</h3>"
 
@@ -239,13 +243,13 @@ def _section_b(training_logs: dict) -> str:
         fig, axes = plt.subplots(1, 3, figsize=(12, 3))
         axes[0].plot(epochs, train_loss, label="train_loss", color="#2a78d6", linewidth=2)
         axes[0].plot(epochs, val_loss, label="val_loss", color="#eb6834", linewidth=2)
-        if best_epoch is not None:
-            axes[0].axvline(epochs[best_epoch], color=_MUTED, linestyle="--", alpha=0.7)
+        if best_idx is not None:
+            axes[0].axvline(epochs[best_idx], color=_MUTED, linestyle="--", alpha=0.7)
         axes[0].set_title("Loss: train vs val")
         axes[0].legend()
         axes[1].plot(epochs, val_mae, color="#008300", linewidth=2)
-        if best_epoch is not None:
-            axes[1].axvline(epochs[best_epoch], color=_MUTED, linestyle="--", alpha=0.7,
+        if best_idx is not None:
+            axes[1].axvline(epochs[best_idx], color=_MUTED, linestyle="--", alpha=0.7,
                             label=f"best={best_mae:.3f}")
         axes[1].set_title("val_MAE")
         axes[1].legend()
@@ -295,7 +299,7 @@ def _section_b(training_logs: dict) -> str:
 <table border="1" cellpadding="4"><tr>
 <th>Model</th><th>Best epoch</th><th>Best val_MAE</th>
 </tr><tr>
-<td>{key}</td><td>{best_epoch}</td><td>{best_mae:.4f}</td>
+<td>{key}</td><td>{best_epoch_num}</td><td>{best_mae:.4f}</td>
 </tr></table><br>"""
 
     html += "</section>"
@@ -373,11 +377,52 @@ def _section_c(results: dict, single: bool = False) -> str:
     return html
 
 
+def _confusion_matrix_b64(y_true, y_pred, label: str) -> str:
+    """Row-normalised confusion matrix (true × predicted) as a base64 PNG.
+
+    Rows = true age, cols = predicted age; cell colour = row share, cell number =
+    image count. A perfect model puts everything on the diagonal.
+    """
+    y_true = np.asarray(y_true, dtype=int)
+    y_pred = np.asarray(y_pred, dtype=int)
+    lo = int(min(y_true.min(), y_pred.min()))
+    hi = int(max(y_true.max(), y_pred.max()))
+    ages = list(range(lo, hi + 1))
+    n = len(ages)
+    cm = np.zeros((n, n), dtype=int)
+    for t, p in zip(y_true, y_pred):
+        cm[t - lo, p - lo] += 1
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_norm = cm / np.maximum(row_sums, 1)
+
+    side = max(3.6, n * 0.42)
+    fig, ax = plt.subplots(figsize=(side, side))
+    ax.imshow(cm_norm, cmap="Blues", vmin=0.0, vmax=1.0)
+    ax.set_xticks(range(n)); ax.set_xticklabels(ages, fontsize=6)
+    ax.set_yticks(range(n)); ax.set_yticklabels(ages, fontsize=6)
+    ax.set_xlabel("Wiek przewidziany")
+    ax.set_ylabel("Wiek rzeczywisty")
+    ax.set_title(f"Macierz pomyłek — {label}", fontsize=9)
+    for i in range(n):
+        for j in range(n):
+            c = int(cm[i, j])
+            if c:
+                ax.text(j, i, str(c), ha="center", va="center", fontsize=5,
+                        color="white" if cm_norm[i, j] > 0.5 else _INK)
+    fig.tight_layout()
+    b64 = _fig_to_b64(fig)
+    plt.close(fig)
+    return b64
+
+
 def _plots_per_condition(results: dict, condition_labels: dict) -> str:
     html = ""
     all_errors = {}
     all_mae_per_age = {}
     all_acc_per_age = {}
+    all_bias_per_age = {}
+    all_n_per_age = {}
+    confusion_figs = []
 
     for cond_key, label in condition_labels.items():
         df = results.get(cond_key)
@@ -389,12 +434,20 @@ def _plots_per_condition(results: dict, condition_labels: dict) -> str:
         ages = sorted(df["age"].unique())
         mae_per_age = {}
         acc_per_age = {}
+        bias_per_age = {}
+        n_per_age = {}
         for a in ages:
             mask = (df["age"] == a).values
             mae_per_age[a] = float(np.mean(np.abs(errors[mask])))
             acc_per_age[a] = float(np.mean(errors[mask] == 0))   # exact-match accuracy
+            bias_per_age[a] = float(np.mean(errors[mask]))       # signed (pred − true)
+            n_per_age[a] = int(mask.sum())
         all_mae_per_age[label] = mae_per_age
         all_acc_per_age[label] = acc_per_age
+        all_bias_per_age[label] = bias_per_age
+        all_n_per_age[label] = n_per_age
+        confusion_figs.append(
+            _confusion_matrix_b64(df["age"].values, df["predicted_age"].values, label))
 
     if all_errors:
         # Signed-error distribution per condition. Grouped (side-by-side) bars on
@@ -481,6 +534,59 @@ def _plots_per_condition(results: dict, condition_labels: dict) -> str:
         plt.close(fig)
         html += ('<p class="cap">Dokładność dokładnego trafienia (pred = prawda) '
                  'per klasa wiekowa.</p>')
+
+    if all_bias_per_age:
+        age_union = sorted({a for d in all_bias_per_age.values() for a in d})
+        fig, ax = plt.subplots(figsize=(8, 4))
+        for label, bias_dict in all_bias_per_age.items():
+            xs = sorted(bias_dict.keys())
+            ax.plot(xs, [bias_dict[a] for a in xs], marker="o", markersize=5,
+                    linewidth=2, color=_LABEL_COLORS.get(label, "#888888"), label=label)
+        ax.axhline(0, color=_INK, linewidth=1)
+        ax.set_xlabel("Klasa wiekowa (lata)")
+        ax.set_ylabel("Bias = śr(pred − prawda)")
+        ax.set_title("Bias per klasa wiekowa (0 = bez obciążenia; <0 = zaniża)")
+        if age_union:
+            ax.set_xticks(age_union)
+        ax.legend(fontsize=7)
+        _style_ax(ax)
+        fig.tight_layout()
+        html += _img_tag(_fig_to_b64(fig))
+        plt.close(fig)
+        html += ('<p class="cap">Znakowany bias per wiek — czy model systematycznie '
+                 'zaniża/zawyża zależnie od rocznika (różny od |MAE|).</p>')
+
+    if all_n_per_age:
+        age_union = sorted({a for d in all_n_per_age.values() for a in d})
+        labels_list = list(all_n_per_age.keys())
+        width = 0.8 / max(1, len(labels_list))
+        fig, ax = plt.subplots(figsize=(8, 3.2))
+        for k, label in enumerate(labels_list):
+            counts = [all_n_per_age[label].get(a, 0) for a in age_union]
+            xs = [a + (k - (len(labels_list) - 1) / 2.0) * width for a in age_union]
+            ax.bar(xs, counts, width=width,
+                   color=_LABEL_COLORS.get(label, "#888888"), label=label)
+        ax.set_xlabel("Klasa wiekowa (lata)")
+        ax.set_ylabel("Liczba obrazów (n)")
+        ax.set_title("Liczność per klasa wiekowa (zbiór testowy)")
+        if age_union:
+            ax.set_xticks(age_union)
+        ax.legend(fontsize=7)
+        _style_ax(ax)
+        fig.tight_layout()
+        html += _img_tag(_fig_to_b64(fig))
+        plt.close(fig)
+        html += ('<p class="cap">Ile obrazów testowych w każdym roczniku — słabe MAE/bias '
+                 'zwykle tam, gdzie n małe (rzadkie, starsze ryby).</p>')
+
+    if confusion_figs:
+        html += "<div style='display:flex;gap:8px;flex-wrap:wrap;'>"
+        for b64 in confusion_figs:
+            html += f'<div style="max-width:32%">{_img_tag(b64, "100%")}</div>'
+        html += "</div>"
+        html += ('<p class="cap">Macierz pomyłek: wiersz = wiek rzeczywisty, kolumna = '
+                 'przewidziany; kolor = udział wiersza, liczba = #obrazów. Idealnie wszystko '
+                 'na przekątnej.</p>')
 
     return html
 

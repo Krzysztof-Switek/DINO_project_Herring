@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import sys
 import time as _time
 from pathlib import Path
@@ -73,30 +74,14 @@ def load_merged_config(base_path: Path | None, override_path: Path | None):
     return OtolithConfig(**merged)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline state tracking
-# ---------------------------------------------------------------------------
-
+# Ordered pipeline steps (for the --dry-run plan printout only). There is no
+# resume/skip-by-state mechanism any more: every run is full and from zero
+# (11.07 TO-DO Punkt 3).
 STEPS = [
     "scan", "train_e", "train_n",
     "infer_ee", "infer_nn", "infer_en", "infer_ne",
     "cards", "report",
 ]
-
-
-def _save_state(state_path: Path, completed: list[str]) -> None:
-    state_path.write_text(
-        json.dumps({"completed_steps": completed}, indent=2), encoding="utf-8"
-    )
-
-
-def _load_state(state_path: Path) -> list[str]:
-    if not state_path.exists():
-        return []
-    try:
-        return json.loads(state_path.read_text(encoding="utf-8")).get("completed_steps", [])
-    except Exception:
-        return []
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +153,12 @@ def _parse_train_log(log_path: Path) -> list[dict]:
                 rows.append(row)
             except ValueError:
                 continue
-    return rows
+    # Keep only the LAST training session. train.log is now written fresh per run
+    # (Trainer truncates it), but a legacy/concatenated log (several appended runs)
+    # must NOT inflate epoch counts — slice from the last epoch==1 so the summary and
+    # the report reflect the real last run, not the sum (11.07 TO-DO Punkt 5).
+    last_start = max((i for i, r in enumerate(rows) if r.get("epoch") == 1), default=0)
+    return rows[last_start:]
 
 
 def _step_train(cfg, labels_csv: Path) -> tuple[Path, list[dict]]:
@@ -642,8 +632,10 @@ def _write_pipeline_summary(
                 "final_train_loss": None,
             }
         else:
+            # epochs_completed = highest epoch NUMBER, not len(logs): robust even if a
+            # legacy train.log ever concatenates runs (11.07 TO-DO Punkt 5).
             training_summary[model_key] = {
-                "epochs_completed": len(logs),
+                "epochs_completed": int(max(r["epoch"] for r in logs)),
                 "best_val_mae":     round(min(r["val_mae"] for r in logs), 4),
                 "final_train_loss": round(logs[-1]["train_loss"], 4),
             }
@@ -693,12 +685,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--train", type=float, default=0.70)
     p.add_argument("--val", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--skip-scan", action="store_true",
-                   help="Skip step 1; use existing labels CSVs in output-dir/data/")
-    p.add_argument("--skip-train", action="store_true",
-                   help="Skip steps 2-3; use existing checkpoints")
-    p.add_argument("--fresh", action="store_true",
-                   help="Delete output-dir/pipeline_state.json first (force a full re-run)")
+    p.add_argument("--rescan", action="store_true",
+                   help="Rebuild data/labels_*.csv from scratch (default: reuse "
+                        "data/labels_*.csv if present — splits are deterministic)")
     p.add_argument("--embedded-only", action="store_true", dest="embedded_only",
                    help="Only Embedded: train_e + infer_ee + cards + report "
                         "(skip NotEmbedded training and all cross-domain inference)")
@@ -710,106 +699,88 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    state_path = output_dir / "pipeline_state.json"
-    if args.fresh and state_path.exists():
-        state_path.unlink()
-        print(f"[fresh] Usunięto {state_path} — wymuszam pełny re-run")
-    print(f"State: {state_path}")
-    completed = _load_state(state_path)
 
     base_cfg_path = Path(args.base_config)
     cfg_emb = load_merged_config(base_cfg_path, Path(args.config_embedded))
     cfg_notemb = load_merged_config(base_cfg_path, Path(args.config_not_embedded))
 
     # --image-dir is authoritative for EVERY step (scan, train, inference, cards).
-    # Without this, only the scan used args.image_dir; train/inference fell back to
-    # cfg.data.image_dir from the YAML (e.g. "Z:/..."), which on Linux is resolved
-    # relative to the project root → ".../DINO_project_Herring/Z:/Photo/..." →
-    # FileNotFoundError mid-training (see plans and summaries/błąd.md).
+    # Without this, train/inference fall back to cfg.data.image_dir from the YAML
+    # (e.g. "Z:/..."), which on Linux resolves under the project root → FileNotFound
+    # mid-training (see plans and summaries/błąd.md).
     if args.image_dir:
         cfg_emb.data.image_dir = args.image_dir
         cfg_notemb.data.image_dir = args.image_dir
 
+    # Consolidate ALL run artifacts under the dated run dir (11.07 TO-DO Punkt 2):
+    # checkpoints/ and logs/ otherwise land in the project root via cfg — force them
+    # under output_dir so one folder holds the whole run.
+    cfg_emb.training.checkpoint_dir = str((output_dir / "checkpoints" / "embedded").resolve())
+    cfg_emb.training.log_dir        = str((output_dir / "logs" / "embedded").resolve())
+    cfg_notemb.training.checkpoint_dir = str((output_dir / "checkpoints" / "not_embedded").resolve())
+    cfg_notemb.training.log_dir        = str((output_dir / "logs" / "not_embedded").resolve())
+
     if args.dry_run:
         skip_set: set[str] = set()
-        if args.skip_scan:
-            skip_set.add("scan")
-        if args.skip_train:
-            skip_set.update({"train_e", "train_n"})
         if args.embedded_only:
             skip_set.update({"train_n", "infer_nn", "infer_en", "infer_ne"})
         print("=== DRY RUN — pipeline steps ===")
         for i, step in enumerate(STEPS, 1):
             status = "SKIP" if step in skip_set else "RUN "
-            prev = "(completed)" if step in completed else ""
-            print(f"  {i}. [{status}] {step} {prev}")
+            print(f"  {i}. [{status}] {step}")
         return
+
+    # Clean start (11.07 TO-DO Punkt 3): wipe the run dir so no result can be stale.
+    if output_dir.exists():
+        print(f"[fresh] Czyszczę katalog runu {output_dir} — pełny bieg od zera")
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("OtolithDino — pipeline Embedded vs NotEmbedded")
     print("=" * 60)
 
-    data_dir = output_dir / "data"
+    # Canonical labels live in the stable project data/ dir and are reused across
+    # runs (splits are deterministic at seed=42). --rescan forces a rebuild.
+    canonical_dir = PROJECT_ROOT / "data"
+    run_data_dir = output_dir / "data"
+    run_data_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Step 1: scan ---
-    if not args.skip_scan and "scan" not in completed:
+    labels_present = all(
+        (canonical_dir / n).exists()
+        for n in ("labels_embedded.csv", "labels_not_embedded.csv", "labels_combined.csv")
+    )
+    if args.rescan or not labels_present:
         print("\n[1/9] SCAN — budowanie labels CSVs")
-        emb_labels, notemb_labels = _step_scan(args, data_dir)
-        completed.append("scan")
-        _save_state(state_path, completed)
+        _step_scan(args, canonical_dir)
     else:
-        print("\n[1/9] SCAN — pominięty")
-        def _resolve_labels(pipeline_path: Path, cfg_path: str) -> Path:
-            if pipeline_path.exists():
-                return pipeline_path
-            p = Path(cfg_path)
-            if not p.is_absolute():
-                p = PROJECT_ROOT / p
-            return p
+        print("\n[1/9] SCAN — pominięty (używam istniejących data/labels_*.csv; "
+              "--rescan wymusza skan)")
 
-        emb_labels = _resolve_labels(
-            data_dir / "labels_embedded.csv", cfg_emb.data.labels_csv)
-        notemb_labels = _resolve_labels(
-            data_dir / "labels_not_embedded.csv", cfg_notemb.data.labels_csv)
-        print(f"  Embedded labels:    {emb_labels}")
-        print(f"  NotEmbedded labels: {notemb_labels}")
+    # Copy canonical labels into the run dir (report lookups + provenance).
+    for name in ("labels_combined.csv", "labels_embedded.csv",
+                 "labels_not_embedded.csv", "scan_stats.json"):
+        src_csv = canonical_dir / name
+        if src_csv.exists():
+            shutil.copy2(src_csv, run_data_dir / name)
+    emb_labels = run_data_dir / "labels_embedded.csv"
+    notemb_labels = run_data_dir / "labels_not_embedded.csv"
 
-    # Determine checkpoint paths from config
-    ckpt_emb_dir = Path(cfg_emb.training.checkpoint_dir)
-    ckpt_notemb_dir = Path(cfg_notemb.training.checkpoint_dir)
-    if not ckpt_emb_dir.is_absolute():
-        ckpt_emb_dir = PROJECT_ROOT / ckpt_emb_dir
-    if not ckpt_notemb_dir.is_absolute():
-        ckpt_notemb_dir = PROJECT_ROOT / ckpt_notemb_dir
-    ckpt_emb = ckpt_emb_dir / "best.pt"
-    ckpt_notemb = ckpt_notemb_dir / "best.pt"
+    # Checkpoint paths follow the (now run-local, absolute) config paths.
+    ckpt_emb = Path(cfg_emb.training.checkpoint_dir) / "best.pt"
+    ckpt_notemb = Path(cfg_notemb.training.checkpoint_dir) / "best.pt"
 
-    # Training logs — populated by _step_train; empty when --skip-train or step already done
     logs_emb: list[dict] = []
     logs_notemb: list[dict] = []
 
-    # --- Steps 2-3: training ---
-    if not args.skip_train:
-        if "train_e" not in completed:
-            print("\n[2/9] TRAIN — Embedded")
-            ckpt_emb, logs_emb = _step_train(cfg_emb, emb_labels)
-            completed.append("train_e")
-            _save_state(state_path, completed)
-        else:
-            print("\n[2/9] TRAIN Embedded — pominięty (już wykonany)")
-
-        if args.embedded_only:
-            print("\n[3/9] TRAIN NotEmbedded — pominięty (--embedded-only)")
-        elif "train_n" not in completed:
-            print("\n[3/9] TRAIN — NotEmbedded")
-            ckpt_notemb, logs_notemb = _step_train(cfg_notemb, notemb_labels)
-            completed.append("train_n")
-            _save_state(state_path, completed)
-        else:
-            print("\n[3/9] TRAIN NotEmbedded — pominięty (już wykonany)")
+    # --- Steps 2-3: training (always full, never skipped) ---
+    print("\n[2/9] TRAIN — Embedded")
+    ckpt_emb, logs_emb = _step_train(cfg_emb, emb_labels)
+    if args.embedded_only:
+        print("\n[3/9] TRAIN NotEmbedded — pominięty (--embedded-only)")
     else:
-        print("\n[2-3/9] TRAIN — pominięty (--skip-train)")
+        print("\n[3/9] TRAIN — NotEmbedded")
+        ckpt_notemb, logs_notemb = _step_train(cfg_notemb, notemb_labels)
 
     # --- Steps 4-7: inference + interpretation + candidates (4 conditions) ---
     conditions = [
@@ -827,13 +798,8 @@ def main(argv: list[str] | None = None) -> None:
     for step_name, cond_key, cfg, ckpt, labels_csv in conditions:
         n = step_nums[step_name]
         infer_dir = output_dir / cond_key
-        if step_name not in completed:
-            print(f"\n[{n}/9] INFER — {cond_key}")
-            _step_infer(cfg, ckpt, labels_csv, infer_dir)
-            completed.append(step_name)
-            _save_state(state_path, completed)
-        else:
-            print(f"\n[{n}/9] INFER {cond_key} — pominięty (już wykonany)")
+        print(f"\n[{n}/9] INFER — {cond_key}")
+        _step_infer(cfg, ckpt, labels_csv, infer_dir)
         pred_csvs[cond_key] = infer_dir / "predictions.csv"
 
     # --- Step 8: increment cards ---
@@ -845,20 +811,11 @@ def main(argv: list[str] | None = None) -> None:
         "cross_notemb_on_emb": (cfg_notemb, ckpt_notemb),
     }
 
-    if "cards" not in completed:
-        print("\n[8/9] CARDS — karty rozumowania")
-        image_dir = Path(args.image_dir)
-        increment_cards = _step_cards(
-            pred_csvs, cfg_emb, image_dir, output_dir, cond_models
-        )
-        completed.append("cards")
-        _save_state(state_path, completed)
-    else:
-        print("\n[8/9] CARDS — pominięty (już wykonany); wczytuję karty z dysku")
-        increment_cards = _reload_cards_from_disk(output_dir)
-        n_best = len(increment_cards.get("best", []))
-        n_worst = len(increment_cards.get("worst", []))
-        print(f"  Wczytano: best={n_best}, worst={n_worst}")
+    print("\n[8/9] CARDS — karty rozumowania")
+    image_dir = Path(args.image_dir)
+    increment_cards = _step_cards(
+        pred_csvs, cfg_emb, image_dir, output_dir, cond_models
+    )
 
     # --- Prepare results_dfs (needed for both report and summary) ---
     import pandas as pd
@@ -873,49 +830,47 @@ def main(argv: list[str] | None = None) -> None:
             results_dfs[cond_key] = None
 
     # --- Step 9: comparison report ---
-    if "report" not in completed:
-        print("\n[9/9] REPORT — raport porównawczy")
-        from src.comparison_report import build_comparison_report
+    print("\n[9/9] REPORT — raport porównawczy")
+    from src.comparison_report import build_comparison_report
 
-        model_info = {
-            "backbone": cfg_emb.model.backbone,
-            "num_age_classes": cfg_emb.model.num_age_classes,
-            "use_metadata": cfg_emb.model.use_metadata,
-            "ckpt_embedded": str(ckpt_emb),
-            "ckpt_not_embedded": str(ckpt_notemb),
-        }
+    model_info = {
+        "backbone": cfg_emb.model.backbone,
+        "num_age_classes": cfg_emb.model.num_age_classes,
+        "use_metadata": cfg_emb.model.use_metadata,
+        "ckpt_embedded": str(ckpt_emb),
+        "ckpt_not_embedded": str(ckpt_notemb),
+    }
 
-        active_ptypes = ["Embedded"] if args.embedded_only else ["Embedded", "NotEmbedded"]
-        dataset_stats = _compute_dataset_stats(
-            data_dir / "labels_combined.csv", active_ptypes=active_ptypes,
-        )
+    active_ptypes = ["Embedded"] if args.embedded_only else ["Embedded", "NotEmbedded"]
+    dataset_stats = _compute_dataset_stats(
+        run_data_dir / "labels_combined.csv", active_ptypes=active_ptypes,
+    )
 
-        report_path = output_dir / "comparison_report.html"
-        training_logs = {"embedded": logs_emb, "not_embedded": logs_notemb}
-        candidate_overlays = _collect_candidate_overlays(output_dir, pred_csvs.keys())
-        split_lookup = _build_split_lookup(data_dir / "labels_combined.csv")
-        build_comparison_report(
-            results=results_dfs,
-            training_logs=training_logs,
-            increment_cards=increment_cards,
-            dataset_stats=dataset_stats,
-            output_path=report_path,
-            model_info=model_info,
-            candidate_overlays=candidate_overlays,
-            split_lookup=split_lookup,
-        )
-        completed.append("report")
-        _save_state(state_path, completed)
-        print(f"  Report: {report_path}")
-    else:
-        print("\n[9/9] REPORT — pominięty (już wykonany)")
+    report_path = output_dir / "comparison_report.html"
+    training_logs = {"embedded": logs_emb, "not_embedded": logs_notemb}
+    candidate_overlays = _collect_candidate_overlays(output_dir, pred_csvs.keys())
+    split_lookup = _build_split_lookup(run_data_dir / "labels_combined.csv")
+    build_comparison_report(
+        results=results_dfs,
+        training_logs=training_logs,
+        increment_cards=increment_cards,
+        dataset_stats=dataset_stats,
+        output_path=report_path,
+        model_info=model_info,
+        candidate_overlays=candidate_overlays,
+        split_lookup=split_lookup,
+    )
+    print(f"  Report: {report_path}")
 
     # --- Pipeline summary (always written) ---
+    completed_steps = (["scan", "train_e"]
+                       + ([] if args.embedded_only else ["train_n"])
+                       + [c[0] for c in conditions] + ["cards", "report"])
     _write_pipeline_summary(
         output_dir=output_dir,
         training_logs={"embedded": logs_emb, "not_embedded": logs_notemb},
         results_dfs=results_dfs,
-        completed_steps=completed,
+        completed_steps=completed_steps,
     )
 
     print("\n=== Pipeline zakończony ===")

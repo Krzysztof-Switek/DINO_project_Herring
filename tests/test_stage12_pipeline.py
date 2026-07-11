@@ -1,7 +1,6 @@
 """Tests for scripts/run_pipeline.py."""
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from typing import Dict
@@ -199,22 +198,6 @@ def test_collect_candidate_overlays(tmp_path):
     assert "NotEmb → NotEmb" not in got   # no overlays dir → omitted
 
 
-def test_fresh_flag_clears_state(tmp_path, capsys):
-    """--fresh deletes pipeline_state.json so a completed run re-runs from scratch."""
-    from scripts.run_pipeline import main as rp_main, _save_state
-
-    state = tmp_path / "pipeline_state.json"
-    _save_state(state, ["scan", "train_e"])
-    rp_main([
-        "--output-dir", str(tmp_path),
-        "--base-config", str(PROJECT_ROOT / "configs" / "config_demo.yaml"),
-        "--fresh", "--dry-run",
-    ])
-    out = capsys.readouterr().out
-    assert not state.exists()             # state removed by --fresh
-    assert "(completed)" not in out       # nothing is marked done anymore
-
-
 def test_embedded_only_dry_run(tmp_path, capsys):
     """--embedded-only runs only Embedded steps; NotEmbedded + cross are SKIP."""
     from scripts.run_pipeline import main as rp_main
@@ -229,22 +212,6 @@ def test_embedded_only_dry_run(tmp_path, capsys):
     assert "[RUN ] infer_ee" in out
     for skipped in ("train_n", "infer_nn", "infer_en", "infer_ne"):
         assert f"[SKIP] {skipped}" in out
-
-
-# ---------------------------------------------------------------------------
-# test_pipeline_state_file
-# ---------------------------------------------------------------------------
-
-def test_pipeline_state_file(tmp_path):
-    """pipeline_state.json is written after each completed step."""
-    from scripts.run_pipeline import _save_state, _load_state
-
-    state_path = tmp_path / "pipeline_state.json"
-    _save_state(state_path, ["scan", "train_e"])
-    loaded = _load_state(state_path)
-    assert "scan" in loaded
-    assert "train_e" in loaded
-    assert "report" not in loaded
 
 
 # ---------------------------------------------------------------------------
@@ -277,40 +244,20 @@ def test_reload_cards_from_disk(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# test_skip_scan_flag
+# test_embedded_only_skips_notembedded_in_dry_run
 # ---------------------------------------------------------------------------
 
-def test_skip_scan_flag(tmp_path):
-    """--skip-scan flag marks scan step as SKIP in dry-run output."""
+def test_embedded_only_flag_marks_skips(tmp_path):
+    """--embedded-only marks NotEmbedded + cross steps as SKIP in dry-run."""
     import subprocess
     result = subprocess.run(
         [sys.executable, str(PROJECT_ROOT / "scripts" / "run_pipeline.py"),
          "--output-dir", str(tmp_path / "out"),
-         "--skip-scan", "--skip-train", "--dry-run"],
+         "--embedded-only", "--dry-run"],
         capture_output=True, text=True, cwd=str(PROJECT_ROOT)
     )
     assert result.returncode == 0
-    assert "SKIP" in result.stdout
-    assert "scan" in result.stdout
-
-
-# ---------------------------------------------------------------------------
-# test_skip_train_flag
-# ---------------------------------------------------------------------------
-
-def test_skip_train_flag(tmp_path):
-    """--skip-train flag marks train_e and train_n as SKIP in dry-run."""
-    import subprocess
-    result = subprocess.run(
-        [sys.executable, str(PROJECT_ROOT / "scripts" / "run_pipeline.py"),
-         "--output-dir", str(tmp_path / "out"),
-         "--skip-train", "--dry-run"],
-        capture_output=True, text=True, cwd=str(PROJECT_ROOT)
-    )
-    assert result.returncode == 0
-    output = result.stdout
-    # Both train steps should be marked SKIP
-    lines = [l for l in output.splitlines() if "train_e" in l or "train_n" in l]
+    lines = [l for l in result.stdout.splitlines() if "train_n" in l]
     assert any("SKIP" in l for l in lines)
 
 
@@ -394,12 +341,3 @@ def test_full_smoke(tmp_path):
     assert report_path.exists()
     content = report_path.read_text(encoding="utf-8")
     assert "<html" in content
-    # State file tracking
-    state_path = tmp_path / "out" / "pipeline_state.json"
-    from scripts.run_pipeline import _save_state
-    _save_state(state_path, ["scan", "train_e", "train_n",
-                              "infer_ee", "infer_nn", "infer_en", "infer_ne",
-                              "cards", "report"])
-    assert state_path.exists()
-    state = json.loads(state_path.read_text())
-    assert "report" in state["completed_steps"]

@@ -322,6 +322,23 @@ def test_section_b_component_charts(tmp_path):
     assert "lokalizuje" in content.lower()
 
 
+def test_section_c_confusion_bias_n_per_age(tmp_path):
+    """Section C adds confusion matrix + signed bias-per-age + n-per-age (11.07 Punkt 4)."""
+    from src.comparison_report import build_comparison_report
+    out = tmp_path / "report.html"
+    build_comparison_report(
+        results={"emb_on_emb": _make_predictions(n=120, seed=1)},
+        training_logs={}, increment_cards={},
+        dataset_stats={"counts": {}, "orphan_count": 0, "age_distributions": {},
+                       "active_ptypes": ["Embedded"]},
+        output_path=out,
+    )
+    content = out.read_text(encoding="utf-8")
+    assert "Macierz pomyłek" in content              # confusion matrix caption
+    assert "Znakowany bias per wiek" in content       # signed bias-per-age caption
+    assert "Ile obrazów testowych" in content         # n-per-age caption
+
+
 def test_section_g_split_badge(tmp_path):
     """Section G badges each tile with its split from split_lookup."""
     import numpy as np

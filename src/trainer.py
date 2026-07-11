@@ -58,6 +58,11 @@ class Trainer:
         log_dir = _resolve_dir(cfg.training.log_dir, root)
         log_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = log_dir / "train.log"
+        # Fresh log per run — start empty so this run's log never concatenates a
+        # previous run's epochs. A concatenated train.log (append mode + no cleanup)
+        # inflated epoch counts in the summary/report; see
+        # plans and summaries/11.07_pipeline_TO.DO.md Punkt 3.
+        self.log_path.write_text("", encoding="utf-8")
 
     # ------------------------------------------------------------------
     # Scheduler

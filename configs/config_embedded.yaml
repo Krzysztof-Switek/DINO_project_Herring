@@ -1,10 +1,7 @@
+# Embedded-only overrides na config.yaml.
+# checkpoint_dir / log_dir / inference.output_dir NIE są tu ustawiane — nadpisuje je
+# scripts/run_pipeline.py pod katalogiem runu z datą (outputs/data/DD.MM/),
+# żeby cały run trzymać w jednym miejscu (patrz 11.07 TO-DO Punkt 2).
 data:
   labels_csv: data/labels_embedded.csv
   image_dir: "Z:/Photo/Otolithes/HER/Processed"
-
-training:
-  checkpoint_dir: checkpoints/embedded
-  log_dir: logs/embedded
-
-inference:
-  output_dir: outputs/emb_on_emb
