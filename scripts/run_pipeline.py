@@ -125,7 +125,7 @@ def _parse_train_log(log_path: Path) -> list[dict]:
     )
     # Optional Section-B diagnostics (only present in newer logs / with the
     # relevant heads active) — parsed independently so older logs still work.
-    extra_keys = ("coral_loss", "mil_loss", "mil_active", "mean_age")
+    extra_keys = ("coral_loss", "mil_loss", "mil_radial", "mil_active", "mean_age")
     extra_pat = {k: re.compile(rf"{k}=([\d.eE+-]+)") for k in extra_keys}
     rows: list[dict] = []
     try:
@@ -410,12 +410,58 @@ def _compute_axis_data_for_samples(
         )
         peak_indices = find_candidate_peaks(profile_1d, min_dist, prominence)
 
+        # Multi-axis increment localisation with count = predicted_age (11.07 Punkt 7):
+        # candidates from every ray + the top-`age` consensus increments on the axis.
+        from src.ring_extraction import select_increments
+        increments = select_increments(
+            grid, axis_info, int(row.get("predicted_age", 0)), H_img, W_img,
+            min_distance=min_dist, prominence=prominence,
+        )
+
+        # OpenCV reference (Kierunek A): downscaled image + axis + CLASSICAL intensity
+        # profile along the axis (sampled from the original grayscale, not the model),
+        # for the interactive report widget where a technician tunes classical detection.
+        opencv_ref = None
+        try:
+            import base64 as _b64
+            import io as _io
+            disp_max = 360
+            sc = min(1.0, disp_max / max(H_img, W_img))
+            dw, dh = max(1, int(W_img * sc)), max(1, int(H_img * sc))
+            _buf = _io.BytesIO()
+            PILImage.fromarray(orig_rgb).resize((dw, dh)).save(_buf, format="PNG")
+            img_b64 = "data:image/png;base64," + _b64.b64encode(_buf.getvalue()).decode("ascii")
+            gray = orig_rgb.mean(axis=2)
+            prof, line_disp = [], []
+            for (px, py) in line_xy:
+                xi = min(max(int(px), 0), W_img - 1)
+                yi = min(max(int(py), 0), H_img - 1)
+                prof.append(float(gray[yi, xi]))
+                line_disp.append([int(px * sc), int(py * sc)])
+            prof = np.asarray(prof, dtype=np.float32)
+            rng = float(prof.max() - prof.min())
+            if rng > 1e-6:
+                prof = (prof - prof.min()) / rng
+            opencv_ref = {
+                "img": img_b64, "w": dw, "h": dh,
+                "line": line_disp,
+                "profile": [round(float(v), 4) for v in prof.tolist()],
+                "true_age": int(row.get("age", 0)),
+                "pred_age": int(row.get("predicted_age", 0)),
+            }
+        except Exception as e:
+            print(f"    [cards] opencv_ref błąd dla {iid}: {e}")
+
         axis_data[iid] = {
-            "mask":         mask_arr,
-            "axis_info":    axis_info,
-            "peak_indices": peak_indices,
-            "line_xy":      line_xy,
-            "profile_1d":   profile_1d,
+            "mask":           mask_arr,
+            "axis_info":      axis_info,
+            "peak_indices":   peak_indices,
+            "line_xy":        line_xy,
+            "profile_1d":     profile_1d,
+            "final_axis_pts": increments["final_axis_pts"],
+            "candidate_pts":  increments["candidate_pts"],
+            "final_t":        increments["final_t"],
+            "opencv_ref":     opencv_ref,
         }
 
     total = len(samples)
@@ -483,11 +529,12 @@ def _step_cards(
     if not Path(image_dir).exists():
         print(f"    [cards] OSTRZEŻENIE: --image-dir nie istnieje: {image_dir} "
               f"— karty zostaną pominięte")
-        return {"best": [], "worst": []}
+        return {"best": [], "worst": []}, {}
 
     top_k_best = cfg_emb.inference.increment_samples.top_k_best
     top_k_worst = cfg_emb.inference.increment_samples.top_k_worst
     cards: dict[str, list[Path]] = {"best": [], "worst": []}
+    opencv_ref_all: dict = {}   # image_id → interactive OpenCV-reference data (Kierunek A)
 
     for cond_key, pred_csv in pred_csvs.items():
         if not Path(pred_csv).exists():
@@ -521,7 +568,12 @@ def _step_cards(
         cards["best"].extend(best_saved)
         cards["worst"].extend(worst_saved)
 
-    return cards
+        for iid, d in axis_data.items():
+            ref = d.get("opencv_ref")
+            if ref and iid not in opencv_ref_all:
+                opencv_ref_all[iid] = ref
+
+    return cards, opencv_ref_all
 
 
 def _compute_dataset_stats(
@@ -813,7 +865,7 @@ def main(argv: list[str] | None = None) -> None:
 
     print("\n[8/9] CARDS — karty rozumowania")
     image_dir = Path(args.image_dir)
-    increment_cards = _step_cards(
+    increment_cards, opencv_reference = _step_cards(
         pred_csvs, cfg_emb, image_dir, output_dir, cond_models
     )
 
@@ -859,6 +911,7 @@ def main(argv: list[str] | None = None) -> None:
         model_info=model_info,
         candidate_overlays=candidate_overlays,
         split_lookup=split_lookup,
+        opencv_reference=opencv_reference,
     )
     print(f"  Report: {report_path}")
 

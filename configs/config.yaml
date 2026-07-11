@@ -13,6 +13,7 @@ model:
   head_type: both                 # coral | mil | both
   mil_count_weight: 1.0           # weight of the MIL top-k concentration loss in the combined loss
   mil_sparsity_weight: 1.0        # weight of the background (off-region) term; higher = cleaner map
+  mil_radial_weight: 0.5          # radial-spread term: push active patches to separate into rings along the radius
   mil_hidden_dim: 64              # patch head hidden layer width
   coral_loss_weight: 0.5          # weight of CORAL loss when head_type='both'
 

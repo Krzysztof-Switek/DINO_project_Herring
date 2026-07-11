@@ -154,3 +154,96 @@ def draw_ring_curves(panel: np.ndarray, curves: List[np.ndarray],
         color = colors[i % len(colors)] if colors else _RING_PALETTE[i % len(_RING_PALETTE)]
         cv2.polylines(panel, [curve.reshape(-1, 1, 2).astype(np.int32)],
                       isClosed=True, color=color, thickness=thickness)
+
+
+def select_increments(
+    prob_grid,
+    axis_info: dict,
+    predicted_age: int,
+    image_h: int,
+    image_w: int,
+    *,
+    n_dirs: int = 48,
+    n_samples: int = 64,
+    min_distance: int = 3,
+    prominence: float = 0.1,
+    inner_margin: float = 0.05,
+    edge_margin: float = 0.08,
+    t_tol: float = 0.06,
+) -> dict:
+    """Multi-axis increment localisation with count = ``predicted_age`` (11.07 Punkt 7).
+
+    Casts ``n_dirs`` rays from the nucleus, finds probability peaks along each
+    (candidates), clusters them by normalised radius across rays, ranks clusters by
+    (support × mean strength), and keeps the top ``predicted_age`` as the FINAL
+    increments — projected onto the measurement axis (nucleus → far edge).
+
+    Returns dict:
+      final_t        : list[float]   normalised radii of chosen increments (≤ age), inner→outer
+      final_axis_pts : list[(x, y)]  those radii projected onto the measurement axis (image px)
+      candidate_pts  : list[(x, y)]  every per-ray peak (image px)
+    """
+    empty = {"final_t": [], "final_axis_pts": [], "candidate_pts": []}
+    if not axis_info:
+        return empty
+    contour = axis_info.get("contour")
+    centroid = axis_info.get("centroid")
+    far_edge = axis_info.get("far_edge")
+    if contour is None or centroid is None or far_edge is None:
+        return empty
+    prob_grid = _to_numpy(prob_grid)
+    cpts = contour.reshape(-1, 2)
+    if len(cpts) < 3:
+        return empty
+
+    cx, cy = centroid
+    idx_sel = np.linspace(0, len(cpts) - 1, min(n_dirs, len(cpts)), dtype=int)
+
+    peaks: List[Tuple[float, float, int, int]] = []   # (t, strength, x, y)
+    candidate_pts: List[Tuple[int, int]] = []
+    for ci in idx_sel:
+        cpt = (int(cpts[ci][0]), int(cpts[ci][1]))
+        profile, line_xy = sample_profile_along_axis(
+            prob_grid, centroid, cpt, image_h, image_w, n_samples=n_samples)
+        p = profile.astype(np.float32)
+        rng = float(p.max() - p.min())
+        if rng <= 1e-6:
+            continue
+        pn = (p - p.min()) / rng
+        idxs, _ = find_peaks(pn, distance=max(1, int(min_distance)),
+                             prominence=float(prominence))
+        for idx in idxs:
+            t = idx / max(1, n_samples - 1)
+            if t < inner_margin or t > 1.0 - edge_margin:
+                continue
+            x, y = int(line_xy[idx][0]), int(line_xy[idx][1])
+            peaks.append((t, float(pn[idx]), x, y))
+            candidate_pts.append((x, y))
+
+    if not peaks:
+        return {"final_t": [], "final_axis_pts": [], "candidate_pts": candidate_pts}
+
+    # cluster peaks by normalised radius t
+    peaks.sort(key=lambda r: r[0])
+    clusters = [[peaks[0]]]
+    for r in peaks[1:]:
+        if r[0] - clusters[-1][-1][0] <= t_tol:
+            clusters[-1].append(r)
+        else:
+            clusters.append([r])
+
+    # score = support (#rays that saw it) × mean strength; keep top `predicted_age`
+    scored = []
+    for cl in clusters:
+        mean_t = float(np.mean([r[0] for r in cl]))
+        score = len(cl) * float(np.mean([r[1] for r in cl]))
+        scored.append((score, mean_t))
+    scored.sort(key=lambda s: s[0], reverse=True)
+    k = max(0, int(predicted_age))
+    chosen_t = sorted(mt for _, mt in scored[:k])       # inner → outer
+
+    fx, fy = far_edge
+    final_axis_pts = [(int(round(cx + t * (fx - cx))),
+                       int(round(cy + t * (fy - cy)))) for t in chosen_t]
+    return {"final_t": chosen_t, "final_axis_pts": final_axis_pts,
+            "candidate_pts": candidate_pts}

@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
@@ -193,7 +194,7 @@ class OtolithDataset(Dataset):
         image_id = str(row["image_id"])
         age = int(row["age"])
 
-        image_tensor = self._load_image(image_id)
+        image_tensor, nucleus = self._load_image(image_id)
         age_ordinal = encode_age_ordinal(age, self.num_age_classes)
 
         sample: Dict = {
@@ -201,6 +202,7 @@ class OtolithDataset(Dataset):
             "age_ordinal": age_ordinal,
             "age": torch.tensor(age, dtype=torch.long),
             "image_id": image_id,
+            "nucleus": nucleus,   # (2,) normalized (x, y) — radial origin for MIL loss
         }
 
         if self.use_metadata and self.metadata_cols:
@@ -212,7 +214,7 @@ class OtolithDataset(Dataset):
     # Image loading
     # ------------------------------------------------------------------
 
-    def _load_image(self, image_id: str) -> torch.Tensor:
+    def _load_image(self, image_id: str) -> tuple[torch.Tensor, torch.Tensor]:
         path = self.img_dir / image_id
         if not path.exists():
             for ext in IMAGE_EXTENSIONS:
@@ -221,7 +223,27 @@ class OtolithDataset(Dataset):
                     path = candidate
                     break
         image = Image.open(path).convert("RGB")
-        return self.transform(image)
+        nucleus = self._compute_nucleus(image)
+        return self.transform(image), nucleus
+
+    @staticmethod
+    def _compute_nucleus(image: Image.Image) -> torch.Tensor:
+        """Brightness-weighted centroid of the otolith (bright object on dark bg),
+        normalized to [0, 1] as (x, y).
+
+        Cheap radial-origin proxy used only by the MIL radial-spread loss; the true
+        reading nucleus is resolved by segmentation at inference. Square Resize keeps
+        [0,1] coords consistent with the patch grid. Falls back to the image centre.
+        """
+        gray = np.asarray(image.convert("L"), dtype=np.float32)
+        h, w = gray.shape
+        mask = gray > float(gray.mean())
+        if int(mask.sum()) < 1:
+            return torch.tensor([0.5, 0.5], dtype=torch.float32)
+        ys, xs = np.nonzero(mask)
+        cx = float(xs.mean()) / max(w, 1)
+        cy = float(ys.mean()) / max(h, 1)
+        return torch.tensor([cx, cy], dtype=torch.float32)
 
     # ------------------------------------------------------------------
     # Metadata encoding

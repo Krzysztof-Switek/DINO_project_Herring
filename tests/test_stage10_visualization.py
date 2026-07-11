@@ -163,3 +163,35 @@ def test_save_reasoning_cards_writes_png(tmp_path):
     assert saved[0].exists()
     img = PILImage.open(saved[0])
     assert img.mode == "RGB"
+
+
+def test_select_increments_count_le_age_and_graceful():
+    """select_increments returns <= predicted_age finals and degrades gracefully (Punkt 7)."""
+    from src.ring_extraction import select_increments
+    H, W = 120, 200
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    grid = np.random.rand(8, 14).astype(np.float32)
+    out = select_increments(grid, axis_info, predicted_age=3, image_h=H, image_w=W)
+    assert len(out["final_axis_pts"]) <= 3
+    assert isinstance(out["candidate_pts"], list)
+    empty = select_increments(grid, None, 3, H, W)   # no axis_info → empty, no crash
+    assert empty["final_axis_pts"] == [] and empty["candidate_pts"] == []
+
+
+def test_draw_reasoning_card_new_increment_mode():
+    """draw_reasoning_card accepts final/candidate points (count=age overlay mode)."""
+    from src.visualization import draw_reasoning_card
+    H, W = 120, 200
+    original = (np.random.rand(H, W, 3) * 255).astype(np.uint8)
+    mask, axis_info, line_xy, profile_1d, _ = _make_axis_payload(H, W)
+    grid = np.random.rand(8, 14).astype(np.float32)
+    card = draw_reasoning_card(
+        original_rgb=original, importance_grid=grid,
+        predicted_age=2, true_age=2,
+        mask=mask, axis_info=axis_info, line_xy=line_xy, profile_1d=profile_1d,
+        final_axis_pts=[(W // 3, H // 2), (W // 2, H // 2)],
+        candidate_pts=[(W // 3, H // 2 - 5), (W // 2, H // 2 + 5)],
+        final_t=[0.3, 0.6],
+    )
+    assert card.ndim == 3 and card.shape[2] == 3
+    assert card.shape[1] == 3 * W

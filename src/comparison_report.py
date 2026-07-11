@@ -790,6 +790,105 @@ def _match_split_key(stem: str, split_lookup: dict) -> str | None:
 # Main builder
 # ---------------------------------------------------------------------------
 
+_OPENCV_JS = r"""
+(function(){
+  function smooth(a, sigma){
+    if(sigma<=0) return a.slice();
+    var r=Math.max(1,Math.ceil(sigma*2)), k=[], s=0, i, j;
+    for(i=-r;i<=r;i++){var w=Math.exp(-(i*i)/(2*sigma*sigma));k.push(w);s+=w;}
+    return a.map(function(_,idx){var acc=0;for(j=-r;j<=r;j++){var q=Math.min(a.length-1,Math.max(0,idx+j));acc+=a[q]*k[j+r];}return acc/s;});
+  }
+  function findPeaks(a, prom, minD){
+    var cand=[], i, t;
+    for(i=1;i<a.length-1;i++){
+      if(a[i]>=a[i-1] && a[i]>a[i+1]){
+        var l=i; while(l>0 && a[l-1]<=a[i]) l--;
+        var rr=i; while(rr<a.length-1 && a[rr+1]<=a[i]) rr++;
+        var lmin=a[i]; for(t=l;t<=i;t++) lmin=Math.min(lmin,a[t]);
+        var rmin=a[i]; for(t=i;t<=rr;t++) rmin=Math.min(rmin,a[t]);
+        if(a[i]-Math.max(lmin,rmin)>=prom) cand.push(i);
+      }
+    }
+    cand.sort(function(x,y){return a[y]-a[x];});
+    var kept=[];
+    cand.forEach(function(p){ if(kept.every(function(q){return Math.abs(q-p)>=minD;})) kept.push(p); });
+    kept.sort(function(x,y){return x-y;});
+    return kept;
+  }
+  function widget(d){
+    var box=document.createElement('div');
+    box.style.cssText='display:inline-block;vertical-align:top;margin:8px;border:1px solid #ddd;padding:6px;border-radius:6px;';
+    var cv=document.createElement('canvas'); cv.width=d.w; cv.height=d.h; cv.style.maxWidth='100%';
+    var img=new Image();
+    var ctrls=document.createElement('div'); ctrls.style.cssText='font-size:12px;margin-top:4px;';
+    function mk(label,min,max,step,val){
+      var wrap=document.createElement('label'); wrap.style.cssText='display:block;margin:2px 0;';
+      var sp=document.createElement('span'); sp.textContent=label+': ';
+      var inp=document.createElement('input'); inp.type='range'; inp.min=min; inp.max=max; inp.step=step; inp.value=val; inp.style.verticalAlign='middle';
+      var out=document.createElement('span'); out.textContent=val; out.style.marginLeft='4px';
+      inp.addEventListener('input',function(){out.textContent=inp.value;draw();});
+      wrap.appendChild(sp);wrap.appendChild(inp);wrap.appendChild(out);ctrls.appendChild(wrap);
+      return inp;
+    }
+    var sSigma=mk('wygladzanie sigma',0,4,0.5,1);
+    var sProm=mk('prominencja',0.02,0.5,0.02,0.1);
+    var sDist=mk('min odstep',1,10,1,3);
+    var readout=document.createElement('div'); readout.style.cssText='font-weight:bold;margin-top:4px;'; ctrls.appendChild(readout);
+    function draw(){
+      var ctx=cv.getContext('2d');
+      ctx.clearRect(0,0,cv.width,cv.height);
+      if(img.complete) ctx.drawImage(img,0,0,cv.width,cv.height);
+      ctx.strokeStyle='rgba(255,220,0,0.7)';ctx.lineWidth=1.5;ctx.beginPath();
+      d.line.forEach(function(p,i){ if(i===0)ctx.moveTo(p[0],p[1]); else ctx.lineTo(p[0],p[1]); }); ctx.stroke();
+      var prof=smooth(d.profile, parseFloat(sSigma.value));
+      var peaks=findPeaks(prof, parseFloat(sProm.value), parseInt(sDist.value));
+      ctx.fillStyle='rgba(255,60,60,0.95)';
+      peaks.forEach(function(idx){ var p=d.line[Math.min(idx,d.line.length-1)]; ctx.beginPath();ctx.arc(p[0],p[1],4,0,2*Math.PI);ctx.fill(); });
+      readout.textContent='OpenCV wykryl: '+peaks.length+'  (model: '+d.pred_age+', prawda: '+d.true_age+')';
+    }
+    img.onload=draw; img.src=d.img;
+    box.appendChild(cv); box.appendChild(ctrls);
+    return box;
+  }
+  var root=document.getElementById('cv-widgets');
+  if(root && typeof OPENCV_DATA!=='undefined'){ OPENCV_DATA.forEach(function(d){ root.appendChild(widget(d)); }); }
+})();
+"""
+
+
+def _section_opencv(opencv_reference: dict | None) -> str:
+    """Section H — interactive classical (OpenCV-style) increment detection for
+    technicians (11.07 Punkt 7 / Kierunek A). Profile is precomputed in Python;
+    smoothing + peak detection run live in the browser via sliders. Reference only —
+    it does not touch the model or its verdict.
+    """
+    if not opencv_reference:
+        return ""
+    import json as _json
+    items = []
+    for iid, d in opencv_reference.items():
+        if not d or not d.get("line") or not d.get("profile"):
+            continue
+        items.append({
+            "id": str(iid),
+            "img": d["img"], "w": d["w"], "h": d["h"],
+            "line": d["line"], "profile": d["profile"],
+            "true_age": d.get("true_age", 0), "pred_age": d.get("pred_age", 0),
+        })
+    if not items:
+        return ""
+    data_json = _json.dumps(items)
+    html = '<section id="H"><h2>H. OpenCV — reference dla technikow (klasyczna detekcja przyrostow)</h2>'
+    html += ('<p class="cap">Interaktywnie: suwaki steruja wygladzaniem i detekcja pikow profilu '
+             'intensywnosci wzdluz osi odczytu. Czerwone kropki = przyrosty wykryte METODA KLASYCZNA '
+             '(nie model) — porownaj z werdyktem modelu. To punkt odniesienia; klasyka bywa zawodna.</p>')
+    html += '<div id="cv-widgets"></div>'
+    html += '<script>const OPENCV_DATA=' + data_json + ';</script>'
+    html += '<script>' + _OPENCV_JS + '</script>'
+    html += '</section>'
+    return html
+
+
 def build_comparison_report(
     results: dict,
     training_logs: dict,
@@ -799,6 +898,7 @@ def build_comparison_report(
     model_info: dict | None = None,
     candidate_overlays: dict | None = None,
     split_lookup: dict | None = None,
+    opencv_reference: dict | None = None,
 ) -> None:
     """Build and write a self-contained HTML comparison report.
 
@@ -851,6 +951,7 @@ def build_comparison_report(
     body += _section_e(increment_cards)
     body += _section_f(model_info)
     body += _section_g(candidate_overlays, split_lookup=split_lookup)
+    body += _section_opencv(opencv_reference)
 
     html = f"""<!DOCTYPE html>
 <html lang="pl">

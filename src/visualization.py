@@ -275,6 +275,28 @@ def _draw_numbered_dots(
                         font_scale, _DOT_BORDER, thickness, cv2.LINE_AA)
 
 
+# Colours for the count=age increment overlays (11.07 Punkt 7)
+_CAND_COLOR = (255, 210, 40)     # yellow — increment CANDIDATES (all axes)
+_FINAL_COLOR = (230, 30, 30)     # red   — FINAL increments (count = predicted age)
+
+
+def _draw_small_points(panel: np.ndarray, points, color, radius: int,
+                       border: bool = False) -> None:
+    """Draw small filled circles (no numbers) at (x, y) points (in place).
+
+    ``border=True`` adds a thin dark outline so bright dots stay visible on the
+    light otolith body (used for the final increments).
+    """
+    if not points:
+        return
+    r = max(2, int(radius))
+    for (x, y) in points:
+        xi, yi = int(x), int(y)
+        if border:
+            cv2.circle(panel, (xi, yi), r + 1, (30, 30, 30), 1)
+        cv2.circle(panel, (xi, yi), r, color, -1)
+
+
 # ---------------------------------------------------------------------------
 # Reasoning card
 # ---------------------------------------------------------------------------
@@ -290,6 +312,9 @@ def draw_reasoning_card(
     peak_indices: Optional[np.ndarray] = None,
     line_xy: Optional[np.ndarray] = None,
     profile_1d: Optional[np.ndarray] = None,
+    final_axis_pts: Optional[list] = None,
+    candidate_pts: Optional[list] = None,
+    final_t: Optional[list] = None,
 ) -> np.ndarray:
     """Compose a 6-panel reasoning card (3 columns × 2 rows).
 
@@ -315,11 +340,20 @@ def draw_reasoning_card(
     # where each curve crosses the measurement axis (ring t → axis index), so the
     # dot count always equals the curve count. Fall back to the incoming axis peaks
     # only when no curves are found (e.g. an untrained model with a flat map).
+    # NEW (Punkt 7): increments come from multi-axis consensus with count = age
+    # (final_axis_pts / candidate_pts precomputed by ring_extraction.select_increments).
+    # Fall back to the old extract_rings ring drawing when they are not provided.
+    use_new = final_axis_pts is not None or candidate_pts is not None
     ring_curves: list = []
     dots_idx = (np.asarray(peak_indices, dtype=int)
                 if peak_indices is not None else np.array([], dtype=int))
-    if axis_info is not None:
-        from src.ring_extraction import extract_rings, draw_ring_curves
+    if use_new:
+        if final_t and line_xy is not None and len(line_xy) > 0:
+            n = len(line_xy)
+            dots_idx = np.clip(
+                np.array([int(round(t * (n - 1))) for t in final_t], dtype=int), 0, n - 1)
+    elif axis_info is not None:
+        from src.ring_extraction import extract_rings
         rings = extract_rings(importance_grid, axis_info, H, W)
         ring_curves = [c for (_t, c) in rings]
         if rings and line_xy is not None and len(line_xy) > 0:
@@ -328,6 +362,7 @@ def draw_reasoning_card(
                 np.array([int(round(t * (n - 1))) for (t, _c) in rings], dtype=int),
                 0, n - 1)
     n_rings = len(ring_curves)
+    n_cand = len(candidate_pts) if candidate_pts else 0
 
     # --- Panel 1: raw ---
     panel1 = original_rgb.copy()
@@ -354,19 +389,32 @@ def draw_reasoning_card(
     else:
         panel4 = _placeholder_panel(H, W, "Oś niedostępna")
 
-    # --- Panel 5: model-derived ring CURVES + the same numbered dots ---
+    # --- Panel 5: increments — candidates (yellow) in new mode; ring curves otherwise ---
     if axis_info is not None:
         panel5 = original_rgb.copy()
-        draw_ring_curves(panel5, ring_curves, thickness=max(2, line_thickness + 1))
-        _draw_axis_overlay(panel5, axis_info, line_thickness, cross_size)
-        if line_xy is not None and len(dots_idx) > 0:
-            _draw_numbered_dots(panel5, dots_idx, line_xy, dot_radius)
+        if use_new:
+            # Panel 5 = ALL candidate increments (yellow) — "where we see possible
+            # increments" across every axis. Final increments live on panel 6.
+            _draw_axis_overlay(panel5, axis_info, line_thickness, cross_size)
+            _draw_small_points(panel5, candidate_pts or [], _CAND_COLOR, max(2, H // 300))
+        else:
+            from src.ring_extraction import draw_ring_curves
+            draw_ring_curves(panel5, ring_curves, thickness=max(2, line_thickness + 1))
+            _draw_axis_overlay(panel5, axis_info, line_thickness, cross_size)
+            if line_xy is not None and len(dots_idx) > 0:
+                _draw_numbered_dots(panel5, dots_idx, line_xy, dot_radius)
     else:
         panel5 = _placeholder_panel(H, W, "Pierscienie niedostepne")
 
-    # --- Panel 6: final verdict (same dots as panel 5) ---
+    # --- Panel 6: final verdict — red FINAL increments on the axis (count = age) ---
     panel6 = original_rgb.copy()
-    if axis_info is not None and line_xy is not None and len(dots_idx) > 0:
+    if use_new and axis_info is not None:
+        cx, cy = axis_info["centroid"]
+        fx, fy = axis_info["far_edge"]
+        cv2.line(panel6, (cx, cy), (fx, fy), _AXIS_COLOR, line_thickness)
+        _draw_small_points(panel6, final_axis_pts or [], _FINAL_COLOR, max(3, H // 110),
+                           border=True)
+    elif axis_info is not None and line_xy is not None and len(dots_idx) > 0:
         cx, cy = axis_info["centroid"]
         fx, fy = axis_info["far_edge"]
         cv2.line(panel6, (cx, cy), (fx, fy), _AXIS_COLOR, line_thickness)
@@ -391,7 +439,8 @@ def draw_reasoning_card(
         "2. Segmentacja otolitu",
         "3. Mapa uwagi (inferno)",
         "4. Os pomiaru + profil 1D",
-        f"5. Pierscienie roczne (N={n_rings})",
+        (f"5. Kandydaci przyrostow (N={n_cand})" if use_new
+         else f"5. Pierscienie roczne (N={n_rings})"),
         f"6. Werdykt: wiek = {int(predicted_age)}",
     ]
     panels = [panel1, panel2, panel3, panel4, panel5, panel6]
@@ -457,6 +506,9 @@ def save_reasoning_cards(
             peak_indices=axis.get("peak_indices"),
             line_xy=axis.get("line_xy"),
             profile_1d=axis.get("profile_1d"),
+            final_axis_pts=axis.get("final_axis_pts"),
+            candidate_pts=axis.get("candidate_pts"),
+            final_t=axis.get("final_t"),
         )
 
         stem = Path(image_id).stem

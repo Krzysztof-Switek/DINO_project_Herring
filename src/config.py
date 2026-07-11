@@ -24,6 +24,7 @@ class ModelConfig(BaseModel):
     head_type: Literal["coral", "mil", "both"] = "both"
     mil_count_weight:    float = Field(1.0,  ge=0.0)  # weight of the MIL concentration loss
     mil_sparsity_weight: float = Field(1.0,  ge=0.0)  # off-region (background) term weight
+    mil_radial_weight:   float = Field(0.5,  ge=0.0)  # radial-spread term: separate rings along the radius
     mil_hidden_dim:      int   = Field(64,   ge=1)
     coral_loss_weight:   float = Field(0.5,  ge=0.0)
 

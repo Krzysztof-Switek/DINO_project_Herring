@@ -112,6 +112,51 @@ def mil_count_loss(
     return (l_on + sparsity_weight * l_off).mean()
 
 
+def mil_radial_spread_loss(
+    patch_probs: Tensor,
+    age: Tensor,
+    nucleus: Tensor,
+    grid_hw: Tuple[int, int],
+) -> Tensor:
+    """Encourage the active patch-probability mass to SPREAD along the radius from
+    the nucleus, so annual increments separate into rings instead of one blob.
+
+    ``mil_count_loss`` alone makes ~age patches fire but they clump into a single
+    region (a blob). Annual rings are concentric, so along the radius they should
+    appear as a *sequence* of activations. We push the probability-weighted radial
+    std σ_r toward a target that grows with age (more rings → wider spread). The
+    penalty is ONE-SIDED (``relu(target − σ_r)``) so it never forces mass to the
+    rim; it only breaks the single-blob solution.
+
+    Args:
+        patch_probs : (B, N) ∈ [0, 1]
+        age         : (B,)   integer ages
+        nucleus     : (B, 2) normalized (x, y) radial origin in [0, 1]
+        grid_hw     : (H_p, W_p) patch grid shape (H_p * W_p == N)
+
+    Returns scalar loss.
+    """
+    B, N = patch_probs.shape
+    Hp, Wp = grid_hw
+    device = patch_probs.device
+    ys = (torch.arange(Hp, device=device, dtype=torch.float32) + 0.5) / Hp
+    xs = (torch.arange(Wp, device=device, dtype=torch.float32) + 0.5) / Wp
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")            # (Hp, Wp) each
+    gx = gx.reshape(1, N)
+    gy = gy.reshape(1, N)
+    cx = nucleus[:, 0:1]                                       # (B, 1)
+    cy = nucleus[:, 1:2]
+    r = torch.sqrt((gx - cx) ** 2 + (gy - cy) ** 2)           # (B, N)
+    r = r / (r.max(dim=1, keepdim=True).values + 1e-6)        # per-sample normalise
+    w = patch_probs
+    wsum = w.sum(dim=1, keepdim=True).clamp(min=1e-6)         # (B, 1)
+    mu = (w * r).sum(dim=1, keepdim=True) / wsum              # (B, 1)
+    var = (w * (r - mu) ** 2).sum(dim=1) / wsum.squeeze(1)    # (B,)
+    std = torch.sqrt(var + 1e-6)                              # (B,)
+    target = torch.clamp(0.10 + 0.03 * age.float(), max=0.45)  # grows with age
+    return torch.relu(target - std).mean()
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------

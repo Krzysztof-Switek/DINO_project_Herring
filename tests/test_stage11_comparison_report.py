@@ -339,6 +339,25 @@ def test_section_c_confusion_bias_n_per_age(tmp_path):
     assert "Ile obrazów testowych" in content         # n-per-age caption
 
 
+def test_section_opencv_reference_widget(tmp_path):
+    """Kierunek A: opencv_reference renders the interactive Section H (11.07 Punkt 7/A)."""
+    from src.comparison_report import build_comparison_report
+    out = tmp_path / "report.html"
+    ref = {"a.jpg": {"img": "data:image/png;base64,iVBORw0KGgo=", "w": 60, "h": 40,
+                     "line": [[5, 20], [30, 20], [55, 20]], "profile": [0.1, 0.8, 0.2],
+                     "true_age": 4, "pred_age": 4}}
+    build_comparison_report(
+        results={"emb_on_emb": _make_predictions(n=40, seed=2)},
+        training_logs={}, increment_cards={},
+        dataset_stats={"counts": {}, "orphan_count": 0, "age_distributions": {},
+                       "active_ptypes": ["Embedded"]},
+        output_path=out, opencv_reference=ref,
+    )
+    content = out.read_text(encoding="utf-8")
+    assert "H. OpenCV" in content
+    assert "cv-widgets" in content and "OPENCV_DATA" in content
+
+
 def test_section_g_split_badge(tmp_path):
     """Section G badges each tile with its split from split_lookup."""
     import numpy as np
