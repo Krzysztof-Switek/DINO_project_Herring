@@ -231,9 +231,18 @@ def test_load_checkpoint_returns_epoch(tmp_path):
 
 def test_fit_creates_checkpoint_per_epoch(tmp_path):
     trainer = _make_trainer(tmp_path, epochs=3)
+    trainer.cfg.training.keep_only_best = False   # test per-epoch mode explicitly
     trainer.fit()
     ckpts = list((tmp_path / "checkpoints").glob("checkpoint_epoch*.pt"))
     assert len(ckpts) == 3
+
+
+def test_keep_only_best_prunes_epoch_checkpoints(tmp_path):
+    """keep_only_best (default) leaves only best.pt — per-epoch checkpoints pruned."""
+    trainer = _make_trainer(tmp_path, epochs=3)   # keep_only_best defaults to True
+    trainer.fit()
+    assert list(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt")) == []
+    assert (trainer.checkpoint_dir / "best.pt").exists()
 
 
 def test_fit_writes_log_file(tmp_path):
@@ -319,6 +328,7 @@ def test_early_stopping_triggers(tmp_path):
     cfg.training.early_stopping_patience = 2
     cfg.training.early_stopping_metric = "val_mae"
     cfg.training.early_stopping_min_delta = 0.001
+    cfg.training.keep_only_best = False   # count per-epoch checkpoints as an epoch proxy
 
     model = _make_model(cfg)
     trainer = ConstantValTrainer(cfg, model, _make_loader(), _make_loader())
@@ -387,6 +397,7 @@ def test_early_stopping_disabled(tmp_path):
 
     cfg = _make_cfg(tmp_path, epochs=3)
     cfg.training.early_stopping_patience = 0
+    cfg.training.keep_only_best = False   # count per-epoch checkpoints as an epoch proxy
 
     model = _make_model(cfg)
     trainer = ConstantValTrainer(cfg, model, _make_loader(), _make_loader())

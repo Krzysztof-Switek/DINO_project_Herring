@@ -116,12 +116,14 @@ def _save_mock_checkpoint(cfg, labels_csv: Path, img_dir: Path) -> Path:
     trainer = Trainer(cfg, model, train_loader, val_loader)
     trainer.fit()
 
-    ckpt_files = sorted(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt"))
-    if not ckpt_files:
-        raise FileNotFoundError(f"No checkpoint in {trainer.checkpoint_dir}")
-    best_src = min(ckpt_files, key=lambda p: float(p.stem.split("_loss")[-1]))
+    # fit() now always writes best.pt (and prunes per-epoch checkpoints by default).
     best_ckpt = trainer.checkpoint_dir / "best.pt"
-    shutil.copy2(best_src, best_ckpt)
+    if not best_ckpt.exists():
+        ckpt_files = sorted(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt"))
+        if not ckpt_files:
+            raise FileNotFoundError(f"No checkpoint in {trainer.checkpoint_dir}")
+        best_src = min(ckpt_files, key=lambda p: float(p.stem.split("_loss")[-1]))
+        shutil.copy2(best_src, best_ckpt)
     return best_ckpt
 
 

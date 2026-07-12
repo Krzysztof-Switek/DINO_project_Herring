@@ -195,3 +195,23 @@ def test_draw_reasoning_card_new_increment_mode():
     )
     assert card.ndim == 3 and card.shape[2] == 3
     assert card.shape[1] == 3 * W
+
+
+def test_draw_reasoning_card_two_head_bars():
+    """Two-row layout: CORAL (blue) title bars in row 1, MIL (orange) in row 2 (Punkt 7)."""
+    from src.visualization import draw_reasoning_card, _HEAD_CORAL_BAR, _HEAD_MIL_BAR
+    H, W = 120, 200
+    original = (np.random.rand(H, W, 3) * 255).astype(np.uint8)
+    mask, axis_info, line_xy, _profile, _peaks = _make_axis_payload(H, W)
+    grid = np.random.rand(8, 14).astype(np.float32)
+    card = draw_reasoning_card(
+        original_rgb=original, importance_grid=grid, predicted_age=3, true_age=3,
+        mask=mask, axis_info=axis_info,
+        coral_gradcam=np.random.rand(8, 14).astype(np.float32),
+        final_axis_pts=[(W // 3, H // 2)], candidate_pts=[(W // 2, H // 2)], final_t=[0.3],
+    )
+
+    def _has(color):
+        return int((np.abs(card.astype(int) - np.array(color)).sum(2) < 20).sum()) > 0
+
+    assert _has(_HEAD_CORAL_BAR) and _has(_HEAD_MIL_BAR)

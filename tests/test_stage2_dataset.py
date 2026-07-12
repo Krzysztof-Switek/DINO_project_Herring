@@ -131,18 +131,6 @@ def test_dataset_image_shape(dummy_data):
     assert item["image"].dtype == torch.float32
 
 
-def test_dataset_has_nucleus(dummy_data):
-    """Each sample carries a normalized (x, y) nucleus in [0,1] for the radial loss."""
-    csv_path, img_dir = dummy_data
-    from src.dataset import OtolithDataset
-    cfg = _make_cfg()
-    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
-    item = ds[0]
-    assert item["nucleus"].shape == (2,)
-    assert item["nucleus"].dtype == torch.float32
-    assert bool((item["nucleus"] >= 0).all()) and bool((item["nucleus"] <= 1).all())
-
-
 def test_dataset_age_ordinal_shape(dummy_data):
     csv_path, img_dir = dummy_data
     from src.dataset import OtolithDataset

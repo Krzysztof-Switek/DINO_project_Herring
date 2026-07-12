@@ -125,7 +125,7 @@ def _parse_train_log(log_path: Path) -> list[dict]:
     )
     # Optional Section-B diagnostics (only present in newer logs / with the
     # relevant heads active) — parsed independently so older logs still work.
-    extra_keys = ("coral_loss", "mil_loss", "mil_radial", "mil_active", "mean_age")
+    extra_keys = ("coral_loss", "mil_loss", "mil_active", "mean_age")
     extra_pat = {k: re.compile(rf"{k}=([\d.eE+-]+)") for k in extra_keys}
     rows: list[dict] = []
     try:
@@ -318,7 +318,8 @@ def _compute_axis_data_for_samples(
     from src.candidates import find_candidate_peaks
     from src.dataset import build_transforms
     from src.inference import load_model_from_checkpoint
-    from src.interpretation import compute_patch_importance
+    from src.interpretation import (compute_patch_importance, compute_coral_gradcam,
+                                     compute_cls_attention)
     from src.otolith_axis import (
         detect_axis,
         find_centroid,
@@ -361,6 +362,12 @@ def _compute_axis_data_for_samples(
             with torch.no_grad():
                 grid = compute_patch_importance(model, tensor).cpu().numpy()
             grids[iid] = grid
+            # CORAL-head attributions (age verdict): Grad-CAM + CLS attention.
+            # Both are internally defensive → None on failure (11.07 Punkt 7).
+            _gc = compute_coral_gradcam(model, tensor)
+            _ca = compute_cls_attention(model, tensor)
+            coral_gc_grid = _gc.cpu().numpy() if _gc is not None else None
+            cls_attn_grid = _ca.cpu().numpy() if _ca is not None else None
         except Exception as e:
             print(f"    [cards] błąd dla {iid}: {e}")
             continue
@@ -398,9 +405,12 @@ def _compute_axis_data_for_samples(
 
         if axis_info is None:
             failed_axes += 1
+            # CORAL panels (Grad-CAM, uwaga CLS, werdykt) NIE potrzebują osi — pokaż je
+            # nawet gdy segmentacja padła; tylko panele lokalizacji będą placeholderem.
             axis_data[iid] = {
                 "mask": None, "axis_info": None,
                 "peak_indices": None, "line_xy": None, "profile_1d": None,
+                "coral_gradcam": coral_gc_grid, "cls_attention": cls_attn_grid,
             }
             continue
 
@@ -462,6 +472,8 @@ def _compute_axis_data_for_samples(
             "candidate_pts":  increments["candidate_pts"],
             "final_t":        increments["final_t"],
             "opencv_ref":     opencv_ref,
+            "coral_gradcam":  coral_gc_grid,
+            "cls_attention":  cls_attn_grid,
         }
 
     total = len(samples)

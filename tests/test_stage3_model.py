@@ -384,31 +384,6 @@ def test_mil_count_loss_concentrates_to_age():
     assert top[6] > 0.5 and top[7] < 0.2                  # 7 on, 8th is background
 
 
-def test_mil_radial_spread_loss_lower_for_spread():
-    """Radial-spread loss is lower for a radially-spread map than a single blob (Punkt 7)."""
-    from src.model import mil_radial_spread_loss
-    Hp = Wp = 8
-    age = torch.tensor([6])
-    nucleus = torch.tensor([[0.5, 0.5]])
-    blob = torch.zeros(Hp, Wp); blob[3:5, 3:5] = 1.0
-    spread = torch.zeros(Hp, Wp)
-    spread[0, 4] = spread[7, 4] = spread[4, 0] = spread[4, 7] = spread[2, 2] = spread[5, 5] = 1.0
-    l_blob = mil_radial_spread_loss(blob.reshape(1, -1), age, nucleus, (Hp, Wp))
-    l_spread = mil_radial_spread_loss(spread.reshape(1, -1), age, nucleus, (Hp, Wp))
-    assert float(l_spread) < float(l_blob)
-
-
-def test_mil_radial_spread_loss_has_gradient():
-    from src.model import mil_radial_spread_loss
-    Hp = Wp = 8
-    logits = torch.randn(2, Hp * Wp, requires_grad=True)
-    age = torch.tensor([3, 8])
-    nucleus = torch.tensor([[0.5, 0.5], [0.4, 0.6]])
-    loss = mil_radial_spread_loss(torch.sigmoid(logits), age, nucleus, (Hp, Wp))
-    loss.backward()
-    assert logits.grad is not None and torch.isfinite(logits.grad).all()
-
-
 def test_mil_count_loss_age_zero_is_empty():
     """age 0 → no patch should fire (k=0, background suppression only)."""
     from src.model import mil_count_loss

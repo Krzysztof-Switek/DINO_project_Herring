@@ -119,6 +119,26 @@ def test_patch_importance_shape():
     assert importance.shape == (4, 4)
 
 
+def test_compute_coral_gradcam_shape():
+    """CORAL Grad-CAM returns a (H_p, W_p) finite map (11.07 Punkt 7)."""
+    from src.interpretation import compute_coral_gradcam
+    cfg = _make_cfg()
+    model = _make_model(cfg); model.eval()
+    cam = compute_coral_gradcam(model, _make_single_image_tensor())
+    assert cam is not None
+    assert tuple(cam.shape) == (4, 4)
+    assert bool(torch.isfinite(cam).all())
+
+
+def test_compute_cls_attention_fallback_none():
+    """CLS attention degrades to None on a backbone without .blocks (mock)."""
+    from src.interpretation import compute_cls_attention
+    cfg = _make_cfg()
+    model = _make_model(cfg); model.eval()
+    # Real DINOv2 exposes blocks[-1].attn.attn_drop; mock does not → graceful None.
+    assert compute_cls_attention(model, _make_single_image_tensor()) is None
+
+
 def test_patch_importance_accepts_3d_input():
     """compute_patch_importance must accept (3, H, W) without batch dim."""
     from src.interpretation import compute_patch_importance

@@ -64,6 +64,105 @@ def compute_patch_importance(
     return patches.norm(dim=-1)                             # (H_p, W_p)
 
 
+def compute_coral_gradcam(
+    model: OtolithModel,
+    image_tensor: Tensor,
+) -> Optional[Tensor]:
+    """Grad-CAM-style saliency for the CORAL **age verdict** (11.07 Punkt 7).
+
+    Answers „które patche najbardziej wpływają na przewidziany wiek": gradient of
+    the CORAL score ``g`` (pre-threshold scalar) w.r.t. the DINOv2 patch tokens,
+    ``importance = ReLU(Σ_d grad ⊙ token)``, reshaped to the (H_p, W_p) grid.
+
+    This is the age head's OWN attribution — distinct from the MIL localisation map.
+    Returns None if the model has no CORAL head. (With a constant-patch mock backbone
+    the gradient may be zero → returns a zero map, which is fine.)
+    """
+    if not hasattr(model, "head"):
+        return None
+    if image_tensor.dim() == 3:
+        image_tensor = image_tensor.unsqueeze(0)
+    device = next(model.parameters()).device
+    image = image_tensor.to(device).clone().requires_grad_(True)
+    was_training = model.training
+    model.eval()
+    cam: Optional[Tensor] = None
+    try:
+        feats = model.backbone.forward_features(image)
+        patches = feats["x_norm_patchtokens"]              # (1, N, D)
+        N = patches.shape[1]
+        hp = int(round(N ** 0.5))
+        if not patches.requires_grad:                      # e.g. constant-patch mock
+            cam = torch.zeros(hp, hp)
+        else:
+            patches.retain_grad()
+            g = model.head(feats["x_norm_clstoken"])       # (1, 1) CORAL score
+            model.zero_grad(set_to_none=True)
+            g.sum().backward()
+            grad = patches.grad
+            if grad is None:
+                cam = torch.zeros(hp, hp)
+            else:
+                flat = torch.relu((grad * patches).sum(dim=-1)).squeeze(0)  # (N,)
+                cam = flat[: hp * hp].reshape(hp, hp).detach().cpu()
+    except Exception:
+        cam = None
+    finally:
+        model.zero_grad(set_to_none=True)
+        if was_training:
+            model.train()
+    return cam
+
+
+def compute_cls_attention(
+    model: OtolithModel,
+    image_tensor: Tensor,
+) -> Optional[Tensor]:
+    """Mean CLS→patch self-attention from DINOv2's LAST block, as a (H_p, W_p) grid.
+
+    The token CLS (which the CORAL head reads) aggregates the image via attention;
+    this shows from which patches it drew. Captured with a forward hook on the last
+    attention block's ``attn_drop`` (whose input is the softmax attention matrix).
+    Returns None when unavailable — mock backbone, xFormers fused attention, or a
+    different ViT layout — so callers can fall back gracefully.
+    """
+    if image_tensor.dim() == 3:
+        image_tensor = image_tensor.unsqueeze(0)
+    backbone = model.backbone
+    try:
+        attn_drop = backbone.blocks[-1].attn.attn_drop
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+    captured: Dict[str, Tensor] = {}
+
+    def _hook(_m, inp, _out):
+        if inp and torch.is_tensor(inp[0]):
+            captured["a"] = inp[0].detach()
+
+    handle = attn_drop.register_forward_hook(_hook)
+    try:
+        device = next(model.parameters()).device
+        model.eval()
+        with torch.no_grad():
+            backbone.forward_features(image_tensor.to(device))
+    except Exception:
+        return None
+    finally:
+        handle.remove()
+
+    a = captured.get("a")
+    if a is None or a.dim() != 4:                          # expect (B, heads, T, T)
+        return None
+    cls_row = a[0, :, 0, 1:].mean(0)                       # avg heads → (T-1,)
+    n_patch = cls_row.shape[0]
+    hp = int(round(n_patch ** 0.5))
+    if hp < 1:
+        return None
+    cls_row = cls_row[-(hp * hp):]                         # robust to register tokens
+    return cls_row.reshape(hp, hp).float().cpu()
+
+
 def importance_to_heatmap(
     importance_grid: Tensor,
     image_size: int,

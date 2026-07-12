@@ -132,6 +132,7 @@ def test_full_pipeline(tmp_path):
     # Train for 2 epochs (backbone frozen on epoch 1, unfrozen on epoch 2)
     # ------------------------------------------------------------------
     model = OtolithModel(cfg, backbone=_MockDinoBackbone())
+    cfg.training.keep_only_best = False   # this test checks per-epoch checkpoints + loading
     trainer = Trainer(cfg, model, train_loader, val_loader)
     trainer.fit()
 

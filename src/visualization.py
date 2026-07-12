@@ -105,11 +105,15 @@ def _fit_font_scale(text: str, max_w: int, start_scale: float,
     return scale
 
 
-def _add_title(img: np.ndarray, title: str) -> np.ndarray:
-    """Stack a dark title bar (with white text) above the image."""
+def _add_title(img: np.ndarray, title: str, bar_color=None) -> np.ndarray:
+    """Stack a title bar (with white text) above the image.
+
+    ``bar_color`` overrides the default dark bar — used to colour-code which head a
+    panel belongs to (granatowy = CORAL/wiek, pomarańcz = MIL/lokalizacja).
+    """
     H, W = img.shape[:2]
     th = _title_height(H)
-    bar = np.full((th, W, 3), _TITLE_BG, dtype=np.uint8)
+    bar = np.full((th, W, 3), _TITLE_BG if bar_color is None else bar_color, dtype=np.uint8)
     font_scale = _fit_font_scale(title, W - 16, max(0.45, th / 55.0), thickness_ratio=1.8)
     thickness = max(1, int(font_scale * 1.8))
     (tw, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
@@ -279,6 +283,10 @@ def _draw_numbered_dots(
 _CAND_COLOR = (255, 210, 40)     # yellow — increment CANDIDATES (all axes)
 _FINAL_COLOR = (230, 30, 30)     # red   — FINAL increments (count = predicted age)
 
+# Title-bar colours = which head a panel belongs to (11.07 Punkt 7 redesign)
+_HEAD_CORAL_BAR = (30, 60, 130)  # granatowy — GŁOWICA WIEKU (CORAL)
+_HEAD_MIL_BAR = (150, 70, 20)    # ciemny pomarańcz — GŁOWICA LOKALIZACJI (MIL)
+
 
 def _draw_small_points(panel: np.ndarray, points, color, radius: int,
                        border: bool = False) -> None:
@@ -315,138 +323,111 @@ def draw_reasoning_card(
     final_axis_pts: Optional[list] = None,
     candidate_pts: Optional[list] = None,
     final_t: Optional[list] = None,
+    coral_gradcam: Optional[np.ndarray] = None,
+    cls_attention: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Compose a 6-panel reasoning card (3 columns × 2 rows).
+    """Compose a 6-panel reasoning card (3 columns × 2 rows) — two rows = two heads.
 
-    Panels:
-      1. Raw photo                    — model input
-      2. Otolith segmentation         — contour + nucleus cross
-      3. Attention heatmap            — inferno colormap, masked to otolith
-      4. Measurement axis + 1D profile
-      5. Annual rings                 — ring curves from the prob map (dots = axis crossings)
-      6. Final verdict                — numbered dots + age label + frame
+    Rząd 1 — GŁOWICA WIEKU (CORAL):
+      1. Grad-CAM werdyktu   — które rejony wpływają na przewidziany wiek
+      2. Uwaga CLS           — z których patchy CLS złożył streszczenie (albo placeholder)
+      3. Werdykt             — wiek = X (true: Y) + ramka OK/błąd
+    Rząd 2 — GŁOWICA LOKALIZACJI (MIL):
+      4. Mapa MIL            — prawdopodobieństwo przyrostu per patch (inferno)
+      5. Kandydaci           — żółte kropki ze wszystkich osi + oś pomiaru
+      6. Finalne (N=wiek)    — czerwone finalne przyrosty na osi
 
-    Each panel keeps the original-image dimensions ``(H, W, 3)`` and is topped
-    with a dark title bar. When ``mask``/``axis_info`` are ``None``, panels 2,
-    4 and 5 are replaced with a "data unavailable" placeholder.
+    Paski tytułów są kolorowane wg głowicy (granatowy = CORAL, pomarańcz = MIL).
+    ``coral_gradcam`` / ``cls_attention`` to siatki (H_p, W_p) lub None (→ placeholder).
+    Stare parametry (``peak_indices``/``profile_1d``) przyjmowane dla zgodności wstecz;
+    panele 5/6 spadają do numerowanych kropek, gdy brak nowych punktów przyrostów.
     """
     H, W = original_rgb.shape[:2]
     line_thickness = max(2, H // 250)
     cross_size = max(8, H // 80)
     dot_radius = max(8, H // 60)
 
-    # --- Model-derived rings (shared by panels 4/5/6 so they stay consistent) ---
-    # Ring curves come from the 2-D probability map; the numbered dots are placed
-    # where each curve crosses the measurement axis (ring t → axis index), so the
-    # dot count always equals the curve count. Fall back to the incoming axis peaks
-    # only when no curves are found (e.g. an untrained model with a flat map).
-    # NEW (Punkt 7): increments come from multi-axis consensus with count = age
-    # (final_axis_pts / candidate_pts precomputed by ring_extraction.select_increments).
-    # Fall back to the old extract_rings ring drawing when they are not provided.
     use_new = final_axis_pts is not None or candidate_pts is not None
-    ring_curves: list = []
+    n_cand = len(candidate_pts) if candidate_pts else 0
+    n_final = len(final_axis_pts) if final_axis_pts else 0
+
+    # Fallback dots (old mode / non-MIL): from incoming peak_indices or final radii.
     dots_idx = (np.asarray(peak_indices, dtype=int)
                 if peak_indices is not None else np.array([], dtype=int))
-    if use_new:
-        if final_t and line_xy is not None and len(line_xy) > 0:
-            n = len(line_xy)
-            dots_idx = np.clip(
-                np.array([int(round(t * (n - 1))) for t in final_t], dtype=int), 0, n - 1)
-    elif axis_info is not None:
-        from src.ring_extraction import extract_rings
-        rings = extract_rings(importance_grid, axis_info, H, W)
-        ring_curves = [c for (_t, c) in rings]
-        if rings and line_xy is not None and len(line_xy) > 0:
-            n = len(line_xy)
-            dots_idx = np.clip(
-                np.array([int(round(t * (n - 1))) for (t, _c) in rings], dtype=int),
-                0, n - 1)
-    n_rings = len(ring_curves)
-    n_cand = len(candidate_pts) if candidate_pts else 0
+    if use_new and final_t and line_xy is not None and len(line_xy) > 0:
+        n = len(line_xy)
+        dots_idx = np.clip(
+            np.array([int(round(t * (n - 1))) for t in final_t], dtype=int), 0, n - 1)
 
-    # --- Panel 1: raw ---
-    panel1 = original_rgb.copy()
+    def _heat_panel(grid) -> np.ndarray:
+        hm = importance_to_heatmap_2d(grid, H, W)
+        panel = apply_colormap_with_mask(hm, original_rgb, mask=mask, alpha=0.55,
+                                         colormap=DEFAULT_COLORMAP)
+        _draw_colorbar(panel)
+        return panel
 
-    # --- Panel 2: segmentation (contour + nucleus only, NO measurement axis) ---
-    if axis_info is not None and mask is not None:
-        panel2 = original_rgb.copy()
-        _draw_axis_overlay(panel2, axis_info, line_thickness, cross_size, draw_axis=False)
-    else:
-        panel2 = _placeholder_panel(H, W, "Segmentacja nieudana")
-
-    # --- Panel 3: attention heatmap ---
-    heatmap = importance_to_heatmap_2d(importance_grid, H, W)
-    panel3 = apply_colormap_with_mask(
-        heatmap, original_rgb, mask=mask, alpha=0.55, colormap=DEFAULT_COLORMAP
-    )
-    _draw_colorbar(panel3)
-
-    # --- Panel 4: axis + 1D profile (peaks = ring axis-crossings) ---
-    if axis_info is not None and line_xy is not None and profile_1d is not None:
-        panel4 = original_rgb.copy()
-        _draw_axis_overlay(panel4, axis_info, line_thickness, cross_size)
-        _draw_profile_inset(panel4, profile_1d, dots_idx)
-    else:
-        panel4 = _placeholder_panel(H, W, "Oś niedostępna")
-
-    # --- Panel 5: increments — candidates (yellow) in new mode; ring curves otherwise ---
-    if axis_info is not None:
-        panel5 = original_rgb.copy()
-        if use_new:
-            # Panel 5 = ALL candidate increments (yellow) — "where we see possible
-            # increments" across every axis. Final increments live on panel 6.
-            _draw_axis_overlay(panel5, axis_info, line_thickness, cross_size)
-            _draw_small_points(panel5, candidate_pts or [], _CAND_COLOR, max(2, H // 300))
-        else:
-            from src.ring_extraction import draw_ring_curves
-            draw_ring_curves(panel5, ring_curves, thickness=max(2, line_thickness + 1))
-            _draw_axis_overlay(panel5, axis_info, line_thickness, cross_size)
-            if line_xy is not None and len(dots_idx) > 0:
-                _draw_numbered_dots(panel5, dots_idx, line_xy, dot_radius)
-    else:
-        panel5 = _placeholder_panel(H, W, "Pierscienie niedostepne")
-
-    # --- Panel 6: final verdict — red FINAL increments on the axis (count = age) ---
-    panel6 = original_rgb.copy()
-    if use_new and axis_info is not None:
-        cx, cy = axis_info["centroid"]
-        fx, fy = axis_info["far_edge"]
-        cv2.line(panel6, (cx, cy), (fx, fy), _AXIS_COLOR, line_thickness)
-        _draw_small_points(panel6, final_axis_pts or [], _FINAL_COLOR, max(3, H // 110),
-                           border=True)
-    elif axis_info is not None and line_xy is not None and len(dots_idx) > 0:
-        cx, cy = axis_info["centroid"]
-        fx, fy = axis_info["far_edge"]
-        cv2.line(panel6, (cx, cy), (fx, fy), _AXIS_COLOR, line_thickness)
-        _draw_numbered_dots(panel6, dots_idx, line_xy, dot_radius)
-    # Age label (always rendered) — shrink font until it fits the panel width
+    # ===== Rząd 1 — GŁOWICA WIEKU (CORAL) =====
+    panel1 = (_heat_panel(coral_gradcam) if coral_gradcam is not None
+              else _placeholder_panel(H, W, "Grad-CAM niedostepny"))
+    panel2 = (_heat_panel(cls_attention) if cls_attention is not None
+              else _placeholder_panel(H, W, "Uwaga CLS niedostepna"))
+    # Panel 3 — werdykt: etykieta wieku + ramka OK/błąd
+    panel3 = original_rgb.copy()
     label = f"Wiek: {int(predicted_age)} (true: {int(true_age)})"
     pad = max(6, H // 80)
-    max_w = W - 2 * pad
-    font_scale = _fit_font_scale(label, max_w, max(0.5, H / 480.0))
+    font_scale = _fit_font_scale(label, W - 2 * pad, max(0.5, H / 480.0))
     thickness = max(1, int(font_scale * 2))
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-    cv2.rectangle(panel6, (pad - 4, H - th - 3 * pad),
+    cv2.rectangle(panel3, (pad - 4, H - th - 3 * pad),
                    (min(pad + tw + 8, W - 2), H - pad), (0, 0, 0), -1)
-    cv2.putText(panel6, label, (pad + 2, H - 2 * pad),
+    cv2.putText(panel3, label, (pad + 2, H - 2 * pad),
                 cv2.FONT_HERSHEY_SIMPLEX, font_scale, _DOT_FILL, thickness, cv2.LINE_AA)
     frame_color = _OK_FRAME if int(predicted_age) == int(true_age) else _BAD_FRAME
-    cv2.rectangle(panel6, (0, 0), (W - 1, H - 1), frame_color, max(3, line_thickness * 2))
+    cv2.rectangle(panel3, (0, 0), (W - 1, H - 1), frame_color, max(3, line_thickness * 2))
 
-    # --- Compose 3×2 grid ---
-    titles = [
-        "1. Surowe zdjecie",
-        "2. Segmentacja otolitu",
-        "3. Mapa uwagi (inferno)",
-        "4. Os pomiaru + profil 1D",
-        (f"5. Kandydaci przyrostow (N={n_cand})" if use_new
-         else f"5. Pierscienie roczne (N={n_rings})"),
-        f"6. Werdykt: wiek = {int(predicted_age)}",
+    # ===== Rząd 2 — GŁOWICA LOKALIZACJI (MIL) =====
+    panel4 = _heat_panel(importance_grid)   # mapa MIL (lub L2 gdy brak MIL)
+    # Panel 5 — kandydaci
+    if axis_info is not None:
+        panel5 = original_rgb.copy()
+        _draw_axis_overlay(panel5, axis_info, line_thickness, cross_size)
+        if use_new:
+            _draw_small_points(panel5, candidate_pts or [], _CAND_COLOR, max(2, H // 300))
+        elif line_xy is not None and len(dots_idx) > 0:
+            _draw_numbered_dots(panel5, dots_idx, line_xy, dot_radius)
+    else:
+        panel5 = _placeholder_panel(H, W, "Os niedostepna")
+    # Panel 6 — finalne przyrosty (N = wiek)
+    if axis_info is not None:
+        panel6 = original_rgb.copy()
+        cx, cy = axis_info["centroid"]
+        fx, fy = axis_info["far_edge"]
+        cv2.line(panel6, (cx, cy), (fx, fy), _AXIS_COLOR, line_thickness)
+        if use_new:
+            _draw_small_points(panel6, final_axis_pts or [], _FINAL_COLOR,
+                               max(3, H // 110), border=True)
+        elif line_xy is not None and len(dots_idx) > 0:
+            _draw_numbered_dots(panel6, dots_idx, line_xy, dot_radius)
+    else:
+        panel6 = _placeholder_panel(H, W, "Os niedostepna")
+
+    # ===== Kompozycja 3×2: rząd 1 = CORAL (pasek granatowy), rząd 2 = MIL (pomarańcz) =====
+    row1_titles = [
+        "WIEK · Grad-CAM (co wplywa na wiek)",
+        "WIEK · uwaga CLS (backbone)",
+        f"WIEK · werdykt = {int(predicted_age)}",
     ]
-    panels = [panel1, panel2, panel3, panel4, panel5, panel6]
-    panels_titled = [_add_title(p, t) for p, t in zip(panels, titles)]
-    row1 = np.concatenate(panels_titled[:3], axis=1)
-    row2 = np.concatenate(panels_titled[3:], axis=1)
+    row2_titles = [
+        "PRZYROSTY · mapa MIL",
+        f"PRZYROSTY · kandydaci (N={n_cand})",
+        f"PRZYROSTY · finalne (N={n_final})",
+    ]
+    row1 = np.concatenate(
+        [_add_title(p, t, _HEAD_CORAL_BAR)
+         for p, t in zip([panel1, panel2, panel3], row1_titles)], axis=1)
+    row2 = np.concatenate(
+        [_add_title(p, t, _HEAD_MIL_BAR)
+         for p, t in zip([panel4, panel5, panel6], row2_titles)], axis=1)
     card = np.concatenate([row1, row2], axis=0)
     return card
 
@@ -509,6 +490,8 @@ def save_reasoning_cards(
             final_axis_pts=axis.get("final_axis_pts"),
             candidate_pts=axis.get("candidate_pts"),
             final_t=axis.get("final_t"),
+            coral_gradcam=axis.get("coral_gradcam"),
+            cls_attention=axis.get("cls_attention"),
         )
 
         stem = Path(image_id).stem

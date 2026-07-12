@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from src.config import OtolithConfig
 from src.dataset import decode_age_ordinal
-from src.model import OtolithModel, mil_count_loss, mil_radial_spread_loss, ordinal_loss
+from src.model import OtolithModel, mil_count_loss, ordinal_loss
 from src.utils import resolve_device  # re-exported for backwards compat
 
 
@@ -46,7 +46,6 @@ class Trainer:
         self.coral_w    = cfg.model.coral_loss_weight
         self.count_w    = cfg.model.mil_count_weight
         self.sparsity_w = cfg.model.mil_sparsity_weight
-        self.radial_w   = cfg.model.mil_radial_weight
         self.last_val_metrics: dict = {}   # Section-B diagnostics from validate()
 
         self.optimizer = self._build_optimizer()
@@ -107,14 +106,11 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _loss_parts(self, out: dict, targets: torch.Tensor,
-                    ages: torch.Tensor,
-                    nucleus: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
+                    ages: torch.Tensor) -> dict[str, torch.Tensor]:
         """Weighted CORAL / MIL components + their sum, keyed by name.
 
         Returned so the trainer can log the head losses separately (report
         Section B — "which head is learning"). ``total`` is what we backprop.
-        ``mil_radial`` (radial-spread) is added when a nucleus is available, so
-        increments separate along the radius instead of clumping (11.07 Punkt 7).
         """
         parts: dict[str, torch.Tensor] = {}
         if "coral_logits" in out:
@@ -123,21 +119,15 @@ class Trainer:
             parts["mil"] = self.count_w * mil_count_loss(
                 out["patch_probs"], ages, self.sparsity_w
             )
-            if nucleus is not None and self.radial_w > 0:
-                n_patches = out["patch_probs"].shape[1]
-                hp = int(round(n_patches ** 0.5))
-                parts["mil_radial"] = self.radial_w * mil_radial_spread_loss(
-                    out["patch_probs"], ages, nucleus, (hp, hp)
-                )
         if not parts:
             raise RuntimeError("Model produced no recognised head outputs")
         parts["total"] = torch.stack(list(parts.values())).sum()
         return parts
 
-    def _combined_loss(self, out: dict, targets: torch.Tensor, ages: torch.Tensor,
-                       nucleus: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _combined_loss(self, out: dict, targets: torch.Tensor,
+                       ages: torch.Tensor) -> torch.Tensor:
         """Combined CORAL + MIL loss (the scalar we optimise)."""
-        return self._loss_parts(out, targets, ages, nucleus)["total"]
+        return self._loss_parts(out, targets, ages)["total"]
 
     @staticmethod
     def _predict_age(out: dict) -> torch.Tensor:
@@ -161,17 +151,13 @@ class Trainer:
             targets = batch["age_ordinal"].to(self.device)
             ages    = batch["age"].to(self.device)
 
-            nucleus = batch.get("nucleus")
-            if nucleus is not None:
-                nucleus = nucleus.to(self.device)
-
             metadata = batch.get("metadata")
             if metadata is not None:
                 metadata = metadata.to(self.device)
 
             self.optimizer.zero_grad()
             out = self.model(images, metadata=metadata)
-            loss = self._combined_loss(out, targets, ages, nucleus)
+            loss = self._combined_loss(out, targets, ages)
             loss.backward()
             self.optimizer.step()
 
@@ -197,10 +183,9 @@ class Trainer:
         total_mae  = 0.0
         coral_sum = 0.0
         mil_sum   = 0.0
-        radial_sum = 0.0
         active_sum = 0.0
         age_sum    = 0.0
-        has_coral = has_mil = has_radial = False
+        has_coral = has_mil = False
         n = 0
         with torch.no_grad():
             for batch in self.val_loader:
@@ -208,16 +193,12 @@ class Trainer:
                 targets = batch["age_ordinal"].to(self.device)
                 ages    = batch["age"].to(self.device)
 
-                nucleus = batch.get("nucleus")
-                if nucleus is not None:
-                    nucleus = nucleus.to(self.device)
-
                 metadata = batch.get("metadata")
                 if metadata is not None:
                     metadata = metadata.to(self.device)
 
                 out = self.model(images, metadata=metadata)
-                parts = self._loss_parts(out, targets, ages, nucleus)
+                parts = self._loss_parts(out, targets, ages)
                 pred_ages = self._predict_age(out)
 
                 bs = images.size(0)
@@ -228,8 +209,6 @@ class Trainer:
                 if "mil" in parts:
                     mil_sum += parts["mil"].item() * bs; has_mil = True
                     active_sum += (out["patch_probs"] > 0.5).sum(dim=1).float().sum().item()
-                if "mil_radial" in parts:
-                    radial_sum += parts["mil_radial"].item() * bs; has_radial = True
                 age_sum += ages.float().sum().item()
                 n += bs
 
@@ -240,8 +219,6 @@ class Trainer:
             self.last_val_metrics["mil_loss"] = mil_sum / denom
             self.last_val_metrics["mil_active"] = active_sum / denom
             self.last_val_metrics["mean_age"] = age_sum / denom
-        if has_radial:
-            self.last_val_metrics["mil_radial"] = radial_sum / denom
         return total_loss / denom, total_mae / denom
 
     # ------------------------------------------------------------------
@@ -281,21 +258,31 @@ class Trainer:
 
             self._log_epoch(epoch, train_loss, val_loss, val_mae, current_lr,
                             getattr(self, "last_val_metrics", None))
-            self.save_checkpoint(epoch, val_loss)
+            ckpt_path = self.save_checkpoint(epoch, val_loss)
 
             current = val_mae if metric_name == "val_mae" else val_loss
-            if current < best_metric - min_delta:
+            improved = current < best_metric - min_delta
+            if improved:
                 best_metric = current
                 patience_counter = 0
-                self._save_best_checkpoint(epoch, val_loss)
+                self._save_best_checkpoint(epoch, val_loss)   # copies epoch ckpt → best.pt
             else:
                 patience_counter += 1
-                if patience > 0 and patience_counter >= patience:
-                    self._log(
-                        f"Early stopping — brak poprawy {metric_name} przez {patience} epok "
-                        f"(best={best_metric:.4f})"
-                    )
-                    break
+
+            # Keep only best.pt — drop this epoch's checkpoint (best.pt already holds the
+            # best model). Stops the run dir ballooning (each checkpoint ~265 MB).
+            if getattr(self.cfg.training, "keep_only_best", True) and ckpt_path.name != "best.pt":
+                try:
+                    ckpt_path.unlink()
+                except OSError:
+                    pass
+
+            if not improved and patience > 0 and patience_counter >= patience:
+                self._log(
+                    f"Early stopping — brak poprawy {metric_name} przez {patience} epok "
+                    f"(best={best_metric:.4f})"
+                )
+                break
 
         self._log("Training complete")
 
@@ -364,7 +351,7 @@ class Trainer:
             line += f"  lr={lr:.2e}"
         # Section-B diagnostics (only present with the relevant heads active).
         if extra:
-            for key in ("coral_loss", "mil_loss", "mil_radial", "mil_active", "mean_age"):
+            for key in ("coral_loss", "mil_loss", "mil_active", "mean_age"):
                 if key in extra and extra[key] == extra[key]:   # skip NaN
                     line += f"  {key}={extra[key]:.4f}"
         self._log(line)
