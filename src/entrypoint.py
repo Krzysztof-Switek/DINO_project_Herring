@@ -54,13 +54,16 @@ def print_config_summary(cfg) -> None:
 def _build_loaders(cfg):
     from torch.utils.data import DataLoader
     from src.dataset import OtolithDataset
+    from src.utils import seed_worker, make_loader_generator
 
     kw = dict(
         batch_size=cfg.training.batch_size,
         num_workers=cfg.data.num_workers,
         pin_memory=True,
+        worker_init_fn=seed_worker,
     )
-    train_loader = DataLoader(OtolithDataset(cfg, split="train"), shuffle=True,  **kw)
+    train_loader = DataLoader(OtolithDataset(cfg, split="train"), shuffle=True,
+                              generator=make_loader_generator(cfg.project.seed), **kw)
     val_loader   = DataLoader(OtolithDataset(cfg, split="val"),   shuffle=False, **kw)
     test_loader  = DataLoader(OtolithDataset(cfg, split="test"),  shuffle=False, **kw)
     return train_loader, val_loader, test_loader
@@ -113,7 +116,10 @@ def run(argv: list[str] | None = None) -> int:
         print_config_summary(cfg)
         from src.model import OtolithModel
         from src.trainer import Trainer
+        from src.utils import seed_everything
 
+        # Seed BEFORE model init + loader build so the run is reproducible.
+        seed_everything(cfg.project.seed)
         train_loader, val_loader, _ = _build_loaders(cfg)
         trainer = Trainer(cfg, OtolithModel(cfg), train_loader, val_loader)
         trainer.fit()

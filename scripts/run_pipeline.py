@@ -166,7 +166,13 @@ def _step_train(cfg, labels_csv: Path) -> tuple[Path, list[dict]]:
     from src.dataset import OtolithDataset
     from src.model import OtolithModel
     from src.trainer import Trainer
+    from src.utils import seed_everything, seed_worker, make_loader_generator
     from torch.utils.data import DataLoader
+
+    # Reproducibility: seed BEFORE model init (fixes head weights) and before the
+    # DataLoader is built (fixes shuffle order). Without this two identical runs
+    # land on different checkpoints by chance — see 13.07_wnioski_TO_DO.md.
+    seed_everything(cfg.project.seed)
 
     cfg_copy = cfg.model_copy(deep=True)
     cfg_copy.data.labels_csv = str(labels_csv)
@@ -175,9 +181,12 @@ def _step_train(cfg, labels_csv: Path) -> tuple[Path, list[dict]]:
     val_ds = OtolithDataset(cfg_copy, split="val")
 
     train_loader = DataLoader(train_ds, batch_size=cfg.training.batch_size,
-                              shuffle=True, num_workers=cfg.data.num_workers)
+                              shuffle=True, num_workers=cfg.data.num_workers,
+                              worker_init_fn=seed_worker,
+                              generator=make_loader_generator(cfg.project.seed))
     val_loader = DataLoader(val_ds, batch_size=cfg.training.batch_size,
-                            shuffle=False, num_workers=cfg.data.num_workers)
+                            shuffle=False, num_workers=cfg.data.num_workers,
+                            worker_init_fn=seed_worker)
 
     model = OtolithModel(cfg_copy)
     trainer = Trainer(cfg_copy, model, train_loader, val_loader)
