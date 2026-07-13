@@ -125,7 +125,8 @@ def _parse_train_log(log_path: Path) -> list[dict]:
     )
     # Optional Section-B diagnostics (only present in newer logs / with the
     # relevant heads active) — parsed independently so older logs still work.
-    extra_keys = ("coral_loss", "mil_loss", "mil_active", "mean_age")
+    extra_keys = ("coral_loss", "mil_loss", "mil_active",
+                  "density_loss", "density_active", "mean_age")
     extra_pat = {k: re.compile(rf"{k}=([\d.eE+-]+)") for k in extra_keys}
     rows: list[dict] = []
     try:
@@ -369,7 +370,12 @@ def _compute_axis_data_for_samples(
             img_pil = PILImage.open(img_path).convert("RGB")
             tensor = transform(img_pil).unsqueeze(0).to(device)
             with torch.no_grad():
-                grid = compute_patch_importance(model, tensor).cpu().numpy()
+                # Localisation signal: prefer the DECOUPLED density map (Kierunek B) when
+                # the model has one, else the MIL / L2 importance map.
+                if getattr(model, "use_density_head", False) and hasattr(model, "density_head"):
+                    grid = model.get_density_probs(tensor).squeeze(0).cpu().numpy()
+                else:
+                    grid = compute_patch_importance(model, tensor).cpu().numpy()
             grids[iid] = grid
             # CORAL-head attributions (age verdict): Grad-CAM + CLS attention.
             # Both are internally defensive → None on failure (11.07 Punkt 7).
@@ -377,6 +383,12 @@ def _compute_axis_data_for_samples(
             _ca = compute_cls_attention(model, tensor)
             coral_gc_grid = _gc.cpu().numpy() if _gc is not None else None
             cls_attn_grid = _ca.cpu().numpy() if _ca is not None else None
+            # Keep the CLS panel from ever being blank: when true CLS attention is
+            # unavailable (fused attention), fall back to a labelled L2-norm proxy.
+            cls_is_fallback = cls_attn_grid is None
+            if cls_is_fallback:
+                cls_attn_grid = compute_patch_importance(
+                    model, tensor, method="patch_token_importance").cpu().numpy()
         except Exception as e:
             print(f"    [cards] błąd dla {iid}: {e}")
             continue
@@ -420,6 +432,7 @@ def _compute_axis_data_for_samples(
                 "mask": None, "axis_info": None,
                 "peak_indices": None, "line_xy": None, "profile_1d": None,
                 "coral_gradcam": coral_gc_grid, "cls_attention": cls_attn_grid,
+                "cls_is_fallback": cls_is_fallback,
             }
             continue
 
@@ -431,16 +444,19 @@ def _compute_axis_data_for_samples(
 
         # Multi-axis increment localisation with count = predicted_age (11.07 Punkt 7):
         # candidates from every ray + the top-`age` consensus increments on the axis.
-        from src.ring_extraction import select_increments
+        from src.ring_extraction import select_increments, extract_ring_curves
         increments = select_increments(
             grid, axis_info, int(row.get("predicted_age", 0)), H_img, W_img,
             min_distance=min_dist, prominence=prominence,
         )
+        # Ring CURVES from the probability map (drawn on the MIL/density card panel).
+        ring_curves = extract_ring_curves(grid, axis_info, H_img, W_img)
 
         # OpenCV reference (Kierunek A): downscaled image + axis + CLASSICAL intensity
         # profile along the axis (sampled from the original grayscale, not the model),
         # for the interactive report widget where a technician tunes classical detection.
         opencv_ref = None
+        classical_pts: list = []   # classical (OpenCV) peak positions on the axis — card cross-check
         try:
             import base64 as _b64
             import io as _io
@@ -461,6 +477,11 @@ def _compute_axis_data_for_samples(
             rng = float(prof.max() - prof.min())
             if rng > 1e-6:
                 prof = (prof - prof.min()) / rng
+            # Classical peaks on the intensity profile → axis pixel positions (model↔classic).
+            for _i in find_candidate_peaks(prof, min_dist, prominence):
+                _i = int(_i)
+                if 0 <= _i < len(line_xy):
+                    classical_pts.append((int(line_xy[_i][0]), int(line_xy[_i][1])))
             opencv_ref = {
                 "img": img_b64, "w": dw, "h": dh,
                 "line": line_disp,
@@ -483,11 +504,22 @@ def _compute_axis_data_for_samples(
             "opencv_ref":     opencv_ref,
             "coral_gradcam":  coral_gc_grid,
             "cls_attention":  cls_attn_grid,
+            "cls_is_fallback": cls_is_fallback,
+            "ring_curves":    ring_curves,
+            "classical_pts":  classical_pts,
         }
 
     total = len(samples)
-    print(f"    [cards] obliczono gridy dla {len(grids)}/{total} próbek "
-          f"(brak obrazu: {missing_images}, segmentacja nieudana: {failed_axes})")
+    summary_line = (f"[cards] {cond_dir.name}: gridy {len(grids)}/{total} "
+                    f"(brak obrazu: {missing_images}, segmentacja nieudana: {failed_axes})")
+    print(f"    {summary_line}")
+    # Persist card diagnostics to a file too — stdout is otherwise easily lost (13.07).
+    try:
+        diag_path = cond_dir.parent / "cards_diagnostics.txt"
+        with diag_path.open("a", encoding="utf-8") as _f:
+            _f.write(summary_line + "\n")
+    except OSError:
+        pass
     if len(grids) == 0 and total > 0:
         print(f"    [cards] OSTRZEŻENIE: 0/{total} próbek przetworzonych — "
               f"sprawdź --image-dir={image_dir}")
@@ -534,6 +566,39 @@ def _collect_candidate_overlays(output_dir: Path, cond_keys) -> dict[str, list[P
     return overlays
 
 
+def _localization_quality(axis_data: dict, samples: list[dict]) -> list[dict]:
+    """Per-sample localisation stats: model increments vs classical intensity peaks.
+
+    ``mean_dist_final_to_classical_px`` = mean over final increments of the distance to
+    the nearest classical (OpenCV) peak along the axis. Lower ⇒ the model's increments
+    sit on the same structures a technician's classical detector finds. ``None`` when a
+    side has no points. This is the quantitative localisation signal (not "na oko").
+    """
+    import numpy as np
+    by_id = {str(s["image_id"]): s for s in samples}
+    rows: list[dict] = []
+    for iid, d in axis_data.items():
+        s = by_id.get(iid, {})
+        finals = d.get("final_axis_pts") or []
+        classical = d.get("classical_pts") or []
+        mean_dist = None
+        if finals and classical:
+            fa = np.asarray(finals, dtype=np.float32)
+            ca = np.asarray(classical, dtype=np.float32)
+            dists = np.sqrt(((fa[:, None, :] - ca[None, :, :]) ** 2).sum(-1))   # (F, C)
+            mean_dist = round(float(dists.min(axis=1).mean()), 2)
+        rows.append({
+            "image_id": iid,
+            "true_age": int(s.get("age", 0)),
+            "predicted_age": int(s.get("predicted_age", 0)),
+            "n_final": len(finals),
+            "n_candidates": len(d.get("candidate_pts") or []),
+            "n_classical": len(classical),
+            "mean_dist_final_to_classical_px": mean_dist,
+        })
+    return rows
+
+
 def _step_cards(
     pred_csvs: dict[str, Path],
     cfg_emb,
@@ -556,6 +621,7 @@ def _step_cards(
     top_k_worst = cfg_emb.inference.increment_samples.top_k_worst
     cards: dict[str, list[Path]] = {"best": [], "worst": []}
     opencv_ref_all: dict = {}   # image_id → interactive OpenCV-reference data (Kierunek A)
+    loc_quality: dict[str, list] = {}   # cond_key → per-card localisation stats (Kierunek B)
 
     for cond_key, pred_csv in pred_csvs.items():
         if not Path(pred_csv).exists():
@@ -589,10 +655,34 @@ def _step_cards(
         cards["best"].extend(best_saved)
         cards["worst"].extend(worst_saved)
 
+        loc_quality[cond_key] = _localization_quality(axis_data, all_samples)
+
         for iid, d in axis_data.items():
             ref = d.get("opencv_ref")
             if ref and iid not in opencv_ref_all:
                 opencv_ref_all[iid] = ref
+
+    # Localisation-quality summary (Kierunek B) — quantitative, saved next to the report.
+    try:
+        import json
+        import numpy as np
+        summary: dict = {}
+        for ck, rows in loc_quality.items():
+            dists = [r["mean_dist_final_to_classical_px"] for r in rows
+                     if r["mean_dist_final_to_classical_px"] is not None]
+            summary[ck] = {
+                "n_cards": len(rows),
+                "mean_dist_final_to_classical_px": (round(float(np.mean(dists)), 2)
+                                                    if dists else None),
+                "mean_n_candidates": (round(float(np.mean([r["n_candidates"] for r in rows])), 2)
+                                      if rows else None),
+                "per_card": rows,
+            }
+        (output_dir / "localization_quality.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"  Localization quality: {output_dir / 'localization_quality.json'}")
+    except Exception as e:
+        print(f"    [cards] localization_quality błąd: {e}")
 
     return cards, opencv_ref_all
 
@@ -776,6 +866,11 @@ def main(argv: list[str] | None = None) -> None:
     base_cfg_path = Path(args.base_config)
     cfg_emb = load_merged_config(base_cfg_path, Path(args.config_embedded))
     cfg_notemb = load_merged_config(base_cfg_path, Path(args.config_not_embedded))
+
+    # Must run before the DINOv2 backbone is imported (torch.hub load in _step_train)
+    # so XFORMERS_DISABLED takes effect and true CLS attention can be captured.
+    from src.utils import configure_attention
+    configure_attention(cfg_emb.interpretation.disable_fused_attention)
 
     # --image-dir is authoritative for EVERY step (scan, train, inference, cards).
     # Without this, train/inference fall back to cfg.data.image_dir from the YAML

@@ -127,7 +127,7 @@ def collect_outputs(cfg, ckpt_path: Path, split: str):
                         batch_size=cfg.training.batch_size, shuffle=False,
                         num_workers=cfg.data.num_workers)
 
-    coral_chunks, patch_chunks, age_chunks, pred_chunks = [], [], [], []
+    coral_chunks, patch_chunks, age_chunks, pred_chunks, density_chunks = [], [], [], [], []
     with torch.no_grad():
         for batch in loader:
             images = batch["image"].to(device)
@@ -147,24 +147,28 @@ def collect_outputs(cfg, ckpt_path: Path, split: str):
 
             if "patch_probs" in out:
                 patch_chunks.append(out["patch_probs"].cpu().numpy())
+            if "density" in out:
+                density_chunks.append(out["density"].cpu().numpy())
 
             age_chunks.append(ages)
 
     coral = np.concatenate(coral_chunks) if coral_chunks else None
     patch = np.concatenate(patch_chunks) if patch_chunks else None
+    density = np.concatenate(density_chunks) if density_chunks else None
     ages = np.concatenate(age_chunks) if age_chunks else np.array([])
     preds = np.concatenate(pred_chunks) if pred_chunks else np.array([])
-    return coral, patch, ages, preds
+    return coral, patch, density, ages, preds
 
 
 def run_validation(cfg, ckpt_path: Path, split: str, threshold: float) -> dict:
     from src.report_common import compute_metrics
 
-    coral, patch, ages, preds = collect_outputs(cfg, ckpt_path, split)
+    coral, patch, density, ages, preds = collect_outputs(cfg, ckpt_path, split)
     report: dict = {
         "checkpoint": str(ckpt_path),
         "split": split,
         "head_type": cfg.model.head_type,
+        "use_density_head": bool(getattr(cfg.model, "use_density_head", False)),
         "n_samples": int(len(ages)),
     }
 
@@ -187,6 +191,16 @@ def run_validation(cfg, ckpt_path: Path, split: str, threshold: float) -> dict:
         stats["pass"] = (not np.isnan(corr)) and corr >= 0.5 and mae <= 2.0
         f11["stats"] = stats
     report["F11"] = f11
+
+    # --- F11d: decoupled density head — same #active≈age check on the density map ---
+    f11d: dict = {"applicable": density is not None}
+    if density is not None and len(ages) > 0:
+        stats = active_patch_stats(density, ages, threshold)
+        corr = stats["corr_nactive_age"]
+        mae = stats["mae_nactive_vs_age"]
+        stats["pass"] = (not np.isnan(corr)) and corr >= 0.5 and mae <= 2.0
+        f11d["stats"] = stats
+    report["F11d"] = f11d
     return report
 
 
@@ -232,6 +246,21 @@ def _print_report(r: dict) -> None:
               {a: round(v, 1) for a, v in s["mean_nactive_per_age"].items()})
         if tag == "WARN":
             print("         → rozważ strojenie mil_sparsity_weight (F11) po treningu.")
+
+    f11d = r.get("F11d", {"applicable": False})
+    print("\n[F11d] Density (odsprzęgnięta głowica Kierunku B) — #aktywnych vs wiek")
+    if not f11d["applicable"]:
+        print("  (brak głowicy density — ustaw model.use_density_head=true; pominięto)")
+    else:
+        s = f11d["stats"]
+        tag = "PASS" if s["pass"] else "WARN"
+        print(f"  [{tag}] corr(#aktywnych, wiek)={s['corr_nactive_age']:.3f}  "
+              f"MAE(#aktywnych vs wiek)={s['mae_nactive_vs_age']:.3f}  "
+              f"(próg prob>{s['threshold']})")
+        print(f"         soft-count(∫density): corr={s['corr_softcount_age']:.3f}  "
+              f"MAE={s['mae_softcount_vs_age']:.3f}  śr.#aktywnych={s['mean_nactive']:.2f}")
+        print("         śr. #aktywnych per wiek:",
+              {a: round(v, 1) for a, v in s["mean_nactive_per_age"].items()})
     print()
 
 

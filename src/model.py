@@ -112,6 +112,63 @@ def mil_count_loss(
     return (l_on + sparsity_weight * l_off).mean()
 
 
+def density_count_loss(
+    density: Tensor,
+    age: Tensor,
+    conc_weight: float = 1.0,
+    tv_weight: float = 0.0,
+) -> Tensor:
+    """Count-consistency loss for the decoupled density-map counting head (Kierunek B).
+
+    Weakly supervised by the count only (no point annotations), so it combines two
+    terms — the same lesson the MIL head taught us (a bare integral→count objective is
+    satisfied by a diffuse ~age/N micro-density that localises nothing):
+
+      * L_count = SmoothL1(Σ density, age)         — integral matches the count
+      * L_conc  = top-``⌈age⌉`` concentration       — the ``age`` strongest cells → 1,
+                  the rest → 0, so the density forms ``age`` localisable peaks
+
+    Args:
+        density     : (B, N) per-patch density ∈ [0, 1]
+        age         : (B,)   true integer ages (integral target + top-k count)
+        conc_weight : weight of the concentration term relative to the count term
+
+    Returns scalar loss. Meant to be computed on a STOP-GRADIENT input so it never
+    reshapes the shared backbone (age head stays safe).
+    """
+    count = density.sum(dim=1)                                        # (B,) integral
+    l_count = F.smooth_l1_loss(count, age.float())
+
+    B, N = density.shape
+    sorted_d, _ = torch.sort(density, dim=1, descending=True)         # (B, N) desc
+    ranks = torch.arange(N, device=density.device).unsqueeze(0)       # (1, N)
+    k = age.long().clamp(min=0, max=N).unsqueeze(1)                   # (B, 1) = ⌈age⌉ on
+    on = (ranks < k).float()
+    off = 1.0 - on
+    n_on = on.sum(dim=1).clamp(min=1.0)
+    n_off = off.sum(dim=1).clamp(min=1.0)
+    l_on = (((1.0 - sorted_d) ** 2) * on).sum(dim=1) / n_on
+    l_off = ((sorted_d ** 2) * off).sum(dim=1) / n_off
+    l_conc = (l_on + l_off).mean()
+    total = l_count + conc_weight * l_conc
+
+    # P2 spatial-coherence prior (off by default): total variation on the (Hp, Wp)
+    # density grid → coherent blobs instead of scattered noise, so peaks are localisable.
+    if tv_weight > 0.0 and hp_wp_square(N):
+        hp = int(round(N ** 0.5))
+        g = density.reshape(B, hp, hp)
+        tv = ((g[:, 1:, :] - g[:, :-1, :]).abs().mean()
+              + (g[:, :, 1:] - g[:, :, :-1]).abs().mean())
+        total = total + tv_weight * tv
+    return total
+
+
+def hp_wp_square(n: int) -> bool:
+    """True when ``n`` patches form a square grid (so a TV reshape is valid)."""
+    r = int(round(n ** 0.5))
+    return r * r == n
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -182,6 +239,18 @@ class OtolithModel(nn.Module):
                 nn.Linear(cfg.model.mil_hidden_dim, 1),
             )
 
+        # Decoupled density-map counting head (Kierunek B). Same per-patch MLP shape as
+        # the MIL head, but fed STOP-GRADIENT patch tokens in forward() so its loss never
+        # reshapes the backbone. Independent of head_type — can ride on top of coral/both.
+        self.use_density_head = bool(getattr(cfg.model, "use_density_head", False))
+        if self.use_density_head:
+            self.density_head = nn.Sequential(
+                nn.Linear(embed_dim, cfg.model.mil_hidden_dim),
+                nn.GELU(),
+                nn.Dropout(p=cfg.model.dropout),
+                nn.Linear(cfg.model.mil_hidden_dim, 1),
+            )
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -209,6 +278,14 @@ class OtolithModel(nn.Module):
             patch_probs  = torch.sigmoid(patch_logits)            # (B, N) ∈ [0,1]
             out["patch_probs"] = patch_probs
             out["patch_count"] = patch_probs.sum(dim=1)           # (B,)
+
+        if self.use_density_head:
+            # STOP-GRADIENT: detach patch tokens so the density loss updates only the
+            # density head, never the shared backbone (age head stays safe by design).
+            dens_logits = self.density_head(patches.detach()).squeeze(-1)   # (B, N)
+            density = torch.sigmoid(dens_logits)                            # (B, N) ∈ [0,1]
+            out["density"] = density
+            out["density_count"] = density.sum(dim=1)                       # (B,)
 
         return out
 
@@ -270,6 +347,23 @@ class OtolithModel(nn.Module):
         B, N = probs.shape
         H_p = W_p = int(N ** 0.5)
         return probs.reshape(B, H_p, W_p)
+
+    def get_density_probs(self, image: Tensor) -> Tensor:
+        """Decoupled density map as a spatial grid (B, H_p, W_p). No gradients.
+
+        This is the Kierunek B localisation signal (integral ≈ age). Raises if the
+        model was built without a density head.
+        """
+        if not hasattr(self, "density_head"):
+            raise RuntimeError(
+                "Model has no density head (model.use_density_head=false)"
+            )
+        with torch.no_grad():
+            out = self.forward(image)
+        density = out["density"]                       # (B, N)
+        B, N = density.shape
+        H_p = W_p = int(N ** 0.5)
+        return density.reshape(B, H_p, W_p)
 
     # ------------------------------------------------------------------
     # Backbone freeze control

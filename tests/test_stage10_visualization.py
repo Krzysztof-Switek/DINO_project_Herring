@@ -215,3 +215,22 @@ def test_draw_reasoning_card_two_head_bars():
         return int((np.abs(card.astype(int) - np.array(color)).sum(2) < 20).sum()) > 0
 
     assert _has(_HEAD_CORAL_BAR) and _has(_HEAD_MIL_BAR)
+
+
+def test_draw_reasoning_card_p0_enrichments():
+    """P0 (13.07): CLS-fallback label + ring curves + classical cross-check points render."""
+    from src.visualization import draw_reasoning_card
+    H, W = 120, 200
+    original = (np.random.rand(H, W, 3) * 255).astype(np.uint8)
+    mask, axis_info, line_xy, profile_1d, _ = _make_axis_payload(H, W)
+    grid = np.random.rand(8, 14).astype(np.float32)
+    ring = np.array([[W // 4, H // 2], [W // 3, H // 2 - 8],
+                     [W // 2, H // 2], [W // 3, H // 2 + 8]], dtype=np.int32)
+    card = draw_reasoning_card(
+        original_rgb=original, importance_grid=grid, predicted_age=2, true_age=2,
+        mask=mask, axis_info=axis_info, line_xy=line_xy, profile_1d=profile_1d,
+        final_axis_pts=[(W // 3, H // 2)], candidate_pts=[(W // 2, H // 2)], final_t=[0.4],
+        cls_attention=np.random.rand(8, 14).astype(np.float32), cls_is_fallback=True,
+        ring_curves=[ring], classical_pts=[(W // 3, H // 2), (W // 2, H // 2)],
+    )
+    assert card.ndim == 3 and card.shape[1] == 3 * W and card.shape[0] > 2 * H

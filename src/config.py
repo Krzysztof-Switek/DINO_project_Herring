@@ -26,6 +26,18 @@ class ModelConfig(BaseModel):
     mil_sparsity_weight: float = Field(1.0,  ge=0.0)  # off-region (background) term weight
     mil_hidden_dim:      int   = Field(64,   ge=1)
     coral_loss_weight:   float = Field(0.5,  ge=0.0)
+    # Kierunek B: decoupled density-map counting head (crowd-counting style). Reads
+    # backbone patch tokens with STOP-GRADIENT (.detach()), so its count-consistency
+    # loss can never flow into the backbone → the age (CORAL) head is safe by design
+    # (hard lesson from the radial-spread experiment). Localisation peaks come from
+    # the density map; integral(density) ≈ age. Off by default (age recipe untouched).
+    use_density_head:      bool  = False
+    density_count_weight:  float = Field(1.0, ge=0.0)  # weight of the density loss in the sum
+    density_conc_weight:   float = Field(1.0, ge=0.0)  # concentration term (breaks diffuse solution)
+    # P2: spatial-coherence (total-variation) prior on the density map — nudges peaks
+    # to be blob-like rather than salt-and-pepper (a safe proxy for the along-axis
+    # peak prior, which would need the reading axis at train time). 0 = off (default).
+    density_tv_weight:     float = Field(0.0, ge=0.0)
 
 
 class DataConfig(BaseModel):
@@ -71,6 +83,12 @@ class TrainingConfig(BaseModel):
     early_stopping_patience: int = Field(10, ge=0)
     early_stopping_metric: Literal["val_mae", "val_loss"] = "val_mae"
     early_stopping_min_delta: float = Field(0.001, ge=0.0)
+    # EMA smoothing of the monitored metric for model selection + early stopping.
+    # The raw per-epoch val_mae is noisy (chunky integer-difference metric), so
+    # best.pt otherwise lands on the single luckiest epoch (diagnosed 13.07). With
+    # ema > 0 the monitored value is smoothed as v_ema = ema*v + (1-ema)*v_ema, and
+    # best.pt / early-stop track v_ema. 0.0 = disabled (raw metric, old behaviour).
+    early_stopping_ema: float = Field(0.0, ge=0.0, le=1.0)
     device: str = "auto"
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
@@ -101,6 +119,12 @@ class InterpretationConfig(BaseModel):
     #   mil_patch_probs        — always the trained MIL patch probabilities (requires MIL head)
     method: Literal["auto", "patch_token_importance", "mil_patch_probs"] = "auto"
     heatmap_alpha: float = Field(0.5, ge=0.0, le=1.0)
+    # DINOv2 uses memory-efficient (xFormers) attention by default, which does NOT
+    # expose the softmax attention matrix → the CLS-attention card panel falls back
+    # to a labelled L2-norm proxy. Set true to force vanilla attention so true
+    # CLS→patch attention is captured (slower training/inference — read by the
+    # entry points BEFORE the backbone is imported, via XFORMERS_DISABLED).
+    disable_fused_attention: bool = False
 
 
 class CandidatesConfig(BaseModel):

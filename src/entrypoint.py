@@ -99,6 +99,10 @@ def run(argv: list[str] | None = None) -> int:
     from src.config import load_config
     cfg = load_config(args.config)
 
+    # Before any backbone import so XFORMERS_DISABLED can take effect (true CLS attention).
+    from src.utils import configure_attention
+    configure_attention(cfg.interpretation.disable_fused_attention)
+
     root    = PROJECT_ROOT
     out_dir = root / cfg.inference.output_dir
 

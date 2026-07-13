@@ -63,6 +63,19 @@ def make_loader_generator(seed: int = 42) -> torch.Generator:
     return g
 
 
+def configure_attention(disable_fused: bool) -> None:
+    """Optionally disable DINOv2's memory-efficient (xFormers) attention.
+
+    DINOv2 reads ``XFORMERS_DISABLED`` at import time; with fused attention the
+    softmax matrix is never materialised, so ``compute_cls_attention`` cannot hook
+    it (the CLS card panel then falls back to a labelled L2 proxy). Call this at the
+    very start of an entry point — BEFORE the backbone is imported/loaded — so the
+    setting takes effect. No-op when ``disable_fused`` is False.
+    """
+    if disable_fused:
+        os.environ["XFORMERS_DISABLED"] = "1"
+
+
 def resolve_device(device_str: str) -> torch.device:
     """Resolve 'auto' to the best available device (cuda > mps > cpu)."""
     if device_str == "auto":

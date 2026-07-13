@@ -414,3 +414,12 @@ def test_optimizer_has_discriminative_lr(tmp_path):
     assert len(groups) == 2
     lrs = sorted(g["lr"] for g in groups)
     assert lrs[0] < lrs[1]   # backbone_lr (lr * backbone_lr_mult) < head_lr
+
+
+def test_fit_ema_selection_runs_and_saves_best(tmp_path):
+    """early_stopping_ema>0 path (13.07): fit completes and writes best.pt via smoothed metric."""
+    trainer = _make_trainer(tmp_path, epochs=3)
+    trainer.cfg.training.early_stopping_ema = 0.5
+    trainer.fit()
+    assert (trainer.checkpoint_dir / "best.pt").exists()
+    assert "Training complete" in trainer.log_path.read_text(encoding="utf-8")

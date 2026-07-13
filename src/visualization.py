@@ -27,6 +27,7 @@ from src.interpretation import (
     apply_colormap_with_mask,
     importance_to_heatmap_2d,
 )
+from src.ring_extraction import draw_ring_curves
 
 # Colors (RGB)
 _AXIS_COLOR     = (255, 220, 0)     # yellow — measurement axis
@@ -288,6 +289,9 @@ _HEAD_CORAL_BAR = (30, 60, 130)  # granatowy — GŁOWICA WIEKU (CORAL)
 _HEAD_MIL_BAR = (150, 70, 20)    # ciemny pomarańcz — GŁOWICA LOKALIZACJI (MIL)
 
 
+_CLASSICAL_COLOR = (0, 255, 180)   # spring-green — classical (OpenCV) cross-check peaks
+
+
 def _draw_small_points(panel: np.ndarray, points, color, radius: int,
                        border: bool = False) -> None:
     """Draw small filled circles (no numbers) at (x, y) points (in place).
@@ -303,6 +307,18 @@ def _draw_small_points(panel: np.ndarray, points, color, radius: int,
         if border:
             cv2.circle(panel, (xi, yi), r + 1, (30, 30, 30), 1)
         cv2.circle(panel, (xi, yi), r, color, -1)
+
+
+def _draw_hollow_points(panel: np.ndarray, points, color, radius: int) -> None:
+    """Draw hollow rings at (x, y) points (in place) — classical cross-check markers.
+
+    Hollow so they read as a distinct overlay next to the filled model increments.
+    """
+    if not points:
+        return
+    r = max(3, int(radius))
+    for (x, y) in points:
+        cv2.circle(panel, (int(x), int(y)), r, color, max(1, r // 3))
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +341,9 @@ def draw_reasoning_card(
     final_t: Optional[list] = None,
     coral_gradcam: Optional[np.ndarray] = None,
     cls_attention: Optional[np.ndarray] = None,
+    cls_is_fallback: bool = False,
+    ring_curves: Optional[list] = None,
+    classical_pts: Optional[list] = None,
 ) -> np.ndarray:
     """Compose a 6-panel reasoning card (3 columns × 2 rows) — two rows = two heads.
 
@@ -387,6 +406,8 @@ def draw_reasoning_card(
 
     # ===== Rząd 2 — GŁOWICA LOKALIZACJI (MIL) =====
     panel4 = _heat_panel(importance_grid)   # mapa MIL (lub L2 gdy brak MIL)
+    if ring_curves:                          # krzywe pierścieni z mapy prawdopodobieństwa
+        draw_ring_curves(panel4, ring_curves, thickness=max(2, H // 300))
     # Panel 5 — kandydaci
     if axis_info is not None:
         panel5 = original_rgb.copy()
@@ -408,19 +429,27 @@ def draw_reasoning_card(
                                max(3, H // 110), border=True)
         elif line_xy is not None and len(dots_idx) > 0:
             _draw_numbered_dots(panel6, dots_idx, line_xy, dot_radius)
+        # Classical (OpenCV) cross-check peaks as hollow green rings — model vs classic.
+        if classical_pts:
+            _draw_hollow_points(panel6, classical_pts, _CLASSICAL_COLOR, max(3, H // 110))
     else:
         panel6 = _placeholder_panel(H, W, "Os niedostepna")
 
     # ===== Kompozycja 3×2: rząd 1 = CORAL (pasek granatowy), rząd 2 = MIL (pomarańcz) =====
+    cls_title = ("WIEK · proxy L2 patchy (CLS niedost.)" if cls_is_fallback
+                 else "WIEK · uwaga CLS (backbone)")
+    mil_title = "PRZYROSTY · mapa MIL + pierscienie" if ring_curves else "PRZYROSTY · mapa MIL"
+    final_title = (f"PRZYROSTY · finalne (N={n_final}) vs klasyka" if classical_pts
+                   else f"PRZYROSTY · finalne (N={n_final})")
     row1_titles = [
         "WIEK · Grad-CAM (co wplywa na wiek)",
-        "WIEK · uwaga CLS (backbone)",
+        cls_title,
         f"WIEK · werdykt = {int(predicted_age)}",
     ]
     row2_titles = [
-        "PRZYROSTY · mapa MIL",
+        mil_title,
         f"PRZYROSTY · kandydaci (N={n_cand})",
-        f"PRZYROSTY · finalne (N={n_final})",
+        final_title,
     ]
     row1 = np.concatenate(
         [_add_title(p, t, _HEAD_CORAL_BAR)
@@ -492,6 +521,9 @@ def save_reasoning_cards(
             final_t=axis.get("final_t"),
             coral_gradcam=axis.get("coral_gradcam"),
             cls_attention=axis.get("cls_attention"),
+            cls_is_fallback=axis.get("cls_is_fallback", False),
+            ring_curves=axis.get("ring_curves"),
+            classical_pts=axis.get("classical_pts"),
         )
 
         stem = Path(image_id).stem

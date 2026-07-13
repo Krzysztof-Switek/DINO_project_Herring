@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 
 from src.config import OtolithConfig
 from src.dataset import decode_age_ordinal
-from src.model import OtolithModel, mil_count_loss, ordinal_loss
+from src.model import OtolithModel, density_count_loss, mil_count_loss, ordinal_loss
 from src.utils import resolve_device  # re-exported for backwards compat
 
 
@@ -46,6 +46,9 @@ class Trainer:
         self.coral_w    = cfg.model.coral_loss_weight
         self.count_w    = cfg.model.mil_count_weight
         self.sparsity_w = cfg.model.mil_sparsity_weight
+        self.density_w      = getattr(cfg.model, "density_count_weight", 1.0)
+        self.density_conc_w = getattr(cfg.model, "density_conc_weight", 1.0)
+        self.density_tv_w   = getattr(cfg.model, "density_tv_weight", 0.0)
         self.last_val_metrics: dict = {}   # Section-B diagnostics from validate()
 
         self.optimizer = self._build_optimizer()
@@ -119,6 +122,12 @@ class Trainer:
             parts["mil"] = self.count_w * mil_count_loss(
                 out["patch_probs"], ages, self.sparsity_w
             )
+        if "density" in out:
+            # Computed on the STOP-GRADIENT density output → updates only the density
+            # head, never the backbone / CORAL / MIL (age head safe by construction).
+            parts["density"] = self.density_w * density_count_loss(
+                out["density"], ages, self.density_conc_w, self.density_tv_w
+            )
         if not parts:
             raise RuntimeError("Model produced no recognised head outputs")
         parts["total"] = torch.stack(list(parts.values())).sum()
@@ -185,7 +194,9 @@ class Trainer:
         mil_sum   = 0.0
         active_sum = 0.0
         age_sum    = 0.0
-        has_coral = has_mil = False
+        density_sum = 0.0
+        density_active_sum = 0.0
+        has_coral = has_mil = has_density = False
         n = 0
         with torch.no_grad():
             for batch in self.val_loader:
@@ -209,6 +220,9 @@ class Trainer:
                 if "mil" in parts:
                     mil_sum += parts["mil"].item() * bs; has_mil = True
                     active_sum += (out["patch_probs"] > 0.5).sum(dim=1).float().sum().item()
+                if "density" in parts:
+                    density_sum += parts["density"].item() * bs; has_density = True
+                    density_active_sum += (out["density"] > 0.5).sum(dim=1).float().sum().item()
                 age_sum += ages.float().sum().item()
                 n += bs
 
@@ -218,6 +232,10 @@ class Trainer:
         if has_mil:
             self.last_val_metrics["mil_loss"] = mil_sum / denom
             self.last_val_metrics["mil_active"] = active_sum / denom
+            self.last_val_metrics["mean_age"] = age_sum / denom
+        if has_density:
+            self.last_val_metrics["density_loss"] = density_sum / denom
+            self.last_val_metrics["density_active"] = density_active_sum / denom
             self.last_val_metrics["mean_age"] = age_sum / denom
         return total_loss / denom, total_mae / denom
 
@@ -240,7 +258,9 @@ class Trainer:
         patience = self.cfg.training.early_stopping_patience
         min_delta = self.cfg.training.early_stopping_min_delta
         metric_name = self.cfg.training.early_stopping_metric
+        ema_alpha = getattr(self.cfg.training, "early_stopping_ema", 0.0)
         best_metric = float("inf")
+        metric_ema: Optional[float] = None
         patience_counter = 0
 
         for epoch in range(1, self.cfg.training.epochs + 1):
@@ -260,7 +280,16 @@ class Trainer:
                             getattr(self, "last_val_metrics", None))
             ckpt_path = self.save_checkpoint(epoch, val_loss)
 
-            current = val_mae if metric_name == "val_mae" else val_loss
+            raw_metric = val_mae if metric_name == "val_mae" else val_loss
+            # Smooth the noisy monitored metric (raw val_mae is chunky) so best.pt and
+            # early stopping don't hinge on a single lucky epoch (13.07 diagnosis).
+            # ema_alpha == 0 → use the raw metric (previous behaviour).
+            if ema_alpha > 0.0 and raw_metric == raw_metric:   # skip NaN (no val loader)
+                metric_ema = (raw_metric if metric_ema is None
+                              else ema_alpha * raw_metric + (1.0 - ema_alpha) * metric_ema)
+                current = metric_ema
+            else:
+                current = raw_metric
             improved = current < best_metric - min_delta
             if improved:
                 best_metric = current
@@ -351,7 +380,8 @@ class Trainer:
             line += f"  lr={lr:.2e}"
         # Section-B diagnostics (only present with the relevant heads active).
         if extra:
-            for key in ("coral_loss", "mil_loss", "mil_active", "mean_age"):
+            for key in ("coral_loss", "mil_loss", "mil_active",
+                        "density_loss", "density_active", "mean_age"):
                 if key in extra and extra[key] == extra[key]:   # skip NaN
                     line += f"  {key}={extra[key]:.4f}"
         self._log(line)

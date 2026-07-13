@@ -413,3 +413,84 @@ def test_get_patch_probs_shape():
     probs = model.get_patch_probs(images)
     assert probs.shape == (1, 4, 4)
     assert ((probs >= 0) & (probs <= 1)).all()
+
+
+# ---------------------------------------------------------------------------
+# Kierunek B — decoupled density-map head (13.07)
+# ---------------------------------------------------------------------------
+
+class _GradPatchBackbone(nn.Module):
+    """Backbone whose patch tokens DEPEND on a real parameter, so a gradient CAN
+    reach the backbone unless it is explicitly stopped. Used to prove stop-gradient."""
+    embed_dim = 64
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(1, self.embed_dim)
+
+    def forward_features(self, x: Tensor) -> Dict:
+        B, C, H, W = x.shape
+        npatch = (H // 14) * (W // 14)
+        mean_val = x.mean(dim=(1, 2, 3), keepdim=True).reshape(B, 1)
+        feat = self.proj(mean_val)                                   # (B, D) depends on proj
+        patches = feat.unsqueeze(1).expand(B, npatch, self.embed_dim)
+        return {"x_norm_clstoken": feat, "x_norm_patchtokens": patches}
+
+
+def _make_density_model():
+    from src.config import OtolithConfig
+    from src.model import OtolithModel
+    cfg = OtolithConfig()
+    cfg.model.num_age_classes = 10
+    cfg.model.dropout = 0.0
+    cfg.model.head_type = "coral"          # isolate: only the density head reads patches
+    cfg.model.use_density_head = True
+    return OtolithModel(cfg, backbone=_GradPatchBackbone())
+
+
+def test_density_head_forward_keys_and_shape():
+    model = _make_density_model()
+    out = model(torch.randn(2, 3, 56, 56))
+    assert "density" in out and "density_count" in out
+    assert out["density"].shape[0] == 2
+    assert out["density_count"].shape == (2,)
+    # density ∈ [0, 1]
+    d = out["density"].detach()
+    assert float(d.min()) >= 0.0 and float(d.max()) <= 1.0
+
+
+def test_density_count_loss_positive_scalar_with_grad():
+    from src.model import density_count_loss
+    model = _make_density_model()
+    out = model(torch.randn(2, 3, 56, 56))
+    loss = density_count_loss(out["density"], torch.tensor([2, 4]), conc_weight=1.0)
+    assert loss.ndim == 0 and float(loss.detach()) >= 0.0
+    assert loss.requires_grad
+
+
+def test_density_head_stop_gradient_blocks_backbone():
+    """CRITICAL: density loss must NOT update the backbone (age head stays safe)."""
+    from src.model import density_count_loss
+    model = _make_density_model()
+    out = model(torch.randn(2, 3, 56, 56))
+    loss = density_count_loss(out["density"], torch.tensor([2, 4]), conc_weight=1.0)
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in model.backbone.parameters())
+    dh_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in model.density_head.parameters())
+    assert not bb_grad, "density loss leaked gradient into the backbone (stop-gradient broken)"
+    assert dh_grad, "density head received no gradient"
+
+
+def test_density_tv_prior_executes_and_nonnegative():
+    """P2: TV spatial-coherence prior path runs and only adds a non-negative term."""
+    from src.model import density_count_loss
+    model = _make_density_model()
+    out = model(torch.randn(2, 3, 56, 56))
+    ages = torch.tensor([2, 4])
+    base = density_count_loss(out["density"], ages, conc_weight=1.0, tv_weight=0.0)
+    with_tv = density_count_loss(out["density"], ages, conc_weight=1.0, tv_weight=1.0)
+    assert float(with_tv.detach()) >= float(base.detach())
+    assert with_tv.requires_grad
