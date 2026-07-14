@@ -1,15 +1,14 @@
 """Zbuduj komplet raportów z ISTNIEJĄCEGO checkpointu — bez treningu, bez kasowania.
 
-Użycie (jeden argument = katalog biegu, reszta wyliczana):
+Użycie jak w main.py: ustaw RUN_DIR w bloku KONFIGURACJA poniżej i uruchom (▶ w PyCharm
+albo `python scripts/report_from_checkpoint.py`). Nie podaje się nic w wierszu poleceń.
 
-    python scripts/report_from_checkpoint.py outputs/data/13.07
-
-To wystarczy. Skrypt sam ustala:
-  * checkpoint  = <run>/checkpoints/embedded/best.pt
-  * train.log   = <run>/logs/embedded/train.log
-  * labels      = <run>/data/labels_*.csv
+Skrypt sam ustala (z RUN_DIR):
+  * checkpoint  = <RUN_DIR>/checkpoints/embedded/best.pt
+  * train.log   = <RUN_DIR>/logs/embedded/train.log
+  * labels      = <RUN_DIR>/data/labels_*.csv
   * zdjęcia     = main.IMAGE_DIR (ta sama ścieżka co trening, wg LOCATION w main.py)
-  * wynik       = <run>_preview  (OBOK katalogu biegu, np. outputs/data/13.07_preview)
+  * wynik       = <RUN_DIR>_preview  (OBOK biegu, np. outputs/data/13.07_preview)
 
 Robi dokładnie to, co kroki 4–9 „normalnego" pipeline'u (`scripts/run_pipeline.py`) —
 woła TE SAME funkcje (`_step_infer`, `_step_cards`, `build_comparison_report`,
@@ -17,23 +16,31 @@ woła TE SAME funkcje (`_step_infer`, `_step_cards`, `build_comparison_report`,
 `localization_quality.json` i `pipeline_summary.json` są takie same jak na końcu
 zwykłego biegu. Pomija tylko skan + trening (bierze gotowy best.pt).
 
-Bezpieczne do uruchomienia W TRAKCIE trwającego treningu:
-  * pisze WYŁĄCZNIE do <run>_preview (osobny katalog),
-  * NIE kasuje niczego (żadnego rmtree — inaczej niż run_pipeline),
-  * z katalogu biegu tylko CZYTA best.pt / train.log / labels.
-(Szansa trafienia na wpół zapisany best.pt jest znikoma — pomijamy.)
-
-Opcjonalne nadpisania: --output-dir, --checkpoint, --image-dir, --device
-(np. --device cpu, gdy nie chcesz dzielić GPU z trwającym treningiem).
+Bezpieczne do uruchomienia W TRAKCIE trwającego treningu: pisze WYŁĄCZNIE do
+<RUN_DIR>_preview, NIE kasuje niczego (żadnego rmtree), z biegu tylko CZYTA.
 """
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# ============================================================
+# KONFIGURACJA — zmień tylko tutaj (jak w main.py)
+# ============================================================
+
+RUN_DIR = "outputs/data/13.07"   # katalog biegu (źródło best.pt / train.log / labels)
+
+DEVICE = None                    # None = z configu (auto → GPU) | "cpu" = nie dziel GPU z treningiem
+
+# Opcjonalne nadpisania — None = wylicz automatycznie z RUN_DIR:
+OUTPUT_DIR = None                # None → <RUN_DIR>_preview (obok biegu)
+CHECKPOINT = None                # None → <RUN_DIR>/checkpoints/embedded/best.pt
+IMAGE_DIR  = None                # None → main.IMAGE_DIR (ta sama ścieżka co trening)
+
+# ============================================================
 
 # Te same bloki, których używa run_pipeline w krokach 4–9 — zero własnej logiki raportu.
 from scripts.run_pipeline import (          # noqa: E402
@@ -51,49 +58,30 @@ from scripts.run_pipeline import (          # noqa: E402
 def _default_image_dir() -> str | None:
     """Ta sama ścieżka do zdjęć co trening — z main.py (LOCATION → serwer/lokalnie)."""
     try:
-        from main import IMAGE_DIR
-        return IMAGE_DIR
+        from main import IMAGE_DIR as MAIN_IMAGE_DIR
+        return MAIN_IMAGE_DIR
     except Exception:
         return None
-
-
-def _parse_args(argv=None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Raporty z istniejącego checkpointu (bez treningu, bez kasowania). "
-                    "Podaj tylko katalog biegu.")
-    p.add_argument("run_dir",
-                   help="Katalog biegu (np. outputs/data/13.07). Źródło best.pt/train.log/labels.")
-    p.add_argument("--output-dir", default=None,
-                   help="Katalog na raporty (domyślnie: <run_dir>_preview, obok biegu).")
-    p.add_argument("--checkpoint", default=None,
-                   help="Ścieżka do .pt (domyślnie <run_dir>/checkpoints/embedded/best.pt).")
-    p.add_argument("--image-dir", default=None,
-                   help="Katalog zdjęć (domyślnie main.IMAGE_DIR — jak w treningu).")
-    p.add_argument("--device", default=None, choices=["auto", "cpu", "cuda", "mps"],
-                   help="Wymuś urządzenie (np. cpu, by nie dzielić GPU z treningiem).")
-    return p.parse_args(argv)
 
 
 def _resolve(path: Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def main(argv=None) -> int:
-    args = _parse_args(argv)
-
-    run_dir = _resolve(Path(args.run_dir))
+def main() -> int:
+    run_dir = _resolve(Path(RUN_DIR))
     if not run_dir.is_dir():
-        print(f"[błąd] Katalog biegu nie istnieje: {run_dir}")
+        print(f"[błąd] Katalog biegu nie istnieje: {run_dir}  (popraw RUN_DIR)")
         return 1
 
-    # --- Wszystko wyliczane z run_dir ---
-    output_dir = _resolve(Path(args.output_dir)) if args.output_dir \
+    # --- Wszystko wyliczane z RUN_DIR (chyba że nadpisane w KONFIGURACJI) ---
+    output_dir = _resolve(Path(OUTPUT_DIR)) if OUTPUT_DIR \
         else run_dir.parent / f"{run_dir.name}_preview"
     if output_dir.resolve() == run_dir.resolve():
-        print("[błąd] --output-dir nie może być tym samym katalogiem co bieg.")
+        print("[błąd] OUTPUT_DIR nie może być tym samym katalogiem co bieg.")
         return 1
 
-    ckpt = _resolve(Path(args.checkpoint)) if args.checkpoint \
+    ckpt = _resolve(Path(CHECKPOINT)) if CHECKPOINT \
         else run_dir / "checkpoints" / "embedded" / "best.pt"
     if not ckpt.exists():
         print(f"[błąd] Nie znaleziono checkpointu: {ckpt}")
@@ -112,13 +100,13 @@ def main(argv=None) -> int:
 
     train_log = run_dir / "logs" / "embedded" / "train.log"
 
-    image_dir = args.image_dir or _default_image_dir()
+    image_dir = IMAGE_DIR or _default_image_dir()
     if not image_dir:
-        print("[błąd] Nie udało się ustalić --image-dir (brak main.IMAGE_DIR). Podaj --image-dir.")
+        print("[błąd] Nie udało się ustalić IMAGE_DIR (brak main.IMAGE_DIR). Ustaw IMAGE_DIR w KONFIGURACJI.")
         return 1
     if not Path(image_dir).is_dir():
         print(f"[błąd] Katalog zdjęć nie istnieje: {image_dir} "
-              f"(sprawdź LOCATION w main.py albo podaj --image-dir).")
+              f"(sprawdź LOCATION w main.py albo ustaw IMAGE_DIR).")
         return 1
 
     # --- Config: dokładnie jak run_pipeline (merge base + embedded override) ---
@@ -127,8 +115,8 @@ def main(argv=None) -> int:
         PROJECT_ROOT / "configs" / "config_embedded.yaml",
     )
     cfg.data.image_dir = str(image_dir)
-    if args.device:
-        cfg.training.device = args.device
+    if DEVICE:
+        cfg.training.device = DEVICE
     cfg.training.checkpoint_dir = str((output_dir / "checkpoints" / "embedded").resolve())
     cfg.training.log_dir = str((output_dir / "logs" / "embedded").resolve())
 
