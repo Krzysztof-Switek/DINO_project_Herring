@@ -379,8 +379,16 @@ def draw_reasoning_card(
         dots_idx = np.clip(
             np.array([int(round(t * (n - 1))) for t in final_t], dtype=int), 0, n - 1)
 
-    def _heat_panel(grid) -> np.ndarray:
-        hm = importance_to_heatmap_2d(grid, H, W)
+    def _heat_panel(grid, robust: bool = False) -> np.ndarray:
+        g = grid
+        if robust and grid is not None:
+            # Utnij pojedynczy dominujący patch (artefakt wysokiej normy), inaczej globalna
+            # normalizacja czyni resztę mapy czarną — mimo że struktura tam jest (widać w kandydatach).
+            arr = np.asarray(grid, dtype=np.float32)
+            hi = float(np.percentile(arr, 99.0))
+            if hi > float(arr.min()):
+                g = np.clip(arr, None, hi)
+        hm = importance_to_heatmap_2d(g, H, W)
         panel = apply_colormap_with_mask(hm, original_rgb, mask=mask, alpha=0.55,
                                          colormap=DEFAULT_COLORMAP)
         _draw_colorbar(panel)
@@ -405,9 +413,10 @@ def draw_reasoning_card(
     frame_color = _OK_FRAME if int(predicted_age) == int(true_age) else _BAD_FRAME
     cv2.rectangle(panel3, (0, 0), (W - 1, H - 1), frame_color, max(3, line_thickness * 2))
 
-    # ===== Rząd 2 — GŁOWICA LOKALIZACJI (MIL) =====
-    panel4 = _heat_panel(importance_grid)   # mapa MIL (lub L2 gdy brak MIL)
-    if ring_curves:                          # krzywe pierścieni z mapy prawdopodobieństwa
+    # ===== Rząd 2 — GŁOWICA LOKALIZACJI (density) =====
+    has_rings = bool(ring_curves) and len(ring_curves) >= 2   # 1 „pierścień" = zwykle artefakt konturu
+    panel4 = _heat_panel(importance_grid, robust=True)   # mapa density (odporna na dominujący outlier)
+    if has_rings:                            # krzywe pierścieni tylko gdy jest ich sensowny zestaw
         draw_ring_curves(panel4, ring_curves, thickness=max(2, H // 300))
     # Panel 5 — kandydaci
     if axis_info is not None:
@@ -436,21 +445,27 @@ def draw_reasoning_card(
     else:
         panel6 = _placeholder_panel(H, W, "Os niedostepna")
 
-    # ===== Kompozycja 3×2: rząd 1 = CORAL (pasek granatowy), rząd 2 = MIL (pomarańcz) =====
+    # ===== Kompozycja 3×2: rząd 1 = GŁOWICA WIEKU (CORAL), rząd 2 = GŁOWICA LOKALIZACJI (density) =====
     # ASCII "-" jako separator — cv2 (Hershey) NIE renderuje "·" i pokazuje "??".
-    cls_title = ("WIEK - proxy L2 patchy (CLS niedost.)" if cls_is_fallback
-                 else "WIEK - uwaga CLS (backbone)")
-    mil_title = "PRZYROSTY - mapa MIL + pierscienie" if ring_curves else "PRZYROSTY - mapa MIL"
-    final_title = (f"PRZYROSTY - finalne (N={n_final}) vs klasyka" if classical_pts
-                   else f"PRZYROSTY - finalne (N={n_final})")
+    # Nazwa głowicy w każdym tytule (CORAL / density) — jasne, która głowica daje który obraz.
+    gc_flat = (coral_gradcam is not None and
+               float(np.ptp(np.asarray(coral_gradcam, dtype=np.float32))) < 1e-6)
+    gradcam_title = ("WIEK (CORAL) - Grad-CAM (plaski/nieinform.)" if gc_flat
+                     else "WIEK (CORAL) - Grad-CAM (co wplywa na wiek)")
+    cls_title = ("WIEK (CORAL) - proxy L2 (CLS niedost.)" if cls_is_fallback
+                 else "WIEK (CORAL) - uwaga CLS")
+    mil_title = ("PRZYROSTY (density) - mapa + pierscienie" if has_rings
+                 else "PRZYROSTY (density) - mapa")
+    final_title = (f"PRZYROSTY (density) - finalne (N={n_final}) vs klasyka" if classical_pts
+                   else f"PRZYROSTY (density) - finalne (N={n_final})")
     row1_titles = [
-        "WIEK - Grad-CAM (co wplywa na wiek)",
+        gradcam_title,
         cls_title,
-        f"WIEK - werdykt = {int(predicted_age)}",
+        f"WIEK (CORAL) - werdykt = {int(predicted_age)}",
     ]
     row2_titles = [
         mil_title,
-        f"PRZYROSTY - kandydaci (N={n_cand})",
+        f"PRZYROSTY (density) - kandydaci (N={n_cand})",
         final_title,
     ]
     row1 = np.concatenate(
