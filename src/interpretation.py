@@ -133,6 +133,13 @@ def compute_cls_attention(
         attn_drop = backbone.blocks[-1].attn.attn_drop
     except (AttributeError, IndexError, TypeError):
         return None
+    # Some DINOv2 builds use fused attention (PyTorch SDPA / xFormers) and keep
+    # ``attn_drop`` as a plain float (the dropout probability) with NO attention matrix
+    # to hook. Guard so we return None gracefully instead of raising
+    # "'float' object has no attribute 'register_forward_hook'" — which otherwise
+    # propagates and skips the WHOLE reasoning card (diagnosed on the 14.07 preview).
+    if not hasattr(attn_drop, "register_forward_hook"):
+        return None
 
     captured: Dict[str, Tensor] = {}
 
@@ -140,7 +147,10 @@ def compute_cls_attention(
         if inp and torch.is_tensor(inp[0]):
             captured["a"] = inp[0].detach()
 
-    handle = attn_drop.register_forward_hook(_hook)
+    try:
+        handle = attn_drop.register_forward_hook(_hook)
+    except Exception:
+        return None
     try:
         device = next(model.parameters()).device
         model.eval()

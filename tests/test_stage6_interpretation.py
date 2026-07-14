@@ -412,3 +412,18 @@ def test_importance_patch_token_method_returns_grid():
         model, _make_single_image_tensor(), method="patch_token_importance"
     )
     assert imp.dim() == 2
+
+
+def test_cls_attention_returns_none_for_float_attn_drop():
+    """Fused-attention DINOv2 (SDPA) keeps attn_drop as a float — must return None, NOT crash.
+
+    Regression for the 14.07 preview: register_forward_hook on a float raised
+    'float' object has no attribute ... and skipped every reasoning card.
+    """
+    import types
+    import torch
+    from src.interpretation import compute_cls_attention
+    fake_block = types.SimpleNamespace(attn=types.SimpleNamespace(attn_drop=0.0))
+    fake_model = types.SimpleNamespace(backbone=types.SimpleNamespace(blocks=[fake_block]))
+    out = compute_cls_attention(fake_model, torch.zeros(1, 3, 28, 28))
+    assert out is None

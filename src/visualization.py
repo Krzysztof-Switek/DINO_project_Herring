@@ -128,7 +128,8 @@ def _add_title(img: np.ndarray, title: str, bar_color=None) -> np.ndarray:
 def _placeholder_panel(H: int, W: int, message: str) -> np.ndarray:
     """Solid dark panel with red error text — used when a step's data is unavailable."""
     panel = np.full((H, W, 3), _PLACEHOLDER_BG, dtype=np.uint8)
-    font_scale = max(0.5, H / 480.0)
+    # Shrink to fit the panel width so the text never spills into the neighbouring panel.
+    font_scale = _fit_font_scale(message, W - 16, max(0.5, H / 480.0))
     thickness = max(1, int(font_scale * 2))
     (tw, th), _ = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
     tx = max(8, (W - tw) // 2)
@@ -436,19 +437,20 @@ def draw_reasoning_card(
         panel6 = _placeholder_panel(H, W, "Os niedostepna")
 
     # ===== Kompozycja 3×2: rząd 1 = CORAL (pasek granatowy), rząd 2 = MIL (pomarańcz) =====
-    cls_title = ("WIEK · proxy L2 patchy (CLS niedost.)" if cls_is_fallback
-                 else "WIEK · uwaga CLS (backbone)")
-    mil_title = "PRZYROSTY · mapa MIL + pierscienie" if ring_curves else "PRZYROSTY · mapa MIL"
-    final_title = (f"PRZYROSTY · finalne (N={n_final}) vs klasyka" if classical_pts
-                   else f"PRZYROSTY · finalne (N={n_final})")
+    # ASCII "-" jako separator — cv2 (Hershey) NIE renderuje "·" i pokazuje "??".
+    cls_title = ("WIEK - proxy L2 patchy (CLS niedost.)" if cls_is_fallback
+                 else "WIEK - uwaga CLS (backbone)")
+    mil_title = "PRZYROSTY - mapa MIL + pierscienie" if ring_curves else "PRZYROSTY - mapa MIL"
+    final_title = (f"PRZYROSTY - finalne (N={n_final}) vs klasyka" if classical_pts
+                   else f"PRZYROSTY - finalne (N={n_final})")
     row1_titles = [
-        "WIEK · Grad-CAM (co wplywa na wiek)",
+        "WIEK - Grad-CAM (co wplywa na wiek)",
         cls_title,
-        f"WIEK · werdykt = {int(predicted_age)}",
+        f"WIEK - werdykt = {int(predicted_age)}",
     ]
     row2_titles = [
         mil_title,
-        f"PRZYROSTY · kandydaci (N={n_cand})",
+        f"PRZYROSTY - kandydaci (N={n_cand})",
         final_title,
     ]
     row1 = np.concatenate(
