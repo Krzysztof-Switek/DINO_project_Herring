@@ -1,39 +1,30 @@
 """Zbuduj komplet raportów z ISTNIEJĄCEGO checkpointu — bez treningu, bez kasowania.
 
-Robi dokładnie to, co kroki 4–9 „normalnego" pipeline'u (`scripts/run_pipeline.py`),
-ale START-uje od gotowego `best.pt` i pomija skan + trening. Woła **te same funkcje**
-co pipeline (`_step_infer`, `_step_cards`, `build_comparison_report`,
+Użycie (jeden argument = katalog biegu, reszta wyliczana):
+
+    python scripts/report_from_checkpoint.py outputs/data/13.07
+
+To wystarczy. Skrypt sam ustala:
+  * checkpoint  = <run>/checkpoints/embedded/best.pt
+  * train.log   = <run>/logs/embedded/train.log
+  * labels      = <run>/data/labels_*.csv
+  * zdjęcia     = main.IMAGE_DIR (ta sama ścieżka co trening, wg LOCATION w main.py)
+  * wynik       = <run>_preview  (OBOK katalogu biegu, np. outputs/data/13.07_preview)
+
+Robi dokładnie to, co kroki 4–9 „normalnego" pipeline'u (`scripts/run_pipeline.py`) —
+woła TE SAME funkcje (`_step_infer`, `_step_cards`, `build_comparison_report`,
 `_write_pipeline_summary`), więc predykcje, karty, `comparison_report.html`,
-`localization_quality.json` i `pipeline_summary.json` są takie same, jak na końcu
-zwykłego biegu. NIE reimplementuje nic osobno.
+`localization_quality.json` i `pipeline_summary.json` są takie same jak na końcu
+zwykłego biegu. Pomija tylko skan + trening (bierze gotowy best.pt).
 
-Bezpieczeństwo (można uruchomić W TRAKCIE trwającego treningu):
-  * pisze WYŁĄCZNIE do --output-dir (osobny katalog),
-  * z katalogu treningu tylko CZYTA best.pt / train.log / labels_*.csv,
-  * NIE robi żadnego rmtree / czyszczenia (w przeciwieństwie do run_pipeline).
+Bezpieczne do uruchomienia W TRAKCIE trwającego treningu:
+  * pisze WYŁĄCZNIE do <run>_preview (osobny katalog),
+  * NIE kasuje niczego (żadnego rmtree — inaczej niż run_pipeline),
+  * z katalogu biegu tylko CZYTA best.pt / train.log / labels.
+(Szansa trafienia na wpół zapisany best.pt jest znikoma — pomijamy.)
 
-Uwaga o wyścigu: `best.pt` jest nadpisywany, gdy trening trafi lepszą epokę. Żeby na
-pewno nie wczytać na wpół zapisanego pliku podczas treningu, skopiuj go najpierw i wskaż
-kopię przez --checkpoint:
-    cp outputs/data/13.07/checkpoints/embedded/best.pt ~/best_13.07.pt
-
-Uwaga o GPU: uruchomiony w trakcie treningu dzieli GPU z treningiem (może zwolnić oba
-albo zabraknąć pamięci). Do podglądu można wymusić CPU przez --device cpu.
-
-Przykłady:
-    # podgląd w trakcie treningu (osobny katalog, kopia checkpointu, CPU):
-    python scripts/report_from_checkpoint.py \\
-        --run-dir  outputs/data/13.07 \\
-        --checkpoint ~/best_13.07.pt \\
-        --output-dir outputs/data/13.07_preview \\
-        --image-dir /home/kswitek/Documents/Photo/Otolithes/HER/Processed \\
-        --device cpu
-
-    # po zakończeniu/przerwaniu treningu (użyj best.pt z katalogu biegu):
-    python scripts/report_from_checkpoint.py \\
-        --run-dir  outputs/data/13.07 \\
-        --output-dir outputs/data/13.07_report \\
-        --image-dir /home/kswitek/Documents/Photo/Otolithes/HER/Processed
+Opcjonalne nadpisania: --output-dir, --checkpoint, --image-dir, --device
+(np. --device cpu, gdy nie chcesz dzielić GPU z trwającym treningiem).
 """
 from __future__ import annotations
 
@@ -57,25 +48,29 @@ from scripts.run_pipeline import (          # noqa: E402
 )
 
 
+def _default_image_dir() -> str | None:
+    """Ta sama ścieżka do zdjęć co trening — z main.py (LOCATION → serwer/lokalnie)."""
+    try:
+        from main import IMAGE_DIR
+        return IMAGE_DIR
+    except Exception:
+        return None
+
+
 def _parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Raporty z istniejącego checkpointu (bez treningu, bez kasowania)")
-    p.add_argument("--run-dir", required=True,
-                   help="Katalog trwającego/zakończonego biegu (źródło best.pt, train.log, labels)")
+        description="Raporty z istniejącego checkpointu (bez treningu, bez kasowania). "
+                    "Podaj tylko katalog biegu.")
+    p.add_argument("run_dir",
+                   help="Katalog biegu (np. outputs/data/13.07). Źródło best.pt/train.log/labels.")
     p.add_argument("--output-dir", default=None,
-                   help="Katalog na raporty (domyślnie: <run-dir>_report). MUSI być inny niż run-dir.")
+                   help="Katalog na raporty (domyślnie: <run_dir>_preview, obok biegu).")
     p.add_argument("--checkpoint", default=None,
-                   help="Ścieżka do .pt (domyślnie <run-dir>/checkpoints/embedded/best.pt). "
-                        "W trakcie treningu wskaż KOPIĘ, by nie trafić na wpół zapisany plik.")
-    p.add_argument("--image-dir", required=True,
-                   help="Katalog oryginalnych zdjęć (do inferencji/kart) — jak w treningu")
-    p.add_argument("--base-config", default=str(PROJECT_ROOT / "configs" / "config.yaml"))
-    p.add_argument("--config-embedded", default=str(PROJECT_ROOT / "configs" / "config_embedded.yaml"),
-                   dest="config_embedded")
-    p.add_argument("--labels-dir", default=None,
-                   help="Katalog z labels_*.csv (domyślnie <run-dir>/data, fallback: <project>/data)")
+                   help="Ścieżka do .pt (domyślnie <run_dir>/checkpoints/embedded/best.pt).")
+    p.add_argument("--image-dir", default=None,
+                   help="Katalog zdjęć (domyślnie main.IMAGE_DIR — jak w treningu).")
     p.add_argument("--device", default=None, choices=["auto", "cpu", "cuda", "mps"],
-                   help="Wymuś urządzenie (np. cpu, gdy trening zajmuje GPU). Domyślnie z configu.")
+                   help="Wymuś urządzenie (np. cpu, by nie dzielić GPU z treningiem).")
     return p.parse_args(argv)
 
 
@@ -87,54 +82,68 @@ def main(argv=None) -> int:
     args = _parse_args(argv)
 
     run_dir = _resolve(Path(args.run_dir))
-    output_dir = _resolve(Path(args.output_dir)) if args.output_dir else run_dir.parent / f"{run_dir.name}_report"
-    if output_dir.resolve() == run_dir.resolve():
-        print("[błąd] --output-dir nie może być tym samym katalogiem co --run-dir "
-              "(chronimy trening przed nadpisaniem).")
+    if not run_dir.is_dir():
+        print(f"[błąd] Katalog biegu nie istnieje: {run_dir}")
         return 1
 
-    ckpt = _resolve(Path(args.checkpoint)) if args.checkpoint else \
-        run_dir / "checkpoints" / "embedded" / "best.pt"
+    # --- Wszystko wyliczane z run_dir ---
+    output_dir = _resolve(Path(args.output_dir)) if args.output_dir \
+        else run_dir.parent / f"{run_dir.name}_preview"
+    if output_dir.resolve() == run_dir.resolve():
+        print("[błąd] --output-dir nie może być tym samym katalogiem co bieg.")
+        return 1
+
+    ckpt = _resolve(Path(args.checkpoint)) if args.checkpoint \
+        else run_dir / "checkpoints" / "embedded" / "best.pt"
     if not ckpt.exists():
         print(f"[błąd] Nie znaleziono checkpointu: {ckpt}")
         return 1
 
-    labels_dir = _resolve(Path(args.labels_dir)) if args.labels_dir else run_dir / "data"
-    emb_labels = labels_dir / "labels_embedded.csv"
-    combined_labels = labels_dir / "labels_combined.csv"
-    if not emb_labels.exists():
-        # fallback: kanoniczny katalog projektu
+    emb_labels = run_dir / "data" / "labels_embedded.csv"
+    combined_labels = run_dir / "data" / "labels_combined.csv"
+    if not emb_labels.exists():                       # fallback: kanoniczny <project>/data
         alt = PROJECT_ROOT / "data" / "labels_embedded.csv"
         if alt.exists():
             emb_labels = alt
             combined_labels = PROJECT_ROOT / "data" / "labels_combined.csv"
         else:
-            print(f"[błąd] Brak labels_embedded.csv w {labels_dir} ani w <project>/data.")
+            print(f"[błąd] Brak labels_embedded.csv w {run_dir / 'data'} ani w <project>/data.")
             return 1
 
     train_log = run_dir / "logs" / "embedded" / "train.log"
 
+    image_dir = args.image_dir or _default_image_dir()
+    if not image_dir:
+        print("[błąd] Nie udało się ustalić --image-dir (brak main.IMAGE_DIR). Podaj --image-dir.")
+        return 1
+    if not Path(image_dir).is_dir():
+        print(f"[błąd] Katalog zdjęć nie istnieje: {image_dir} "
+              f"(sprawdź LOCATION w main.py albo podaj --image-dir).")
+        return 1
+
     # --- Config: dokładnie jak run_pipeline (merge base + embedded override) ---
-    cfg = load_merged_config(Path(args.base_config), Path(args.config_embedded))
-    cfg.data.image_dir = args.image_dir              # autorytatywne dla inferencji/kart
+    cfg = load_merged_config(
+        PROJECT_ROOT / "configs" / "config.yaml",
+        PROJECT_ROOT / "configs" / "config_embedded.yaml",
+    )
+    cfg.data.image_dir = str(image_dir)
     if args.device:
         cfg.training.device = args.device
-    # Katalogi checkpointów/logów wskazujemy na OUTPUT (nie używane do zapisu tu, ale spójnie).
     cfg.training.checkpoint_dir = str((output_dir / "checkpoints" / "embedded").resolve())
     cfg.training.log_dir = str((output_dir / "logs" / "embedded").resolve())
 
-    # Prawdziwa uwaga CLS na kartach — musi paść PRZED importem backbone (jak w pipeline).
+    # Prawdziwa uwaga CLS na kartach — PRZED importem backbone (jak w pipeline).
     from src.utils import configure_attention
     configure_attention(cfg.interpretation.disable_fused_attention)
 
-    output_dir.mkdir(parents=True, exist_ok=True)    # NIE kasujemy niczego
+    output_dir.mkdir(parents=True, exist_ok=True)     # NIE kasujemy niczego
     print("=" * 60)
     print("RAPORT Z CHECKPOINTU (bez treningu, bez kasowania)")
+    print(f"  bieg       : {run_dir}")
     print(f"  checkpoint : {ckpt}")
-    print(f"  labels     : {emb_labels}")
-    print(f"  train.log  : {train_log}  ({'jest' if train_log.exists() else 'BRAK → Sekcja B pusta'})")
-    print(f"  image-dir  : {cfg.data.image_dir}")
-    print(f"  output     : {output_dir}")
+    print(f"  train.log  : {'jest' if train_log.exists() else 'BRAK → Sekcja B pusta'}")
+    print(f"  zdjęcia    : {cfg.data.image_dir}")
+    print(f"  wynik      : {output_dir}")
     print(f"  device     : {cfg.training.device}")
     print("=" * 60)
 
@@ -162,8 +171,7 @@ def main(argv=None) -> int:
             results_dfs[ck] = df
         else:
             results_dfs[ck] = None
-    logs_emb = _parse_train_log(train_log)
-    training_logs = {"embedded": logs_emb, "not_embedded": []}
+    training_logs = {"embedded": _parse_train_log(train_log), "not_embedded": []}
 
     # --- Krok 9: raport porównawczy (ten sam build_comparison_report) ---
     print("\n[3/4] REPORT — raport porównawczy")
@@ -197,7 +205,7 @@ def main(argv=None) -> int:
         output_dir=output_dir,
         training_logs=training_logs,
         results_dfs=results_dfs,
-        completed_steps=["infer_ee", "cards", "report"],   # bez scan/train — to raport z checkpointu
+        completed_steps=["infer_ee", "cards", "report"],   # bez scan/train — raport z checkpointu
     )
 
     print("\n=== Gotowe ===")
