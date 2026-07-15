@@ -234,3 +234,55 @@ def test_draw_reasoning_card_p0_enrichments():
         ring_curves=[ring], classical_pts=[(W // 3, H // 2), (W // 2, H // 2)],
     )
     assert card.ndim == 3 and card.shape[1] == 3 * W and card.shape[0] > 2 * H
+
+
+def test_classical_increments_multi_ray_on_gray():
+    """classical_increments (E1): piki intensywności na tych samych 48 promieniach; graceful bez osi."""
+    import numpy as np
+    from src.ring_extraction import classical_increments
+    H, W = 120, 200
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    cx, cy = axis_info["centroid"]
+    yy, xx = np.mgrid[0:H, 0:W]
+    r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    gray = (128 + 100 * np.cos(r / 6.0)).astype(np.float32)   # koncentryczne pierścienie
+    out = classical_increments(gray, axis_info, smooth_sigma=0.0, prominence=0.02, min_distance=1)
+    assert len(out["candidate_pts"]) > 0
+    assert all(len(t) == 3 for t in out["clusters"])          # (mean_t, support, mean_strength)
+    assert classical_increments(gray, None)["candidate_pts"] == []   # bez osi → pusto, bez crasha
+
+
+def test_density_peaks_shape():
+    import numpy as np
+    from src.ring_extraction import density_peaks
+    H, W = 120, 200
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    grid = np.random.rand(8, 14).astype(np.float32)
+    peaks, cand = density_peaks(grid, axis_info, H, W)
+    assert isinstance(peaks, list) and isinstance(cand, list)
+    if peaks:
+        assert len(peaks[0]) == 4          # (t, strength, x, y)
+
+
+def test_fuse_increments_three_methods():
+    """fuse_increments: density/classical/consensus → <= age finals; consensus preferuje zgodność."""
+    from src.ring_extraction import fuse_increments
+    H, W = 120, 200
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    cx, cy = axis_info["centroid"]
+    fx, fy = axis_info["far_edge"]
+
+    def pk(t):
+        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)))
+
+    density = [pk(0.30), pk(0.31), pk(0.60), pk(0.61)]
+    classical = [pk(0.29), pk(0.30), pk(0.60), pk(0.90), pk(0.91)]
+    for m in ("density", "classical", "consensus"):
+        out = fuse_increments(density, classical, 2, axis_info, method=m)
+        assert len(out["final_t"]) <= 2
+        assert len(out["final_axis_pts"]) == len(out["final_t"])
+    ts = fuse_increments(density, classical, 2, axis_info, method="consensus")["final_t"]
+    assert len(ts) == 2
+    assert min(abs(t - 0.30) for t in ts) < 0.05
+    assert min(abs(t - 0.60) for t in ts) < 0.05          # 0.9 (tylko klasyka) NIE wybrane
+    assert fuse_increments(density, classical, 2, None, method="consensus")["final_t"] == []

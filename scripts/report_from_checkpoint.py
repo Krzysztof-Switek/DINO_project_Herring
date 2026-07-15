@@ -49,8 +49,6 @@ from scripts.run_pipeline import (          # noqa: E402
     _step_infer,
     _step_cards,
     _compute_dataset_stats,
-    _collect_candidate_overlays,
-    _build_split_lookup,
     _write_pipeline_summary,
 )
 
@@ -145,7 +143,7 @@ def main() -> int:
     # --- Krok 8: karty rozumowania (ten sam _step_cards) ---
     print("\n[2/4] CARDS — karty rozumowania")
     cond_models = {cond_key: (cfg, ckpt)}
-    increment_cards, opencv_reference = _step_cards(
+    increment_cards, opencv_reference, localization_methods = _step_cards(
         pred_csvs, cfg, Path(cfg.data.image_dir), output_dir, cond_models)
 
     # --- Wyniki + logi treningu (parsujemy ISTNIEJĄCY train.log) ---
@@ -172,8 +170,6 @@ def main() -> int:
         "ckpt_not_embedded": "",
     }
     dataset_stats = _compute_dataset_stats(combined_labels, active_ptypes=["Embedded"])
-    candidate_overlays = _collect_candidate_overlays(output_dir, pred_csvs.keys())
-    split_lookup = _build_split_lookup(combined_labels)
     report_path = output_dir / "comparison_report.html"
     build_comparison_report(
         results=results_dfs,
@@ -182,9 +178,8 @@ def main() -> int:
         dataset_stats=dataset_stats,
         output_path=report_path,
         model_info=model_info,
-        candidate_overlays=candidate_overlays,
-        split_lookup=split_lookup,
         opencv_reference=opencv_reference,
+        localization_methods=localization_methods,
     )
 
     # --- Summary (ten sam _write_pipeline_summary) ---

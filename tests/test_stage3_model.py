@@ -494,3 +494,26 @@ def test_density_tv_prior_executes_and_nonnegative():
     with_tv = density_count_loss(out["density"], ages, conc_weight=1.0, tv_weight=1.0)
     assert float(with_tv.detach()) >= float(base.detach())
     assert with_tv.requires_grad
+
+
+def test_density_tv_prior_penalises_scattered_more_than_coherent():
+    """N+1 (15.07 Tor B): the TV term is a spatial-coherence lever toward localisable rings.
+
+    Count and concentration are permutation-invariant (sum / sorted density), so two maps
+    holding the SAME values differ ONLY in the TV term — a scattered map must be penalised
+    more than a coherent blob.
+    """
+    from src.model import density_count_loss
+    ages = torch.tensor([4])                       # 4×4 grid (N=16), 4 hot cells
+    coherent = torch.zeros(1, 16)
+    coherent[0, [0, 1, 4, 5]] = 0.9                # 2×2 blob in the top-left corner → low TV
+    scattered = torch.zeros(1, 16)
+    scattered[0, [0, 2, 8, 10]] = 0.9             # same 4 values, maximally separated → high TV
+
+    base_c = density_count_loss(coherent, ages, conc_weight=1.0, tv_weight=0.0)
+    base_s = density_count_loss(scattered, ages, conc_weight=1.0, tv_weight=0.0)
+    assert torch.allclose(base_c, base_s), "count+concentration must be identical for a spatial permutation"
+
+    tv_c = float(density_count_loss(coherent, ages, conc_weight=1.0, tv_weight=1.0) - base_c)
+    tv_s = float(density_count_loss(scattered, ages, conc_weight=1.0, tv_weight=1.0) - base_s)
+    assert tv_s > tv_c, f"scattered TV penalty ({tv_s:.4f}) must exceed coherent blob ({tv_c:.4f})"

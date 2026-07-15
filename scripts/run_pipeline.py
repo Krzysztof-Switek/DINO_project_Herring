@@ -244,7 +244,6 @@ def _step_infer(cfg, ckpt_path: Path, labels_csv: Path, output_dir: Path) -> Pat
     from src.dataset import OtolithDataset
     from src.inference import run_inference, load_model_from_checkpoint
     from src.interpretation import run_interpretation
-    from src.candidates import run_candidates
     from torch.utils.data import DataLoader, Subset
 
     cfg_copy = cfg.model_copy(deep=True)
@@ -288,9 +287,6 @@ def _step_infer(cfg, ckpt_path: Path, labels_csv: Path, output_dir: Path) -> Pat
 
     print("  Heatmapy i nakładki (oryginalna rozdzielczość)...")
     run_interpretation(cfg_copy, model, interp_loader, output_dir, image_dir=image_dir)
-
-    print("  Kandydaci przyrostów (oryginalna rozdzielczość)...")
-    run_candidates(cfg_copy, model, interp_loader, output_dir, image_dir=image_dir)
 
     print(f"  Predictions: {pred_csv}")
     return pred_csv
@@ -492,6 +488,34 @@ def _compute_axis_data_for_samples(
         except Exception as e:
             print(f"    [cards] opencv_ref błąd dla {iid}: {e}")
 
+        # Sekcje I/J/K — bake-off metod lokalizacji (density | klasyka | fuzja) na tych
+        # samych 48 promieniach; liczba finalnych = wiek (CORAL). Overlaye jako base64.
+        localization_overlays: dict = {}
+        try:
+            from src.ring_extraction import (density_peaks, classical_increments,
+                                             fuse_increments)
+            from src.visualization import render_localization_overlay
+            import base64 as _b64m
+            import io as _iom
+            _dpk, _ = density_peaks(grid, axis_info, H_img, W_img,
+                                    min_distance=min_dist, prominence=prominence)
+            _cpk = classical_increments(orig_rgb, axis_info)["peaks"]
+            _age = int(row.get("predicted_age", 0))
+            _sc = min(1.0, 360 / max(H_img, W_img))
+            _dw, _dh = max(1, int(W_img * _sc)), max(1, int(H_img * _sc))
+            for _m in ("density", "classical", "consensus"):
+                _fr = fuse_increments(_dpk, _cpk, _age, axis_info, method=_m)
+                _ov = render_localization_overlay(orig_rgb, axis_info,
+                                                  _fr["final_axis_pts"], _fr["candidate_pts"])
+                _b = _iom.BytesIO()
+                PILImage.fromarray(_ov).resize((_dw, _dh)).save(_b, format="PNG")
+                localization_overlays[_m] = {
+                    "b64": "data:image/png;base64," + _b64m.b64encode(_b.getvalue()).decode("ascii"),
+                    "n_final": len(_fr["final_axis_pts"]),
+                }
+        except Exception as e:
+            print(f"    [cards] localization I/J/K błąd dla {iid}: {e}")
+
         axis_data[iid] = {
             "mask":           mask_arr,
             "axis_info":      axis_info,
@@ -507,6 +531,7 @@ def _compute_axis_data_for_samples(
             "cls_is_fallback": cls_is_fallback,
             "ring_curves":    ring_curves,
             "classical_pts":  classical_pts,
+            "localization_overlays": localization_overlays,
         }
 
     total = len(samples)
@@ -548,22 +573,6 @@ _CONDITION_LABELS = {
     "cross_emb_on_notemb": "Emb → NotEmb (CROSS)",
     "cross_notemb_on_emb": "NotEmb → Emb (CROSS)",
 }
-
-
-def _collect_candidate_overlays(output_dir: Path, cond_keys) -> dict[str, list[Path]]:
-    """Gather model-drawn increment-dot overlay PNGs per condition (report Section G).
-
-    Reads ``output_dir/<cond_key>/candidates_overlays/*_candidates_overlay.png``.
-    How many images are present depends on ``increment_samples.annotate_all``.
-    """
-    overlays: dict[str, list[Path]] = {}
-    for cond_key in cond_keys:
-        ov_dir = Path(output_dir) / cond_key / "candidates_overlays"
-        if ov_dir.exists():
-            pngs = sorted(ov_dir.glob("*_candidates_overlay.png"))
-            if pngs:
-                overlays[_CONDITION_LABELS.get(cond_key, cond_key)] = pngs
-    return overlays
 
 
 def _localization_quality(axis_data: dict, samples: list[dict]) -> list[dict]:
@@ -615,13 +624,14 @@ def _step_cards(
     if not Path(image_dir).exists():
         print(f"    [cards] OSTRZEŻENIE: --image-dir nie istnieje: {image_dir} "
               f"— karty zostaną pominięte")
-        return {"best": [], "worst": []}, {}
+        return {"best": [], "worst": []}, {}, {}
 
     top_k_best = cfg_emb.inference.increment_samples.top_k_best
     top_k_worst = cfg_emb.inference.increment_samples.top_k_worst
     cards: dict[str, list[Path]] = {"best": [], "worst": []}
     opencv_ref_all: dict = {}   # image_id → interactive OpenCV-reference data (Kierunek A)
     loc_quality: dict[str, list] = {}   # cond_key → per-card localisation stats (Kierunek B)
+    loc_methods: dict[str, list] = {}   # method → [{image_id, true/pred age, b64, n_final}] (sekcje I/J/K)
 
     for cond_key, pred_csv in pred_csvs.items():
         if not Path(pred_csv).exists():
@@ -657,10 +667,20 @@ def _step_cards(
 
         loc_quality[cond_key] = _localization_quality(axis_data, all_samples)
 
+        by_id = {str(s["image_id"]): s for s in all_samples}
         for iid, d in axis_data.items():
             ref = d.get("opencv_ref")
             if ref and iid not in opencv_ref_all:
                 opencv_ref_all[iid] = ref
+            s = by_id.get(iid, {})
+            for _m, _data in (d.get("localization_overlays") or {}).items():
+                loc_methods.setdefault(_m, []).append({
+                    "image_id": iid,
+                    "true_age": int(s.get("age", 0)),
+                    "pred_age": int(s.get("predicted_age", 0)),
+                    "b64":      _data["b64"],
+                    "n_final":  _data["n_final"],
+                })
 
     # Localisation-quality summary (Kierunek B) — quantitative, saved next to the report.
     try:
@@ -684,7 +704,7 @@ def _step_cards(
     except Exception as e:
         print(f"    [cards] localization_quality błąd: {e}")
 
-    return cards, opencv_ref_all
+    return cards, opencv_ref_all, loc_methods
 
 
 def _compute_dataset_stats(
@@ -759,22 +779,6 @@ def _compute_dataset_stats(
         "active_ptypes": active_ptypes or PTYPES,
         "funnel": funnel,
     }
-
-
-def _build_split_lookup(labels_combined_csv: Path) -> dict:
-    """Return {image_id -> split} from labels_combined.csv for Section G tile badges."""
-    import pandas as pd
-    for p in (labels_combined_csv, PROJECT_ROOT / "data" / "labels_combined.csv"):
-        if Path(p).exists():
-            try:
-                df = pd.read_csv(p)
-            except (OSError, ValueError):
-                return {}
-            if "image_id" in df.columns and "split" in df.columns:
-                sub = df.dropna(subset=["split"])
-                return dict(zip(sub["image_id"].astype(str), sub["split"].astype(str)))
-            return {}
-    return {}
 
 
 def _write_pipeline_summary(
@@ -981,7 +985,7 @@ def main(argv: list[str] | None = None) -> None:
 
     print("\n[8/9] CARDS — karty rozumowania")
     image_dir = Path(args.image_dir)
-    increment_cards, opencv_reference = _step_cards(
+    increment_cards, opencv_reference, localization_methods = _step_cards(
         pred_csvs, cfg_emb, image_dir, output_dir, cond_models
     )
 
@@ -1016,8 +1020,6 @@ def main(argv: list[str] | None = None) -> None:
 
     report_path = output_dir / "comparison_report.html"
     training_logs = {"embedded": logs_emb, "not_embedded": logs_notemb}
-    candidate_overlays = _collect_candidate_overlays(output_dir, pred_csvs.keys())
-    split_lookup = _build_split_lookup(run_data_dir / "labels_combined.csv")
     build_comparison_report(
         results=results_dfs,
         training_logs=training_logs,
@@ -1025,9 +1027,8 @@ def main(argv: list[str] | None = None) -> None:
         dataset_stats=dataset_stats,
         output_path=report_path,
         model_info=model_info,
-        candidate_overlays=candidate_overlays,
-        split_lookup=split_lookup,
         opencv_reference=opencv_reference,
+        localization_methods=localization_methods,
     )
     print(f"  Report: {report_path}")
 

@@ -185,21 +185,6 @@ def test_select_topk_image_ids_uses_target_age(tmp_path):
     assert _select_topk_image_ids(tmp_path / "nope.csv", 1, 1) == set()
 
 
-def test_collect_candidate_overlays(tmp_path):
-    """Overlay collector groups candidate PNGs per condition, skips missing dirs."""
-    from scripts.run_pipeline import _collect_candidate_overlays
-
-    ov_dir = tmp_path / "emb_on_emb" / "candidates_overlays"
-    ov_dir.mkdir(parents=True)
-    (ov_dir / "a_candidates_overlay.png").write_bytes(b"x")
-    (ov_dir / "b_candidates_overlay.png").write_bytes(b"x")
-
-    got = _collect_candidate_overlays(tmp_path, ["emb_on_emb", "notemb_on_notemb"])
-    assert "Emb → Emb" in got
-    assert len(got["Emb → Emb"]) == 2
-    assert "NotEmb → NotEmb" not in got   # no overlays dir → omitted
-
-
 def test_embedded_only_dry_run(tmp_path, capsys):
     """--embedded-only runs only Embedded steps; NotEmbedded + cross are SKIP."""
     from scripts.run_pipeline import main as rp_main

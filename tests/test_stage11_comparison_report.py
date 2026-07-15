@@ -128,7 +128,7 @@ def test_report_has_all_sections(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_section_e_has_reasoning_card_caption(tmp_path):
-    """Section E must include the 6-step reasoning caption (ordered list)."""
+    """Section E must include the 2-head reasoning caption (ordered list)."""
     from src.comparison_report import build_comparison_report
     out = tmp_path / "report.html"
     build_comparison_report(
@@ -142,17 +142,14 @@ def test_section_e_has_reasoning_card_caption(tmp_path):
     content = out.read_text(encoding="utf-8")
     assert "Karty rozumowania" in content
     assert "<ol>" in content
-    assert "Surowe zdjęcie" in content
-    assert "Pierścienie roczne" in content
+    assert "GŁOWICA WIEKU (CORAL)" in content
+    assert "GŁOWICA LOKALIZACJI (density)" in content
     # Section D caption about heatmaps/overlays distinction (present in the
     # 4-condition comparison; Section D is dropped only for single-condition).
     assert "inferno" in content.lower()
-    assert "overlays" in content
-    # Doprecyzowanie opisu (post-fix sekcji E):
-    # — panel 4: jasno wskazana wstawka 1D w rogu zdjęcia
-    assert "wstawka" in content.lower()
-    # Nota „puste panele 4/5/6 = oczekiwane / find_peaks" USUNIĘTA (Faza C, sekcja E)
-    assert "Dlaczego niektóre karty mają puste panele" not in content
+    # Nowy opis 2-głowicowy: jawne panele density (kandydaci / finalne)
+    assert "Kandydaci" in content
+    assert "Finalne" in content
 
 
 # ---------------------------------------------------------------------------
@@ -214,28 +211,8 @@ def _base_kwargs():
     )
 
 
-def test_candidate_overlay_gallery_section(tmp_path):
-    """Section G embeds the model-drawn dot overlays passed in candidate_overlays."""
-    import numpy as np
-    from PIL import Image
-    from src.comparison_report import build_comparison_report
-
-    ov = tmp_path / "sample_001_candidates_overlay.png"
-    Image.fromarray(np.zeros((24, 24, 3), dtype=np.uint8)).save(ov)
-    out = tmp_path / "report.html"
-    build_comparison_report(
-        output_path=out,
-        candidate_overlays={"Emb → Emb": [ov]},
-        **_base_kwargs(),
-    )
-    content = out.read_text(encoding="utf-8")
-    assert 'id="G"' in content
-    assert "Galeria" in content
-    assert "Emb → Emb — 1 obraz" in content
-
-
-def test_no_gallery_section_without_overlays(tmp_path):
-    """Section G is omitted when no candidate_overlays are supplied."""
+def test_no_gallery_section_g(tmp_path):
+    """Sekcja G (galeria kropek) została usunięta — raport nie może jej zawierać."""
     from src.comparison_report import build_comparison_report
     out = tmp_path / "report.html"
     build_comparison_report(output_path=out, **_base_kwargs())
@@ -358,22 +335,31 @@ def test_section_opencv_reference_widget(tmp_path):
     assert "cv-widgets" in content and "OPENCV_DATA" in content
 
 
-def test_section_g_split_badge(tmp_path):
-    """Section G badges each tile with its split from split_lookup."""
+def test_section_e_reasoning_cards_embedded(tmp_path):
+    """Section E embeds the reasoning-card PNGs passed via increment_cards."""
     import numpy as np
     from PIL import Image
     from src.comparison_report import build_comparison_report
 
-    ov = tmp_path / "fishA_candidates_overlay.png"
-    Image.fromarray(np.zeros((24, 24, 3), dtype=np.uint8)).save(ov)
+    card = tmp_path / "best_fishA_card.png"
+    Image.fromarray(np.zeros((24, 24, 3), dtype=np.uint8)).save(card)
     out = tmp_path / "report.html"
-    build_comparison_report(
-        output_path=out,
-        candidate_overlays={"Emb → Emb": [ov]},
-        split_lookup={"fishA.jpg": "test"},
-        **_base_kwargs(),
-    )
+    kw = _base_kwargs()
+    kw["increment_cards"] = {"best": [card], "worst": []}
+    build_comparison_report(output_path=out, **kw)
     content = out.read_text(encoding="utf-8")
-    assert ">test<" in content              # split badge rendered
-    assert "Dlaczego kropki są właśnie tu?" in content
-    assert "SmartDots" not in content       # removed per Faza C
+    assert 'id="E"' in content
+    assert "data:image/png;base64," in content   # karta osadzona
+
+
+def test_section_localization_methods_ijk(tmp_path):
+    """Sekcje I/J/K (bake-off density | klasyka | fuzja) renderują się z localization_methods."""
+    from src.comparison_report import build_comparison_report
+    out = tmp_path / "report.html"
+    b64 = "data:image/png;base64,AAAA"
+    loc = {m: [{"image_id": "fishA.jpg", "true_age": 3, "pred_age": 3, "b64": b64, "n_final": 3}]
+           for m in ("density", "classical", "consensus")}
+    build_comparison_report(output_path=out, localization_methods=loc, **_base_kwargs())
+    content = out.read_text(encoding="utf-8")
+    assert 'id="I"' in content and 'id="J"' in content and 'id="K"' in content
+    assert "density (model)" in content and "fuzja (konsensus)" in content

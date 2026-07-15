@@ -392,7 +392,13 @@ def draw_reasoning_card(
         panel = apply_colormap_with_mask(hm, original_rgb, mask=mask, alpha=0.55,
                                          colormap=DEFAULT_COLORMAP)
         _draw_colorbar(panel)
+        _draw_contour(panel)                 # obrys otolitu — widać, gdzie kończy się overlay
         return panel
+
+    def _draw_contour(panel) -> None:
+        """Narysuj cyjanowy kontur otolitu (jeśli dostępny) — na KAŻDYM panelu ze zdjęciem."""
+        if axis_info is not None and axis_info.get("contour") is not None:
+            cv2.drawContours(panel, [axis_info["contour"]], -1, _CONTOUR_COLOR, line_thickness)
 
     # ===== Rząd 1 — GŁOWICA WIEKU (CORAL) =====
     panel1 = (_heat_panel(coral_gradcam) if coral_gradcam is not None
@@ -401,6 +407,7 @@ def draw_reasoning_card(
               else _placeholder_panel(H, W, "Uwaga CLS niedostepna"))
     # Panel 3 — werdykt: etykieta wieku + ramka OK/błąd
     panel3 = original_rgb.copy()
+    _draw_contour(panel3)
     label = f"Wiek: {int(predicted_age)} (true: {int(true_age)})"
     pad = max(6, H // 80)
     font_scale = _fit_font_scale(label, W - 2 * pad, max(0.5, H / 480.0))
@@ -431,6 +438,7 @@ def draw_reasoning_card(
     # Panel 6 — finalne przyrosty (N = wiek)
     if axis_info is not None:
         panel6 = original_rgb.copy()
+        _draw_contour(panel6)
         cx, cy = axis_info["centroid"]
         fx, fy = axis_info["far_edge"]
         cv2.line(panel6, (cx, cy), (fx, fy), _AXIS_COLOR, line_thickness)
@@ -476,6 +484,40 @@ def draw_reasoning_card(
          for p, t in zip([panel4, panel5, panel6], row2_titles)], axis=1)
     card = np.concatenate([row1, row2], axis=0)
     return card
+
+
+# ---------------------------------------------------------------------------
+# Localisation-method overlay (report sections I / J / K)
+# ---------------------------------------------------------------------------
+
+def render_localization_overlay(
+    image: np.ndarray,
+    axis_info: Optional[dict],
+    final_pts: Optional[list],
+    candidate_pts: Optional[list] = None,
+) -> np.ndarray:
+    """RGB overlay for one localisation method: contour + axis + candidates + finals.
+
+    Used by the I/J/K bake-off sections (density / classical / fusion): each renders
+    the SAME otolith with that method's ``final_pts`` (red, count = age) over faint
+    ``candidate_pts`` (yellow), plus the otolith contour and measurement axis.
+    """
+    img = np.ascontiguousarray(image[..., :3]).copy()
+    H = img.shape[0]
+    lt = max(2, H // 300)
+    if axis_info is not None:
+        contour = axis_info.get("contour")
+        if contour is not None:
+            cv2.drawContours(img, [contour], -1, _CONTOUR_COLOR, lt)
+        if axis_info.get("centroid") and axis_info.get("far_edge"):
+            cx, cy = axis_info["centroid"]
+            fx, fy = axis_info["far_edge"]
+            cv2.line(img, (cx, cy), (fx, fy), _AXIS_COLOR, lt)
+    if candidate_pts:
+        _draw_small_points(img, candidate_pts, _CAND_COLOR, max(1, H // 500))
+    if final_pts:
+        _draw_small_points(img, final_pts, _FINAL_COLOR, max(3, H // 130), border=True)
+    return img
 
 
 # ---------------------------------------------------------------------------

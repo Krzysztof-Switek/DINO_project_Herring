@@ -642,42 +642,44 @@ def _section_d(results: dict) -> str:
 def _section_e(increment_cards: dict) -> str:
     html = '<section id="E"><h2>E. Karty rozumowania modelu</h2>'
     html += """
-<p>Każda karta pokazuje 6 etapów dochodzenia modelu do werdyktu wiekowego
-(od surowego zdjęcia do liczby pierścieni). Wszystkie panele renderowane są
-na zdjęciu w oryginalnej rozdzielczości — żółta linia to <i>oś biologiczna</i>
-od jądra (centroid) do najdalszej krawędzi konturu (zwykle post-rostralnej):</p>
+<p>Każda karta to <b>6 paneli w dwóch rzędach = dwie głowice modelu</b>. Rząd górny
+(pasek granatowy) to <b>GŁOWICA WIEKU (CORAL)</b> — „na co model patrzy, licząc wiek".
+Rząd dolny (pasek pomarańczowy) to <b>GŁOWICA LOKALIZACJI (density)</b> — „gdzie model
+widzi przyrosty". Wszystkie panele renderowane są na zdjęciu w oryginalnej rozdzielczości;
+cyjanowy obrys = kontur otolitu, żółta linia = oś biologiczna od jądra do najdalszej
+krawędzi konturu.</p>
+<p><b>Rząd 1 — GŁOWICA WIEKU (CORAL):</b></p>
 <ol>
-  <li><b>Surowe zdjęcie</b> — wejście do modelu, bez żadnych anotacji.</li>
-  <li><b>Segmentacja otolitu</b> — cyjanowy kontur, niebieski krzyżyk = jądro
-      (klasyczne CV, niezależnie od modelu). Tu sprawdzasz, czy segmentacja w
-      ogóle złapała otolit; jeśli nie, panele 4/5/6 pokażą placeholder
-      „Segmentacja nieudana”.</li>
-  <li><b>Mapa uwagi modelu</b> — kolormap <i>inferno</i> wewnątrz otolitu:
-      ciemne = niski sygnał, jasno-żółte = wysoki. Po treningu wartość =
-      <b>prawdopodobieństwo przyrostu na patch</b> (głowica MIL, słabo nadzorowana
-      wiekiem); dla modelu bez głowicy MIL — norma L2 tokenów DINOv2 (heurystyka).</li>
-  <li><b>Oś pomiaru + profil 1D</b> — żółta oś biologiczna na zdjęciu, a w
-      <b>prawym górnym rogu mała wstawka 1D</b> z profilem ważności wzdłuż tej
-      osi. Wstawkę czyta się od góry: oś pionowa = pozycja na osi (góra = jądro,
-      dół = brzeg), oś pozioma = wartość ważności. <i>Czerwone kropki + przerywane
-      poziome linie</i> w tej wstawce = wykryte peaki profilu (kandydaci na
-      przyrosty roczne).</li>
-  <li><b>Pierścienie roczne</b> — <i>krzywe pierścieni</i> wyznaczone z mapy
-      prawdopodobieństwa modelu: radialne peaki w wielu kierunkach → połączone
-      w zamkniętą linię (locus wysokiego prawdopodobieństwa), każdy pierścień
-      w innym kolorze. <b>Każdy pierścień przechodzi przez ponumerowaną kropkę na
-      osi pomiaru</b> — panele 5 i 6 to ten sam sygnał (kropki = przecięcia krzywych
-      z osią). <b>Brak krzywych = model nie zlokalizował przyrostów</b> (mapa
-      płaska) — to sygnał, nie brak renderu.</li>
-  <li><b>Werdykt</b> — końcowa anotacja: żółta oś + <i>ponumerowane żółte
-      kropki</i> w miejscach przecięcia krzywych pierścieni z osią + przewidziany
-      wiek (zielona ramka = trafny, czerwona = błąd).</li>
+  <li><b>Grad-CAM werdyktu</b> — mapa (inferno), które rejony najbardziej wpływają na
+      przewidziany wiek. Uwaga: na ścieżce tokenu CLS gradient bywa rozmyty i mapa jest
+      wtedy niemal płaska — tytuł panelu sygnalizuje to jako „(plaski/nieinform.)". To
+      znane ograniczenie tej atrybucji, nie brak renderu.</li>
+  <li><b>Uwaga CLS</b> — z których patchy token CLS złożył „streszczenie" obrazu, z
+      którego CORAL liczy wiek. Gdy backbone używa fused-attention (nie wystawia macierzy
+      uwagi), panel pokazuje <b>oznaczone proxy L2</b> (norma tokenów) zamiast prawdziwej
+      uwagi — tytuł mówi wtedy „proxy L2 patchy (CLS niedost.)".</li>
+  <li><b>Werdykt</b> — zdjęcie + etykieta „Wiek: X (true: Y)" + ramka: <b>zielona</b> =
+      trafny, <b>czerwona</b> = błąd.</li>
+</ol>
+<p><b>Rząd 2 — GŁOWICA LOKALIZACJI (density):</b></p>
+<ol start="4">
+  <li><b>Mapa density</b> — kolormap inferno wewnątrz otolitu: ciemne = niski sygnał,
+      jasno-żółte = wysoki. Wartość = <b>prawdopodobieństwo przyrostu na patch</b>
+      (odsprzęgnięta głowica density, uczona słabo — samą liczbą wieku). Gdy znaleziono
+      sensowny zestaw pierścieni-konsensusu (≥2), nakładane są ich krzywe.</li>
+  <li><b>Kandydaci</b> — <b>żółte kropki</b> = wszystkie lokalne maksima mapy density
+      wzdłuż <b>48 promieni</b> z jądra we wszystkich kierunkach (nie jednej osi). Cyjanowy
+      kontur, żółta oś pomiaru, niebieski krzyżyk = jądro. To „surowy" sygnał lokalizacji.</li>
+  <li><b>Finalne (N = wiek)</b> — <b>czerwone kropki</b> = top-<code>wiek</code> „pierścieni-
+      konsensusu" (piki na tym samym promieniu w wielu kierunkach), rzutowane na oś pomiaru.
+      <b>Zielone puste okręgi</b> = piki klasyczne (OpenCV) — kontrola „model vs technik".</li>
 </ol>
 <p style="font-size:90%;color:#444;">
   <b>Wiek (werdykt) vs liczba pierścieni.</b> Werdykt wiekowy pochodzi z głowicy
-  <b>liczącej</b> (CORAL), a pierścienie/kropki z głowicy <b>lokalizującej</b> (MIL)
-  — to dwa różne sygnały. Mogą się nieznacznie różnić (np. wiek = 3, a zlokalizowane
-  2 pierścienie); po dobrym treningu powinny się zgadzać.
+  <b>liczącej</b> (CORAL, rząd 1), a kropki/finalne z głowicy <b>lokalizującej</b>
+  (density, rząd 2, odsprzęgniętej stop-gradientem) — to dwa niezależne sygnały. Mogą się
+  różnić (np. wiek = 3, a zlokalizowane 2 przyrosty); trafność lokalizacji jest wciąż
+  wąskim gardłem — patrz sekcja H i dziennik Kierunku B.
 </p>
 """
     for label, paths in increment_cards.items():
@@ -702,88 +704,6 @@ def _section_f(model_info: dict) -> str:
 </table>
 </section>
 """
-
-
-def _thumb_b64(path) -> str | None:
-    """Downscaled base64 PNG thumbnail; None if the file can't be read."""
-    try:
-        return pil_to_b64(path, max_px=340)
-    except Exception:
-        return None
-
-
-_SPLIT_BADGE = {
-    "train": ("#2a78d6", "train"),
-    "val":   ("#eb6834", "val"),
-    "test":  ("#008300", "test"),
-}
-
-
-def _section_g(candidate_overlays: dict | None,
-               split_lookup: dict | None = None) -> str:
-    """Gallery of model-drawn increment-dot overlays for every annotated image.
-
-    ``candidate_overlays``: ``{label -> [png Path, ...]}``. Empty/None → section omitted.
-    ``split_lookup``: optional ``{image_id -> split}`` to badge each tile.
-    Which images appear is governed by ``inference.increment_samples.annotate_all``
-    (all test images when True, otherwise only the top-k best/worst).
-    """
-    if not candidate_overlays:
-        return ""
-    split_lookup = split_lookup or {}
-    html = (
-        '<section id="G">'
-        '<h2>G. Galeria: kropki przyrostów wykryte przez model</h2>'
-        '<p>Każdy kafelek to zdjęcie otolitu z konturem, żółtą osią biologiczną i '
-        '<b>czerwonymi kropkami</b> w miejscach przyrostów wykrytych przez model.</p>'
-        '<p class="cap"><b>Dlaczego kropki są właśnie tu?</b> Model dla każdego '
-        'patcha (fragmentu ~14×14 px) zwraca <b>prawdopodobieństwo przyrostu</b> '
-        '(głowica MIL, uczona słabo — tylko wiekiem ryby). Wzdłuż osi pomiaru '
-        '(jądro → brzeg) odczytujemy profil tej mapy i bierzemy jego <b>lokalne '
-        'maksima</b> — w tych punktach stawiamy kropki. Kropka = miejsce, które '
-        'model uznał za najbardziej „pierścieniowe”, nie ręczna anotacja.</p>'
-    )
-    for label, paths in candidate_overlays.items():
-        paths = list(paths)
-        html += f'<h3>{label} — {len(paths)} obraz(ów)</h3>'
-        html += '<div style="display:flex;flex-wrap:wrap;gap:8px;">'
-        for p in paths:
-            b64 = _thumb_b64(p)
-            if not b64:
-                continue
-            stem = Path(p).stem.replace("_candidates_overlay", "")
-            image_id = _match_split_key(stem, split_lookup)
-            split = split_lookup.get(image_id) if image_id else None
-            badge = ""
-            if split in _SPLIT_BADGE:
-                color, text = _SPLIT_BADGE[split]
-                badge = (f'<span style="display:inline-block;background:{color};'
-                         'color:#fff;font-size:9px;padding:1px 5px;border-radius:3px;'
-                         f'margin-bottom:2px;">{text}</span><br>')
-            html += (
-                '<figure style="width:230px;margin:0;">'
-                f'<img src="data:image/png;base64,{b64}" '
-                'style="width:100%;border:1px solid #ccc;border-radius:3px;">'
-                f'<figcaption style="font-size:10px;color:#666;word-break:break-all;">'
-                f'{badge}{stem}</figcaption></figure>'
-            )
-        html += '</div>'
-    html += '</section>'
-    return html
-
-
-def _match_split_key(stem: str, split_lookup: dict) -> str | None:
-    """Find the labels image_id whose stem matches the overlay stem.
-
-    Overlay files are ``<image_id-stem>_candidates_overlay.png``; labels use the
-    full filename (with extension). Match by stem so extensions/dirs don't matter.
-    """
-    if stem in split_lookup:
-        return stem
-    for image_id in split_lookup:
-        if Path(image_id).stem == stem:
-            return image_id
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -889,6 +809,50 @@ def _section_opencv(opencv_reference: dict | None) -> str:
     return html
 
 
+_LOC_METHOD_META = {
+    "density":   ("I", "density (model)",
+                  "Top-<code>wiek</code> pierścieni z mapy density modelu (48 promieni z jądra)."),
+    "classical": ("J", "klasyka (obraz)",
+                  "Top-<code>wiek</code> z klasycznej intensywności szarości (te same 48 promieni)."),
+    "consensus": ("K", "fuzja (konsensus)",
+                  "Pierścienie, gdzie density I klasyka zgadzają się co do promienia; "
+                  "liczba = wiek (CORAL). Fallback do density, gdy za mało zgodnych."),
+}
+
+
+def _section_localization_methods(localization_methods: dict | None) -> str:
+    """Bake-off metod lokalizacji: sekcje I / J / K (density | klasyka | fuzja).
+
+    ``localization_methods``: ``{method -> [{image_id, true_age, pred_age, b64, n_final}]}``.
+    Każda metoda = osobna sekcja; ta sama pula otolitów, różny sposób wyboru finalnych.
+    """
+    if not localization_methods:
+        return ""
+    html = ""
+    for method in ("density", "classical", "consensus"):
+        items = localization_methods.get(method)
+        if not items:
+            continue
+        sec_id, title, desc = _LOC_METHOD_META[method]
+        html += (
+            f'<section id="{sec_id}"><h2>{sec_id}. Lokalizacja — {title}</h2>'
+            f'<p>{desc} <b>Czerwone</b> = finalne (N=wiek), żółte = kandydaci, '
+            'cyjan = kontur otolitu, żółta linia = oś pomiaru. Ta sama pula otolitów we '
+            'wszystkich metodach — porównaj, która najlepiej trafia w realne przyrosty.</p>'
+            '<div style="display:flex;flex-wrap:wrap;gap:8px;">'
+        )
+        for it in items:
+            cap = f"wiek {it['pred_age']} (true {it['true_age']}) &middot; N={it['n_final']}"
+            html += (
+                '<figure style="width:230px;margin:0;">'
+                f'<img src="{it["b64"]}" style="width:100%;border:1px solid #ccc;border-radius:3px;">'
+                f'<figcaption style="font-size:10px;color:#666;word-break:break-all;">'
+                f'{cap}</figcaption></figure>'
+            )
+        html += '</div></section>'
+    return html
+
+
 def build_comparison_report(
     results: dict,
     training_logs: dict,
@@ -896,9 +860,8 @@ def build_comparison_report(
     dataset_stats: dict,
     output_path: Path,
     model_info: dict | None = None,
-    candidate_overlays: dict | None = None,
-    split_lookup: dict | None = None,
     opencv_reference: dict | None = None,
+    localization_methods: dict | None = None,
 ) -> None:
     """Build and write a self-contained HTML comparison report.
 
@@ -912,8 +875,6 @@ def build_comparison_report(
     dataset_stats : keys counts, age_distributions, orphan_count
     output_path   : where to write the HTML file
     model_info    : optional dict of key→value pairs for section F
-    candidate_overlays : optional {label -> [png Path, ...]} for the Section G
-                    increment-dot gallery (model-drawn dots for every annotated image)
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -950,8 +911,8 @@ def build_comparison_report(
         body += _section_d(results)     # cross-evaluation is meaningless for 1 condition
     body += _section_e(increment_cards)
     body += _section_f(model_info)
-    body += _section_g(candidate_overlays, split_lookup=split_lookup)
     body += _section_opencv(opencv_reference)
+    body += _section_localization_methods(localization_methods)
 
     html = f"""<!DOCTYPE html>
 <html lang="pl">
