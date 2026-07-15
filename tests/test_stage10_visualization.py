@@ -286,3 +286,30 @@ def test_fuse_increments_three_methods():
     assert min(abs(t - 0.30) for t in ts) < 0.05
     assert min(abs(t - 0.60) for t in ts) < 0.05          # 0.9 (tylko klasyka) NIE wybrane
     assert fuse_increments(density, classical, 2, None, method="consensus")["final_t"] == []
+
+
+def test_fuse_increments_dp_enforces_spacing():
+    """method='dp': gdy dwa najmocniejsze piki są zbyt blisko (< dp_min_gap), DP rozsuwa
+    wybór (bierze jeden z nich + odległy), zamiast 'skupiać' oba obok siebie jak top-k."""
+    from src.ring_extraction import fuse_increments
+    H, W = 120, 200
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    cx, cy = axis_info["centroid"]
+    fx, fy = axis_info["far_edge"]
+
+    def pk(t):
+        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)))
+
+    # Klastry: t=0.20 (support 4, najmocniejszy), t=0.27 (support 3), t=0.80 (support 2).
+    # 0.20 i 0.27 są > t_tol (osobne klastry), ale < dp_min_gap → nie mogą być wybrane oba.
+    density = [pk(0.20)] * 4 + [pk(0.27)] * 3 + [pk(0.80)] * 2
+    out = fuse_increments(density, [], 2, axis_info, method="dp", dp_min_gap=0.12)
+    ts = out["final_t"]
+    assert len(ts) == 2
+    assert ts == sorted(ts)                                  # inner→outer
+    assert min(b - a for a, b in zip(ts, ts[1:])) >= 0.12    # rozstaw wymuszony
+    assert min(abs(t - 0.80) for t in ts) < 0.06            # odległy pik wybrany (rozłożenie)
+    assert min(abs(t - 0.27) for t in ts) > 0.06            # 0.27 odrzucone na rzecz rozstawu
+    assert len(out["final_axis_pts"]) == 2
+    # k większe niż liczba klastrów → zwraca tyle, ile jest (bez wysypki)
+    assert len(fuse_increments(density, [], 9, axis_info, method="dp")["final_t"]) == 3

@@ -817,11 +817,15 @@ _LOC_METHOD_META = {
     "consensus": ("K", "fuzja (konsensus)",
                   "Pierścienie, gdzie density I klasyka zgadzają się co do promienia; "
                   "liczba = wiek (CORAL). Fallback do density, gdy za mało zgodnych."),
+    "dp":        ("L", "fuzja (DP + rozstaw)",
+                  "Programowanie dynamiczne: dokładnie <code>wiek</code> pierścieni z połączonej "
+                  "puli density+klasyka (konsensus punktowany wyżej), z wymuszonym minimalnym "
+                  "rozstawem — rozkłada przyrosty wzdłuż osi zamiast je skupiać."),
 }
 
 
 def _section_localization_methods(localization_methods: dict | None) -> str:
-    """Bake-off metod lokalizacji: sekcje I / J / K (density | klasyka | fuzja).
+    """Bake-off metod lokalizacji: sekcje I / J / K / L (density | klasyka | konsensus | DP).
 
     ``localization_methods``: ``{method -> [{image_id, true_age, pred_age, b64, n_final}]}``.
     Każda metoda = osobna sekcja; ta sama pula otolitów, różny sposób wyboru finalnych.
@@ -829,7 +833,7 @@ def _section_localization_methods(localization_methods: dict | None) -> str:
     if not localization_methods:
         return ""
     html = ""
-    for method in ("density", "classical", "consensus"):
+    for method in ("density", "classical", "consensus", "dp"):
         items = localization_methods.get(method)
         if not items:
             continue

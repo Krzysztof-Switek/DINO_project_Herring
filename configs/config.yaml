@@ -4,7 +4,10 @@ project:
   seed: 42
 
 model:
-  backbone: dinov2_vits14         # dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14
+  backbone: dinov2_vits14_reg     # N+1 (15.07 Tor C): wariant Z REJESTRAMI — tłumi patche o ekstremalnej
+                                  # normie (register tokens, Darcet 2023), które w 13.07 zapalały density na
+                                  # glare/krawędziach zamiast na pierścieniach. Ten sam wymiar 384 → głowice bez zmian.
+                                  # Warianty: dinov2_vits14 | *_vitb14 | *_vitl14 | *_reg
   use_metadata: false
   target_type: ordinal            # regression | ordinal | count_aware
   num_age_classes: 17             # max observed age = 16 (real data)

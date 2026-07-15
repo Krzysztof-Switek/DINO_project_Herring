@@ -23,7 +23,7 @@ def test_config_loads_without_error() -> None:
 def test_config_model_fields() -> None:
     from src.config import load_config
     cfg = load_config(CONFIG_PATH)
-    assert cfg.model.backbone == "dinov2_vits14"
+    assert cfg.model.backbone.startswith("dinov2_vits14")   # vits14 lub wariant _reg (rejestry)
     assert cfg.model.target_type == "ordinal"
     assert cfg.model.num_age_classes == 17
     assert cfg.model.use_metadata is False

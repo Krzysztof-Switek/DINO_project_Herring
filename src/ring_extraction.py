@@ -255,6 +255,52 @@ def _project_to_axis(chosen_t, axis_info: dict) -> List[Tuple[int, int]]:
             for t in chosen_t]
 
 
+def _dp_select_t(cands, k: int, min_gap: float) -> List[float]:
+    """Pick exactly ``k`` radii from ``cands=[(t, score)]`` maximising total score with a
+    minimum spacing ``min_gap`` between chosen radii (DP peak selection, monotone in ``t``).
+
+    This is the ``method="dp"`` selector: unlike top-k (which can bunch several picks at
+    almost the same radius), the spacing constraint spreads the ``k`` increments along the
+    axis — the classic dynamic-programming ring/peak selection used in tree-ring counting.
+    Falls back to the top-``k`` by score (spacing ignored) when spacing makes ``k`` picks
+    infeasible, so it always returns as many as possible up to ``k``.
+    """
+    if k <= 0 or not cands:
+        return []
+    cs = sorted(cands, key=lambda c: c[0])                    # by radius (inner→outer)
+    ts = [float(c[0]) for c in cs]
+    ss = [float(c[1]) for c in cs]
+    M = len(cs)
+    k = min(k, M)
+    NEG = float("-inf")
+    dp = [[NEG] * M for _ in range(k + 1)]                    # dp[j][i]: best score, j picks, last at i
+    par = [[-1] * M for _ in range(k + 1)]
+    for i in range(M):
+        dp[1][i] = ss[i]
+    for j in range(2, k + 1):
+        for i in range(M):
+            best, bp = NEG, -1
+            for p in range(i):
+                if ts[i] - ts[p] >= min_gap and dp[j - 1][p] > best:
+                    best, bp = dp[j - 1][p], p
+            if best > NEG:
+                dp[j][i] = best + ss[i]
+                par[j][i] = bp
+    end, best_val = -1, NEG
+    for i in range(M):
+        if dp[k][i] > best_val:
+            best_val, end = dp[k][i], i
+    if end == -1:                                            # spacing infeasible for k → top-k by score
+        top = sorted(range(M), key=lambda i: ss[i], reverse=True)[:k]
+        return sorted(ts[i] for i in top)
+    chosen, j = [], k
+    while end != -1 and j >= 1:
+        chosen.append(ts[end])
+        end = par[j][end]
+        j -= 1
+    return sorted(chosen)
+
+
 def select_increments(
     prob_grid,
     axis_info: dict,
@@ -359,7 +405,7 @@ def density_peaks(
 
 def fuse_increments(
     density_pks, classical_pks, predicted_age: int, axis_info: dict,
-    *, method: str = "consensus", t_tol: float = 0.06,
+    *, method: str = "consensus", t_tol: float = 0.06, dp_min_gap: float = 0.04,
 ) -> dict:
     """Choose the final ``predicted_age`` increments on the axis from peak sources.
 
@@ -370,6 +416,9 @@ def fuse_increments(
       * ``"consensus"`` — clusters where density AND classical agree on radius ``t``
         (combined support), top-`age`; falls back to top density clusters if fewer than
         ``age`` agree.
+      * ``"dp"``        — merge density+classical clusters (consensus rings scored higher),
+        then dynamic-programming select exactly `age` radii maximising total score with a
+        minimum spacing ``dp_min_gap`` (spreads increments along the axis, no bunching).
     Returns ``{final_t, final_axis_pts, candidate_pts}`` (candidates = the source(s) used).
     """
     empty = {"final_t": [], "final_axis_pts": [], "candidate_pts": []}
@@ -383,6 +432,29 @@ def fuse_increments(
     elif method == "classical":
         chosen = _topk_cluster_t(_cluster_by_radius(classical_pks, t_tol), k)
         cand = [(p[2], p[3]) for p in classical_pks]
+    elif method == "dp":
+        dclust = _cluster_by_radius(density_pks, t_tol)
+        cclust = _cluster_by_radius(classical_pks, t_tol)
+        merged: List[Tuple[float, float]] = []       # (t, score); consensus rings sum both scores
+        used = [False] * len(cclust)
+        for (dt, ds, dstr) in dclust:
+            score = ds * dstr
+            t = dt
+            best_i, best_d = -1, t_tol
+            for i, c in enumerate(cclust):
+                if not used[i] and abs(c[0] - dt) <= best_d:
+                    best_i, best_d = i, abs(c[0] - dt)
+            if best_i >= 0:                          # density ring corroborated by classical
+                c = cclust[best_i]
+                used[best_i] = True
+                score += c[1] * c[2]
+                t = 0.5 * (dt + c[0])
+            merged.append((t, score))
+        for i, c in enumerate(cclust):               # classical-only rings still eligible
+            if not used[i]:
+                merged.append((c[0], c[1] * c[2]))
+        chosen = _dp_select_t(merged, k, dp_min_gap)
+        cand = [(p[2], p[3]) for p in density_pks] + [(p[2], p[3]) for p in classical_pks]
     else:  # consensus
         dclust = _cluster_by_radius(density_pks, t_tol)
         cclust = _cluster_by_radius(classical_pks, t_tol)

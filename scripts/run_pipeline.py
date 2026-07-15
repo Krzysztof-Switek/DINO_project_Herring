@@ -503,7 +503,7 @@ def _compute_axis_data_for_samples(
             _age = int(row.get("predicted_age", 0))
             _sc = min(1.0, 360 / max(H_img, W_img))
             _dw, _dh = max(1, int(W_img * _sc)), max(1, int(H_img * _sc))
-            for _m in ("density", "classical", "consensus"):
+            for _m in ("density", "classical", "consensus", "dp"):
                 _fr = fuse_increments(_dpk, _cpk, _age, axis_info, method=_m)
                 _ov = render_localization_overlay(orig_rgb, axis_info,
                                                   _fr["final_axis_pts"], _fr["candidate_pts"])
@@ -512,6 +512,8 @@ def _compute_axis_data_for_samples(
                 localization_overlays[_m] = {
                     "b64": "data:image/png;base64," + _b64m.b64encode(_b.getvalue()).decode("ascii"),
                     "n_final": len(_fr["final_axis_pts"]),
+                    # keep the points too so _localization_quality can score each method
+                    "final_axis_pts": [(int(x), int(y)) for (x, y) in _fr["final_axis_pts"]],
                 }
         except Exception as e:
             print(f"    [cards] localization I/J/K błąd dla {iid}: {e}")
@@ -585,25 +587,39 @@ def _localization_quality(axis_data: dict, samples: list[dict]) -> list[dict]:
     """
     import numpy as np
     by_id = {str(s["image_id"]): s for s in samples}
+
+    def _mean_dist(finals, classical):
+        if not finals or not classical:
+            return None
+        fa = np.asarray(finals, dtype=np.float32)
+        ca = np.asarray(classical, dtype=np.float32)
+        dists = np.sqrt(((fa[:, None, :] - ca[None, :, :]) ** 2).sum(-1))       # (F, C)
+        return round(float(dists.min(axis=1).mean()), 2)
+
     rows: list[dict] = []
     for iid, d in axis_data.items():
         s = by_id.get(iid, {})
+        pred_age = int(s.get("predicted_age", 0))
         finals = d.get("final_axis_pts") or []
         classical = d.get("classical_pts") or []
-        mean_dist = None
-        if finals and classical:
-            fa = np.asarray(finals, dtype=np.float32)
-            ca = np.asarray(classical, dtype=np.float32)
-            dists = np.sqrt(((fa[:, None, :] - ca[None, :, :]) ** 2).sum(-1))   # (F, C)
-            mean_dist = round(float(dists.min(axis=1).mean()), 2)
+        # Per-method scoring (sekcje I/J/K/DP): |n_final - wiek| + odległość do klasyki.
+        per_method: dict = {}
+        for m, ov in (d.get("localization_overlays") or {}).items():
+            mf = ov.get("final_axis_pts") or []
+            per_method[m] = {
+                "n_final": len(mf),
+                "abs_n_final_minus_age": abs(len(mf) - pred_age),
+                "mean_dist_final_to_classical_px": _mean_dist(mf, classical),
+            }
         rows.append({
             "image_id": iid,
             "true_age": int(s.get("age", 0)),
-            "predicted_age": int(s.get("predicted_age", 0)),
+            "predicted_age": pred_age,
             "n_final": len(finals),
             "n_candidates": len(d.get("candidate_pts") or []),
             "n_classical": len(classical),
-            "mean_dist_final_to_classical_px": mean_dist,
+            "mean_dist_final_to_classical_px": _mean_dist(finals, classical),
+            "per_method": per_method,
         })
     return rows
 
@@ -690,12 +706,33 @@ def _step_cards(
         for ck, rows in loc_quality.items():
             dists = [r["mean_dist_final_to_classical_px"] for r in rows
                      if r["mean_dist_final_to_classical_px"] is not None]
+            # Per-method bake-off (density | classical | consensus | dp): mean distance to
+            # classical peaks + how close #final is to the CORAL age. Lower = better.
+            methods: dict = {}
+            for r in rows:
+                for m, pm in (r.get("per_method") or {}).items():
+                    acc = methods.setdefault(m, {"dist": [], "abs_diff": [], "n_final": []})
+                    if pm["mean_dist_final_to_classical_px"] is not None:
+                        acc["dist"].append(pm["mean_dist_final_to_classical_px"])
+                    acc["abs_diff"].append(pm["abs_n_final_minus_age"])
+                    acc["n_final"].append(pm["n_final"])
+            per_method_summary = {
+                m: {
+                    "mean_dist_final_to_classical_px": (round(float(np.mean(a["dist"])), 2)
+                                                        if a["dist"] else None),
+                    "mean_abs_n_final_minus_age": (round(float(np.mean(a["abs_diff"])), 2)
+                                                   if a["abs_diff"] else None),
+                    "mean_n_final": (round(float(np.mean(a["n_final"])), 2) if a["n_final"] else None),
+                }
+                for m, a in methods.items()
+            }
             summary[ck] = {
                 "n_cards": len(rows),
                 "mean_dist_final_to_classical_px": (round(float(np.mean(dists)), 2)
                                                     if dists else None),
                 "mean_n_candidates": (round(float(np.mean([r["n_candidates"] for r in rows])), 2)
                                       if rows else None),
+                "per_method": per_method_summary,
                 "per_card": rows,
             }
         (output_dir / "localization_quality.json").write_text(
