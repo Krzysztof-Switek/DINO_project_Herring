@@ -337,9 +337,10 @@ def _compute_axis_data_for_samples(
 
     grids: dict = {}
     axis_data: dict = {}
+    walkthrough_payload = None                     # step-by-step DP walkthrough for ONE example otolith
 
     if not samples:
-        return grids, axis_data
+        return grids, axis_data, walkthrough_payload
 
     mask_dir = cond_dir / "masks"
     mask_dir.mkdir(parents=True, exist_ok=True)
@@ -352,6 +353,7 @@ def _compute_axis_data_for_samples(
     min_dist = cfg.candidates.min_peak_distance
     prominence = cfg.candidates.prominence_threshold
     n_samples_axis = 50
+    walkthrough_iid = _pick_walkthrough_iid(samples)   # deterministyczny przykład (wiek ~4)
 
     missing_images = 0
     failed_axes = 0
@@ -518,6 +520,41 @@ def _compute_axis_data_for_samples(
         except Exception as e:
             print(f"    [cards] localization I/J/K błąd dla {iid}: {e}")
 
+        # Sekcja „krok po kroku" (jeden przykładowy otolit): pełne dane DP + panele przestrzenne.
+        if iid == walkthrough_iid:
+            try:
+                from src.ring_extraction import dp_walkthrough_data
+                from src.visualization import (render_rays_and_candidates,
+                                               render_localization_overlay)
+                import base64 as _b64w
+                import io as _iow
+                _wsc = min(1.0, 480 / max(H_img, W_img))
+                _wdw, _wdh = max(1, int(W_img * _wsc)), max(1, int(H_img * _wsc))
+                _wage = int(row.get("predicted_age", 0))
+                _wd = dp_walkthrough_data(grid, orig_rgb, axis_info, H_img, W_img, _wage,
+                                          density_min_distance=min_dist, density_prominence=prominence)
+                _p1 = render_rays_and_candidates(orig_rgb, axis_info,
+                                                 _wd["density_pts"], _wd["classical_pts"])
+                _wcand = list(_wd["density_pts"]) + list(_wd["classical_pts"])
+                _p5 = render_localization_overlay(orig_rgb, axis_info, _wd["final_axis_pts"], _wcand)
+
+                def _wb64(arr):
+                    _bb = _iow.BytesIO()
+                    PILImage.fromarray(arr).resize((_wdw, _wdh)).save(_bb, format="PNG")
+                    return "data:image/png;base64," + _b64w.b64encode(_bb.getvalue()).decode("ascii")
+
+                walkthrough_payload = {
+                    "image_id": iid,
+                    "true_age": int(row.get("age", 0)),
+                    "pred_age": _wage,
+                    "panel_rays_b64": _wb64(_p1),
+                    "panel_final_b64": _wb64(_p5),
+                    "data": _wd,
+                }
+                print(f"    [cards] walkthrough zbudowany dla {iid} (wiek {_wage})")
+            except Exception as e:
+                print(f"    [cards] walkthrough błąd dla {iid}: {e}")
+
         axis_data[iid] = {
             "mask":           mask_arr,
             "axis_info":      axis_info,
@@ -550,7 +587,20 @@ def _compute_axis_data_for_samples(
     if len(grids) == 0 and total > 0:
         print(f"    [cards] OSTRZEŻENIE: 0/{total} próbek przetworzonych — "
               f"sprawdź --image-dir={image_dir}")
-    return grids, axis_data
+    return grids, axis_data, walkthrough_payload
+
+
+def _pick_walkthrough_iid(samples: list[dict]) -> str:
+    """Deterministycznie wybierz JEDEN otolit na sekcję „krok po kroku".
+
+    Preferuje wiek najbliższy 4 (widoczne pierścienie, nie skrajny), remisy rozstrzyga
+    alfabetycznie po image_id → ten sam przykład przy każdym uruchomieniu (seed niezależne).
+    """
+    if not samples:
+        return ""
+    def _key(s):
+        return (abs(int(s.get("predicted_age", 0)) - 4), str(s.get("image_id", "")))
+    return str(min(samples, key=_key)["image_id"])
 
 
 def _reload_cards_from_disk(output_dir: Path) -> dict[str, list[Path]]:
@@ -640,7 +690,7 @@ def _step_cards(
     if not Path(image_dir).exists():
         print(f"    [cards] OSTRZEŻENIE: --image-dir nie istnieje: {image_dir} "
               f"— karty zostaną pominięte")
-        return {"best": [], "worst": []}, {}, {}
+        return {"best": [], "worst": []}, {}, {}, None
 
     top_k_best = cfg_emb.inference.increment_samples.top_k_best
     top_k_worst = cfg_emb.inference.increment_samples.top_k_worst
@@ -648,6 +698,7 @@ def _step_cards(
     opencv_ref_all: dict = {}   # image_id → interactive OpenCV-reference data (Kierunek A)
     loc_quality: dict[str, list] = {}   # cond_key → per-card localisation stats (Kierunek B)
     loc_methods: dict[str, list] = {}   # method → [{image_id, true/pred age, b64, n_final}] (sekcje I/J/K)
+    walkthrough = None                  # step-by-step DP example (jeden otolit, pierwsza sekcja wizualna)
 
     for cond_key, pred_csv in pred_csvs.items():
         if not Path(pred_csv).exists():
@@ -665,9 +716,11 @@ def _step_cards(
 
         cond_dir = output_dir / cond_key
         all_samples = list(best) + list(worst)
-        importance_grids, axis_data = _compute_axis_data_for_samples(
+        importance_grids, axis_data, wt = _compute_axis_data_for_samples(
             all_samples, image_dir, cfg_cond, ckpt_cond, cond_dir,
         )
+        if walkthrough is None and wt is not None:      # pierwsza kondycja z sygnałem (emb_on_emb)
+            walkthrough = wt
 
         cards_dir = output_dir / "cards" / cond_key
         best_saved = save_reasoning_cards(
@@ -741,7 +794,7 @@ def _step_cards(
     except Exception as e:
         print(f"    [cards] localization_quality błąd: {e}")
 
-    return cards, opencv_ref_all, loc_methods
+    return cards, opencv_ref_all, loc_methods, walkthrough
 
 
 def _compute_dataset_stats(
@@ -1022,7 +1075,7 @@ def main(argv: list[str] | None = None) -> None:
 
     print("\n[8/9] CARDS — karty rozumowania")
     image_dir = Path(args.image_dir)
-    increment_cards, opencv_reference, localization_methods = _step_cards(
+    increment_cards, opencv_reference, localization_methods, localization_walkthrough = _step_cards(
         pred_csvs, cfg_emb, image_dir, output_dir, cond_models
     )
 
@@ -1066,6 +1119,7 @@ def main(argv: list[str] | None = None) -> None:
         model_info=model_info,
         opencv_reference=opencv_reference,
         localization_methods=localization_methods,
+        localization_walkthrough=localization_walkthrough,
     )
     print(f"  Report: {report_path}")
 

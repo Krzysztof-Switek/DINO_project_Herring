@@ -520,6 +520,46 @@ def render_localization_overlay(
     return img
 
 
+_RAY_COLOR = (110, 110, 110)     # faint gray — the n_dirs measurement rays (walkthrough panel 1)
+
+
+def render_rays_and_candidates(
+    image: np.ndarray,
+    axis_info: Optional[dict],
+    density_pts: Optional[list],
+    classical_pts: Optional[list],
+    n_dirs: int = 48,
+) -> np.ndarray:
+    """Panel 1 of the DP walkthrough: otolith + ``n_dirs`` faint rays nucleus→contour,
+    with density candidates (yellow) and classical candidates (green) at their pixels.
+
+    Shows where candidates come from — every local maximum along every ray, in all
+    directions — before they are reduced to the 1D radius (kolejne panele).
+    """
+    img = np.ascontiguousarray(image[..., :3]).copy()
+    H = img.shape[0]
+    lt = max(2, H // 300)
+    if axis_info is not None:
+        contour = axis_info.get("contour")
+        centroid = axis_info.get("centroid")
+        if contour is not None and centroid is not None:
+            cx, cy = int(centroid[0]), int(centroid[1])
+            cpts = contour.reshape(-1, 2)
+            idx_sel = np.linspace(0, len(cpts) - 1, min(n_dirs, len(cpts)), dtype=int)
+            for ci in idx_sel:
+                cv2.line(img, (cx, cy), (int(cpts[ci][0]), int(cpts[ci][1])),
+                         _RAY_COLOR, 1, cv2.LINE_AA)
+            cv2.drawContours(img, [contour], -1, _CONTOUR_COLOR, lt)
+            if axis_info.get("far_edge"):
+                fx, fy = axis_info["far_edge"]
+                cv2.line(img, (cx, cy), (int(fx), int(fy)), _AXIS_COLOR, lt)
+    if density_pts:
+        _draw_small_points(img, density_pts, _CAND_COLOR, max(1, H // 500))
+    if classical_pts:
+        _draw_small_points(img, classical_pts, _CLASSICAL_COLOR, max(1, H // 500))
+    return img
+
+
 # ---------------------------------------------------------------------------
 # Saving helpers
 # ---------------------------------------------------------------------------

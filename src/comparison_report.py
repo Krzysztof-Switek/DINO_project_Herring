@@ -809,6 +809,143 @@ def _section_opencv(opencv_reference: dict | None) -> str:
     return html
 
 
+def _section_localization_walkthrough(payload: dict | None) -> str:
+    """Sekcja edukacyjna „krok po kroku": na JEDNYM otolicie pokazuje, jak z kandydatów
+    z 48 promieni (density + klasyka) metoda DP wybiera finalne przyrosty (czerwone).
+
+    ``payload`` (z run_pipeline): ``image_id, true_age, pred_age, panel_rays_b64,
+    panel_final_b64, data`` gdzie ``data`` = wynik ``ring_extraction.dp_walkthrough_data``.
+    """
+    if not payload or not payload.get("data"):
+        return ""
+    d = payload["data"]
+    age = int(payload.get("pred_age", 0))
+    gap = float(d.get("dp_min_gap", 0.04))
+
+    # --- Panel 2: profile 3 promieni (surowy vs znormalizowany per-promień) + piki ---
+    profiles = d.get("sample_profiles") or []
+    prof_b64 = ""
+    if profiles:
+        n = len(profiles)
+        fig, axes = plt.subplots(1, n, figsize=(3.6 * n, 2.8), squeeze=False)
+        for j, pr in enumerate(profiles):
+            ax = axes[0][j]
+            t = pr["t"]
+            ax.plot(t, pr["raw"], color="#999", lw=1.0, label="surowy")
+            ax.plot(t, pr["norm"], color="#2a78d6", lw=1.6, label="znorm. [0,1]")
+            for pt in pr.get("peak_t", []):
+                ax.axvline(pt, color="#e01e1e", ls="--", lw=1.0)
+            ax.set_title(f"promień {j + 1}", fontsize=9)
+            ax.set_xlabel("t (jądro→brzeg)", fontsize=8)
+            ax.set_ylim(-0.05, 1.05)
+            if j == 0:
+                ax.legend(fontsize=7, loc="upper right")
+        fig.tight_layout()
+        prof_b64 = _fig_to_b64(fig)
+        plt.close(fig)
+
+    # --- Panel 3: głosowanie po promieniu (piki density vs klasyka, x=t) ---
+    dpk = d.get("density_peaks") or []
+    cpk = d.get("classical_peaks") or []
+    vote_b64 = ""
+    if dpk or cpk:
+        fig, ax = plt.subplots(figsize=(9, 2.6))
+        dt = [p[0] for p in dpk]
+        ct = [p[0] for p in cpk]
+        if dt:
+            ax.hist(dt, bins=40, range=(0, 1), color="#f4b400", alpha=0.75, label="density (48 promieni)")
+        if ct:
+            ax.hist(ct, bins=40, range=(0, 1), color="#0a9d6e", alpha=0.55, label="klasyka (48 promieni)")
+        for (mt, _s, _st) in (d.get("density_clusters") or []):
+            ax.axvline(mt, color="#c58a00", ls=":", lw=0.8)
+        ax.set_xlabel("t (znormalizowany promień, jądro→brzeg)", fontsize=9)
+        ax.set_ylabel("liczba pików (kierunków)", fontsize=9)
+        ax.set_title("Głosowanie po promieniu — ile z 48 kierunków ma pik na danym promieniu", fontsize=10)
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        vote_b64 = _fig_to_b64(fig)
+        plt.close(fig)
+
+    # --- Panel 4: score pierścieni + wybór DP (wyróżnione `wiek` wybranych) ---
+    merged = d.get("merged") or []
+    chosen = set(round(t, 4) for t in (d.get("chosen_t") or []))
+    dp_b64 = ""
+    if merged:
+        fig, ax = plt.subplots(figsize=(9, 2.8))
+        src_color = {"consensus": "#7b1fa2", "density": "#f4b400", "classical": "#0a9d6e"}
+        for (t, score, source) in merged:
+            picked = round(t, 4) in chosen
+            ax.bar(t, score, width=0.012,
+                   color=src_color.get(source, "#888"),
+                   edgecolor="#e01e1e" if picked else "none",
+                   linewidth=2.2 if picked else 0.0)
+        for t in (d.get("chosen_t") or []):
+            ax.axvline(t, color="#e01e1e", ls="--", lw=1.0, alpha=0.6)
+        ax.set_xlim(0, 1)
+        ax.set_xlabel("t (promień)", fontsize=9)
+        ax.set_ylabel("score pierścienia\n(support × siła; konsensus = suma)", fontsize=8)
+        n_sel = len(d.get("chosen_t") or [])
+        _cap = (f"wybrano {n_sel} z {age} (tyle odrębnych pierścieni-kandydatów)"
+                if n_sel < age else f"dokładnie {age}")
+        ax.set_title(f"Wybór DP: {_cap} (czerwona ramka), min. rozstaw {gap:g}", fontsize=10)
+        # legenda źródeł
+        from matplotlib.patches import Patch
+        ax.legend(handles=[Patch(color=c, label=l) for l, c in
+                           (("konsensus", "#7b1fa2"), ("density", "#f4b400"), ("klasyka", "#0a9d6e"))],
+                  fontsize=8, loc="upper right")
+        fig.tight_layout()
+        dp_b64 = _fig_to_b64(fig)
+        plt.close(fig)
+
+    def _fig_block(title, desc, b64):
+        if not b64:
+            return ""
+        return (f'<h3 style="margin:0.8em 0 0.2em;">{title}</h3>'
+                f'<p style="margin:0 0 0.4em;color:#555;">{desc}</p>{_img_tag(b64)}')
+
+    n_final = len(d.get("chosen_t") or [])
+    note = ("" if n_final >= age else
+            f' <b>Uwaga:</b> tu DP znalazło tylko <b>{n_final}</b> odrębnych pierścieni (wiek {age}) — '
+            'gęste piki klasyki sklejają się w klastrowaniu po promieniu; to znane ograniczenie do poprawy.')
+    html = (
+        f'<section id="loc-walkthrough"><h2>Lokalizacja — jak wybieramy przyrosty (krok po kroku)</h2>'
+        f'<p>Na jednym otolicie (<code>{payload.get("image_id","")[:60]}</code>, wiek modelu '
+        f'<b>{age}</b>, prawdziwy {int(payload.get("true_age",0))}) pokazujemy, jak z kandydatów na '
+        f'<b>48 promieniach</b> (density modelu + klasyka obrazu) metoda <b>DP</b> (sekcja L) wybiera '
+        f'finalne przyrosty (czerwone).{note} Ta sama logika działa na wszystkich 20 otolitach niżej.</p>'
+    )
+    html += _fig_block(
+        "Krok 1 — kandydaci ze wszystkich 48 kierunków",
+        "Z jądra rzucamy 48 promieni do konturu. Wzdłuż każdego szukamy pików: "
+        "<b>żółte</b> = mapa density modelu, <b>zielone</b> = klasyka (jasność obrazu). "
+        "Cyjan = kontur, żółta linia = oś pomiaru.",
+        payload.get("panel_rays_b64", ""))
+    html += _fig_block(
+        "Krok 2 — profil promienia i normalizacja per-promień",
+        "Każdy promień normalizujemy osobno do [0,1] (żeby jasne i ciemne kierunki były "
+        "porównywalne), potem szukamy pików (czerwone linie). Trzy przykładowe promienie:",
+        prof_b64)
+    html += _fig_block(
+        "Krok 3 — głosowanie po promieniu",
+        "Każdy pik ma promień <code>t</code> (0=jądro, 1=brzeg). Prawdziwy pierścień jest "
+        "koncentryczny → pojawia się na tym samym <code>t</code> w wielu kierunkach. Skupiska = "
+        "pierścienie-kandydaci.",
+        vote_b64)
+    html += _fig_block(
+        "Krok 4 — score pierścieni i wybór DP",
+        "Score pierścienia = ile kierunków go widziało × siła; gdy density i klasyka zgadzają się "
+        "co do promienia, score się <b>sumuje</b> (konsensus). DP wybiera dokładnie <code>wiek</code> "
+        "pierścieni o najwyższym łącznym score, z <b>wymuszonym rozstawem</b> (nie skupia pików).",
+        dp_b64)
+    html += _fig_block(
+        "Krok 5 — rzut na oś: finalne przyrosty",
+        "Wybrane promienie rzutujemy na oś pomiaru (jądro→brzeg) — <b>czerwone</b> punkty. "
+        "To jest wynik sekcji L dla tego otolitu.",
+        payload.get("panel_final_b64", ""))
+    html += '</section>'
+    return html
+
+
 _LOC_METHOD_META = {
     "density":   ("I", "density (model)",
                   "Top-<code>wiek</code> pierścieni z mapy density modelu (48 promieni z jądra)."),
@@ -866,6 +1003,7 @@ def build_comparison_report(
     model_info: dict | None = None,
     opencv_reference: dict | None = None,
     localization_methods: dict | None = None,
+    localization_walkthrough: dict | None = None,
 ) -> None:
     """Build and write a self-contained HTML comparison report.
 
@@ -916,6 +1054,7 @@ def build_comparison_report(
     body += _section_e(increment_cards)
     body += _section_f(model_info)
     body += _section_opencv(opencv_reference)
+    body += _section_localization_walkthrough(localization_walkthrough)
     body += _section_localization_methods(localization_methods)
 
     html = f"""<!DOCTYPE html>

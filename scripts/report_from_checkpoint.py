@@ -143,7 +143,7 @@ def main() -> int:
     # --- Krok 8: karty rozumowania (ten sam _step_cards) ---
     print("\n[2/4] CARDS — karty rozumowania")
     cond_models = {cond_key: (cfg, ckpt)}
-    increment_cards, opencv_reference, localization_methods = _step_cards(
+    increment_cards, opencv_reference, localization_methods, localization_walkthrough = _step_cards(
         pred_csvs, cfg, Path(cfg.data.image_dir), output_dir, cond_models)
 
     # --- Wyniki + logi treningu (parsujemy ISTNIEJĄCY train.log) ---
@@ -180,6 +180,7 @@ def main() -> int:
         model_info=model_info,
         opencv_reference=opencv_reference,
         localization_methods=localization_methods,
+        localization_walkthrough=localization_walkthrough,
     )
 
     # --- Summary (ten sam _write_pipeline_summary) ---

@@ -313,3 +313,53 @@ def test_fuse_increments_dp_enforces_spacing():
     assert len(out["final_axis_pts"]) == 2
     # k większe niż liczba klastrów → zwraca tyle, ile jest (bez wysypki)
     assert len(fuse_increments(density, [], 9, axis_info, method="dp")["final_t"]) == 3
+
+
+def test_merge_clusters_consensus_sums_scores():
+    """_merge_clusters: pierścień widziany przez density I klasykę na tym samym promieniu →
+    jeden pierścień 'consensus' o zsumowanym score; pierścienie solo zachowują źródło."""
+    from src.ring_extraction import _merge_clusters
+    H, W = 120, 200
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    cx, cy = axis_info["centroid"]
+    fx, fy = axis_info["far_edge"]
+
+    def pk(t):
+        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)))
+
+    density = [pk(0.30)] * 3 + [pk(0.70)] * 2          # 0.30 (support3), 0.70 (support2, tylko density)
+    classical = [pk(0.31)] * 4                          # 0.31 ~ 0.30 → konsensus
+    merged = {round(t, 2): (score, src) for (t, score, src) in _merge_clusters(density, classical)}
+    # pierścień ~0.30: konsensus, score = density(3×1) + klasyka(4×1) = 7
+    key = min(merged, key=lambda k: abs(k - 0.30))
+    assert merged[key][1] == "consensus"
+    assert merged[key][0] == 7.0
+    # pierścień 0.70: tylko density
+    key2 = min(merged, key=lambda k: abs(k - 0.70))
+    assert merged[key2][1] == "density"
+
+
+def test_dp_walkthrough_data_keys_and_consistency():
+    """dp_walkthrough_data: zwraca komplet artefaktów, a chosen_t == to, co wybrałaby metoda dp."""
+    import numpy as np
+    from src.ring_extraction import dp_walkthrough_data, fuse_increments, density_peaks, classical_increments
+    H, W = 140, 220
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    rng = np.random.default_rng(0)
+    grid = rng.random((10, 16)).astype(np.float32)
+    gray = rng.random((H, W)).astype(np.float32)
+    age = 3
+    wd = dp_walkthrough_data(grid, gray, axis_info, H, W, age)
+    for key in ("density_peaks", "classical_peaks", "density_pts", "classical_pts",
+                "density_clusters", "classical_clusters", "merged", "chosen_t",
+                "final_axis_pts", "sample_profiles"):
+        assert key in wd, f"brak klucza {key}"
+    assert len(wd["sample_profiles"]) >= 1
+    p0 = wd["sample_profiles"][0]
+    assert len(p0["t"]) == len(p0["raw"]) == len(p0["norm"])
+    assert 0.0 <= min(p0["norm"]) and max(p0["norm"]) <= 1.0
+    # chosen_t z walkthrough == final_t z prawdziwej fuzji dp (ta sama logika)
+    dpk, _ = density_peaks(grid, axis_info, H, W)
+    cpk = classical_increments(gray, axis_info)["peaks"]
+    ref = fuse_increments(dpk, cpk, age, axis_info, method="dp")["final_t"]
+    assert wd["chosen_t"] == ref

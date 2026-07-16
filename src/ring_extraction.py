@@ -403,6 +403,38 @@ def density_peaks(
     )
 
 
+def _merge_clusters(density_pks, classical_pks, t_tol: float = 0.06):
+    """Merge density + classical radius-clusters into candidate rings ``[(t, score, source)]``.
+
+    A density ring corroborated by a classical ring at a similar radius (``t_tol``) becomes
+    one **consensus** ring whose score is the SUM of both ``support × mean_strength`` — this is
+    how ``fuse_increments(method="dp")`` (and the step-by-step walkthrough) reward agreement
+    between the two sources. Rings seen by only one source stay in with their own score.
+    ``source`` ∈ {``"consensus"``, ``"density"``, ``"classical"``}.
+    """
+    dclust = _cluster_by_radius(density_pks, t_tol)
+    cclust = _cluster_by_radius(classical_pks, t_tol)
+    merged: List[Tuple[float, float, str]] = []
+    used = [False] * len(cclust)
+    for (dt, ds, dstr) in dclust:
+        score = ds * dstr
+        t, source = dt, "density"
+        best_i, best_d = -1, t_tol
+        for i, c in enumerate(cclust):
+            if not used[i] and abs(c[0] - dt) <= best_d:
+                best_i, best_d = i, abs(c[0] - dt)
+        if best_i >= 0:                                  # density ring corroborated by classical
+            c = cclust[best_i]
+            used[best_i] = True
+            score += c[1] * c[2]
+            t, source = 0.5 * (dt + c[0]), "consensus"
+        merged.append((t, score, source))
+    for i, c in enumerate(cclust):                       # classical-only rings still eligible
+        if not used[i]:
+            merged.append((c[0], c[1] * c[2], "classical"))
+    return merged
+
+
 def fuse_increments(
     density_pks, classical_pks, predicted_age: int, axis_info: dict,
     *, method: str = "consensus", t_tol: float = 0.06, dp_min_gap: float = 0.04,
@@ -433,27 +465,8 @@ def fuse_increments(
         chosen = _topk_cluster_t(_cluster_by_radius(classical_pks, t_tol), k)
         cand = [(p[2], p[3]) for p in classical_pks]
     elif method == "dp":
-        dclust = _cluster_by_radius(density_pks, t_tol)
-        cclust = _cluster_by_radius(classical_pks, t_tol)
-        merged: List[Tuple[float, float]] = []       # (t, score); consensus rings sum both scores
-        used = [False] * len(cclust)
-        for (dt, ds, dstr) in dclust:
-            score = ds * dstr
-            t = dt
-            best_i, best_d = -1, t_tol
-            for i, c in enumerate(cclust):
-                if not used[i] and abs(c[0] - dt) <= best_d:
-                    best_i, best_d = i, abs(c[0] - dt)
-            if best_i >= 0:                          # density ring corroborated by classical
-                c = cclust[best_i]
-                used[best_i] = True
-                score += c[1] * c[2]
-                t = 0.5 * (dt + c[0])
-            merged.append((t, score))
-        for i, c in enumerate(cclust):               # classical-only rings still eligible
-            if not used[i]:
-                merged.append((c[0], c[1] * c[2]))
-        chosen = _dp_select_t(merged, k, dp_min_gap)
+        merged = _merge_clusters(density_pks, classical_pks, t_tol)
+        chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap)
         cand = [(p[2], p[3]) for p in density_pks] + [(p[2], p[3]) for p in classical_pks]
     else:  # consensus
         dclust = _cluster_by_radius(density_pks, t_tol)
@@ -478,3 +491,93 @@ def fuse_increments(
     return {"final_t": chosen,
             "final_axis_pts": _project_to_axis(chosen, axis_info),
             "candidate_pts": cand}
+
+
+def _example_ray_profiles(grid, axis_info: dict, image_h: int, image_w: int, *,
+                          n_dirs: int = 48, n_samples: int = 64, min_distance: int = 3,
+                          prominence: float = 0.1, inner_margin: float = 0.05,
+                          edge_margin: float = 0.08, n_example: int = 3) -> List[dict]:
+    """A few representative per-ray profiles (for the walkthrough panel „normalizacja").
+
+    Mirrors one ray of :func:`_all_ray_peaks`: samples the signal jądro→kontur, normalises
+    per-ray to [0,1], finds peaks. Returns ``[{t, raw, norm, peak_t, contour_pt}]`` for
+    ``n_example`` rays evenly spaced among the ``n_dirs`` directions.
+    """
+    contour = axis_info.get("contour") if axis_info else None
+    centroid = axis_info.get("centroid") if axis_info else None
+    if contour is None or centroid is None:
+        return []
+    g = _to_numpy(grid)
+    if g.ndim == 3:
+        g = g.mean(axis=2).astype(np.float32)
+    cpts = contour.reshape(-1, 2)
+    if len(cpts) < 3:
+        return []
+    idx_sel = np.linspace(0, len(cpts) - 1, min(n_dirs, len(cpts)), dtype=int)
+    pick = np.linspace(0, len(idx_sel) - 1, min(n_example, len(idx_sel)), dtype=int)
+    out: List[dict] = []
+    for pi in pick:
+        ci = idx_sel[int(pi)]
+        cpt = (int(cpts[ci][0]), int(cpts[ci][1]))
+        profile, _ = sample_profile_along_axis(g, centroid, cpt, image_h, image_w, n_samples=n_samples)
+        p = profile.astype(np.float32)
+        rng = float(p.max() - p.min())
+        norm = (p - p.min()) / rng if rng > 1e-6 else np.zeros_like(p)
+        peak_t: List[float] = []
+        if rng > 1e-6:
+            idxs, _ = find_peaks(norm, distance=max(1, int(min_distance)), prominence=float(prominence))
+            peak_t = [float(i / max(1, n_samples - 1)) for i in idxs
+                      if inner_margin <= i / max(1, n_samples - 1) <= 1.0 - edge_margin]
+        out.append({
+            "t": np.linspace(0.0, 1.0, n_samples).tolist(),
+            "raw": p.tolist(),
+            "norm": norm.tolist(),
+            "peak_t": peak_t,
+            "contour_pt": cpt,
+        })
+    return out
+
+
+def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int, image_w: int,
+                        predicted_age: int, *, n_dirs: int = 48, n_samples: int = 64,
+                        t_tol: float = 0.06, dp_min_gap: float = 0.04,
+                        density_min_distance: int = 3, density_prominence: float = 0.1,
+                        classical_smooth_sigma: float = 0.0, classical_min_distance: int = 1,
+                        classical_prominence: float = 0.02, inner_margin: float = 0.05,
+                        edge_margin: float = 0.08, n_example_rays: int = 3) -> dict:
+    """All intermediate artifacts of ``fuse_increments(method="dp")`` for ONE otolith.
+
+    Feeds the step-by-step report section: candidates from 48 rays (density + classical),
+    per-ray profiles, radius-clusters, merged candidate rings with scores, and the DP
+    selection. Reuses the SAME helpers as the real fusion, so what it shows == what runs.
+    """
+    dpk, dpts = density_peaks(density_grid, axis_info, image_h, image_w,
+                              n_dirs=n_dirs, n_samples=n_samples, min_distance=density_min_distance,
+                              prominence=density_prominence, inner_margin=inner_margin,
+                              edge_margin=edge_margin)
+    cinc = classical_increments(gray_image, axis_info, n_dirs=n_dirs, n_samples=n_samples,
+                                smooth_sigma=classical_smooth_sigma, min_distance=classical_min_distance,
+                                prominence=classical_prominence, inner_margin=inner_margin,
+                                edge_margin=edge_margin, t_tol=t_tol)
+    cpk, cpts = cinc["peaks"], cinc["candidate_pts"]
+    merged = _merge_clusters(dpk, cpk, t_tol)
+    k = max(0, int(predicted_age))
+    chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap)
+    return {
+        "predicted_age": k,
+        "n_dirs": n_dirs,
+        "dp_min_gap": dp_min_gap,
+        "density_peaks": dpk,
+        "classical_peaks": cpk,
+        "density_pts": dpts,
+        "classical_pts": cpts,
+        "density_clusters": _cluster_by_radius(dpk, t_tol),
+        "classical_clusters": _cluster_by_radius(cpk, t_tol),
+        "merged": merged,
+        "chosen_t": chosen,
+        "final_axis_pts": _project_to_axis(chosen, axis_info),
+        "sample_profiles": _example_ray_profiles(
+            density_grid, axis_info, image_h, image_w, n_dirs=n_dirs, n_samples=n_samples,
+            min_distance=density_min_distance, prominence=density_prominence,
+            inner_margin=inner_margin, edge_margin=edge_margin, n_example=n_example_rays),
+    }
