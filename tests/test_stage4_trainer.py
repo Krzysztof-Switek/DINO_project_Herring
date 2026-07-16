@@ -359,6 +359,62 @@ def test_early_stopping_saves_best_pt(tmp_path):
     assert (trainer.checkpoint_dir / "best.pt").exists()
 
 
+def test_density_gate_delays_stop_until_density_alive(tmp_path):
+    """16.07: with use_density_head, early-stopping/best.pt WAIT until density is alive.
+
+    Constant val_mae would normally stop at e3 (patience 2). But while density_active=0 the
+    gate holds (no patience, no stop); density wakes at e5, then patience(2) → stop ~e7.
+    """
+    from src.trainer import Trainer
+
+    class DeadThenAliveTrainer(Trainer):
+        def validate(self):
+            self._vc = getattr(self, "_vc", 0) + 1
+            self.last_val_metrics = {"density_active": (0.0 if self._vc <= 4 else 2.0)}
+            return 1.0, 5.0                       # constant val_mae
+
+    cfg = _make_cfg(tmp_path, epochs=10)
+    cfg.model.use_density_head = True
+    cfg.training.early_stopping_patience = 2
+    cfg.training.early_stopping_min_delta = 0.001
+    cfg.training.min_epochs = 0
+    cfg.training.min_density_active = 1.0
+    cfg.training.keep_only_best = False           # count per-epoch checkpoints as an epoch proxy
+
+    model = _make_model(cfg)
+    trainer = DeadThenAliveTrainer(cfg, model, _make_loader(), _make_loader())
+    trainer.fit()
+
+    ckpt_files = list(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt"))
+    assert len(ckpt_files) >= 6, f"gate should delay stop past naive e3, ran {len(ckpt_files)}"
+    assert (trainer.checkpoint_dir / "best.pt").exists()
+
+
+def test_density_gate_noop_without_density_head(tmp_path):
+    """use_density_head=False → gate inert; identical to old early-stopping (stop at e3)."""
+    from src.trainer import Trainer
+
+    class ConstantValTrainer(Trainer):
+        def validate(self):
+            self.last_val_metrics = {}
+            return 1.0, 5.0
+
+    cfg = _make_cfg(tmp_path, epochs=10)
+    cfg.model.use_density_head = False
+    cfg.training.early_stopping_patience = 2
+    cfg.training.early_stopping_min_delta = 0.001
+    cfg.training.min_epochs = 0
+    cfg.training.min_density_active = 1.0         # ignored — no density head
+    cfg.training.keep_only_best = False
+
+    model = _make_model(cfg)
+    trainer = ConstantValTrainer(cfg, model, _make_loader(), _make_loader())
+    trainer.fit()
+
+    ckpt_files = list(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt"))
+    assert len(ckpt_files) == 3
+
+
 def test_trainer_supports_mil_head_type(tmp_path):
     """Trener musi działać dla head_type='mil' (bez CORAL)."""
     cfg = _make_cfg(tmp_path, epochs=1)

@@ -89,6 +89,16 @@ class TrainingConfig(BaseModel):
     # ema > 0 the monitored value is smoothed as v_ema = ema*v + (1-ema)*v_ema, and
     # best.pt / early-stop track v_ema. 0.0 = disabled (raw metric, old behaviour).
     early_stopping_ema: float = Field(0.0, ge=0.0, le=1.0)
+    # Density-maturity gate for checkpoint selection (16.07). The density (localisation)
+    # head trains SLOWER than the age head; on the 15.07_rx run best.pt was frozen on
+    # val_mae at e17 while density_active was still 0 (density woke at e23). These decouple
+    # best.pt / early-stopping from age alone so the saved model has a TRAINED density head:
+    #   min_epochs         — early stopping cannot fire before this epoch (floor).
+    #   min_density_active — when use_density_head, best.pt is only eligible / patience only
+    #                        counts once mean density_active ≥ this (density is "alive").
+    # Defaults 0 = old behaviour (no gating).
+    min_epochs: int = Field(0, ge=0)
+    min_density_active: float = Field(0.0, ge=0.0)
     device: str = "auto"
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"

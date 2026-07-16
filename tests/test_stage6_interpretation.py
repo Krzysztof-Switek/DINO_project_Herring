@@ -139,6 +139,15 @@ def test_compute_cls_attention_fallback_none():
     assert compute_cls_attention(model, _make_single_image_tensor()) is None
 
 
+def test_compute_cls_attention_patched_fallback_none():
+    """Monkey-patched CLS attention (16.07) also degrades to None on the mock (no .blocks),
+    without raising — so run_pipeline can fall back to the L2 proxy."""
+    from src.interpretation import compute_cls_attention_patched
+    cfg = _make_cfg()
+    model = _make_model(cfg); model.eval()
+    assert compute_cls_attention_patched(model, _make_single_image_tensor()) is None
+
+
 def test_patch_importance_accepts_3d_input():
     """compute_patch_importance must accept (3, H, W) without batch dim."""
     from src.interpretation import compute_patch_importance

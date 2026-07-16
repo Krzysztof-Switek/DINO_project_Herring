@@ -173,6 +173,69 @@ def compute_cls_attention(
     return cls_row.reshape(hp, hp).float().cpu()
 
 
+def compute_cls_attention_patched(
+    model: OtolithModel,
+    image_tensor: Tensor,
+) -> Optional[Tensor]:
+    """REAL CLS→patch attention via a temporary monkey-patch of the last block (16.07).
+
+    ``compute_cls_attention`` (hook on ``attn_drop``) fails on modern DINOv2: the block
+    computes ``scaled_dot_product_attention`` (fused → no softmax matrix) and ``attn_drop``
+    is a plain float, so there is nothing to hook. This function instead **temporarily
+    replaces** ``backbone.blocks[-1].attn.forward`` with a maths-identical version that
+    materialises ``softmax(q·kᵀ · scale)``, captures it, runs ONE forward, and restores the
+    original in ``finally``. Returns the mean CLS→patch attention as a ``(H_p, W_p)`` grid,
+    or ``None`` (safe fallback to the L2 proxy) when the layout is unexpected — e.g. the mock
+    backbone. Weights are untouched; this is post-hoc and read-only.
+    """
+    import types
+    if image_tensor.dim() == 3:
+        image_tensor = image_tensor.unsqueeze(0)
+    backbone = model.backbone
+    try:
+        attn = backbone.blocks[-1].attn
+    except (AttributeError, IndexError, TypeError):
+        return None
+    if not all(hasattr(attn, a) for a in ("qkv", "proj", "num_heads", "scale")):
+        return None
+
+    captured: Dict[str, Tensor] = {}
+
+    def _patched_forward(self, x, *args, **kwargs):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
+        q, k, v = torch.unbind(qkv, 2)
+        q, k, v = [t.transpose(1, 2) for t in (q, k, v)]      # (B, heads, N, head_dim)
+        a = (q @ k.transpose(-2, -1)) * self.scale            # (B, heads, N, N)
+        a = a.softmax(dim=-1)
+        captured["a"] = a.detach()
+        out = (a @ v).transpose(1, 2).contiguous().view(B, N, C)
+        return self.proj_drop(self.proj(out))
+
+    orig_forward = attn.forward
+    try:
+        attn.forward = types.MethodType(_patched_forward, attn)
+        device = next(model.parameters()).device
+        model.eval()
+        with torch.no_grad():
+            backbone.forward_features(image_tensor.to(device))
+    except Exception:
+        return None
+    finally:
+        attn.forward = orig_forward
+
+    a = captured.get("a")
+    if a is None or a.dim() != 4:                             # expect (B, heads, T, T)
+        return None
+    cls_row = a[0, :, 0, 1:].mean(0)                          # avg heads → CLS→(non-CLS)
+    n = cls_row.shape[0]
+    hp = int(round(n ** 0.5))
+    if hp < 1:
+        return None
+    cls_row = cls_row[-(hp * hp):]                            # drop register tokens → last hp*hp patches
+    return cls_row.reshape(hp, hp).float().cpu()
+
+
 def importance_to_heatmap(
     importance_grid: Tensor,
     image_size: int,

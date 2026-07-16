@@ -325,7 +325,7 @@ def _compute_axis_data_for_samples(
     from src.dataset import build_transforms
     from src.inference import load_model_from_checkpoint
     from src.interpretation import (compute_patch_importance, compute_coral_gradcam,
-                                     compute_cls_attention)
+                                     compute_cls_attention, compute_cls_attention_patched)
     from src.otolith_axis import (
         detect_axis,
         find_centroid,
@@ -378,7 +378,11 @@ def _compute_axis_data_for_samples(
             # CORAL-head attributions (age verdict): Grad-CAM + CLS attention.
             # Both are internally defensive → None on failure (11.07 Punkt 7).
             _gc = compute_coral_gradcam(model, tensor)
-            _ca = compute_cls_attention(model, tensor)
+            # Prawdziwa uwaga CLS: najpierw monkey-patch (działa na fused SDPA), potem hook,
+            # a gdy oba zawiodą → niżej fallback do proxy L2 (etykieta „CLS niedost.").
+            _ca = compute_cls_attention_patched(model, tensor)
+            if _ca is None:
+                _ca = compute_cls_attention(model, tensor)
             coral_gc_grid = _gc.cpu().numpy() if _gc is not None else None
             cls_attn_grid = _ca.cpu().numpy() if _ca is not None else None
             # Keep the CLS panel from ever being blank: when true CLS attention is

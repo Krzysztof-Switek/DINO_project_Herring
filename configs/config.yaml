@@ -23,9 +23,9 @@ model:
   use_density_head: true          # false = stare zachowanie (tylko MIL do lokalizacji)
   density_count_weight: 1.0       # waga straty density w sumie
   density_conc_weight: 1.0        # człon koncentracji (rozbija rozmyte rozwiązanie)
-  density_tv_weight: 0.1          # N+1 (15.07 Tor B): spójność przestrzenna (total-variation) mapy density
-                                  # → spójne plamy zamiast szumu, piki lokalizowalne. Liczone na patches.detach()
-                                  # (stop-gradient → wiek CORAL bezpieczny). Główny knob do strojenia „pierścieniowości".
+  density_tv_weight: 0.0          # N+2a (16.07): TV WYŁĄCZONE. Bieg 15.07_rx (TV=0.1) miał density martwe 22/26 epok
+                                  # — TV zdusiła aktywację na starcie. TV=0 izoluje wpływ backbone _reg na lokalizację
+                                  # (porównywalne z 13.07, też TV=0). Liczone na patches.detach() (wiek bezpieczny).
 
 data:
   image_dir: Z:/Photo/Otolithes/HER/Processed
@@ -54,6 +54,10 @@ training:
   early_stopping_metric: val_mae  # val_mae (zalecane) | val_loss
   early_stopping_min_delta: 0.005 # minimalna poprawa żeby zresetować licznik (>szum EMA → koniec mikro-resetów)
   early_stopping_ema: 0.3         # wygładzanie EMA metryki wyboru best.pt (0 = surowa; 0.3 = odporne na loterię)
+  min_epochs: 12                  # N+2a (16.07): early stopping NIE zadziała przed tą epoką (podłoga)
+  min_density_active: 1.0         # N+2a: best.pt/patience aktywne dopiero gdy density żyje (density_active≥1.0)
+                                  # — bieg 15.07_rx zamroził best.pt @e17, gdy density_active=0. To gwarantuje
+                                  # checkpoint z wytrenowaną lokalizacją (fallback: gdy density nigdy nie ożywa → jak dawniej)
   device: auto                    # auto | cpu | cuda | mps
   checkpoint_dir: checkpoints
   log_dir: logs

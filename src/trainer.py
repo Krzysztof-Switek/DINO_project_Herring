@@ -262,6 +262,16 @@ class Trainer:
         best_metric = float("inf")
         metric_ema: Optional[float] = None
         patience_counter = 0
+        # Density-maturity gate (16.07): the density (localisation) head trains slower than
+        # the age head. On 15.07_rx best.pt was frozen on val_mae at e17 while density_active
+        # was 0 (density woke at e23) → the saved model had an untrained density head. While
+        # the gate is CLOSED we still keep an age-best snapshot (safety net) but DON'T count
+        # patience / early-stop, so training continues until density wakes; when it opens we
+        # restart model-selection among density-mature epochs.
+        min_epochs = getattr(self.cfg.training, "min_epochs", 0)
+        min_density_active = getattr(self.cfg.training, "min_density_active", 0.0)
+        uses_density = bool(getattr(self.model, "use_density_head", False))
+        gate_open = False
 
         for epoch in range(1, self.cfg.training.epochs + 1):
             if freeze_until > 0 and epoch == freeze_until + 1:
@@ -290,13 +300,29 @@ class Trainer:
                 current = metric_ema
             else:
                 current = raw_metric
+            # Density-maturity gate: open once the density head is "alive". When it first
+            # opens, restart selection (best_metric/patience) so best.pt is chosen among
+            # mature epochs, not the early age-only ones. No gating when density head is off.
+            density_active = float((getattr(self, "last_val_metrics", None) or {})
+                                   .get("density_active", 0.0) or 0.0)
+            density_mature = (not uses_density) or min_density_active <= 0.0 \
+                or density_active >= min_density_active
+            if density_mature and not gate_open:
+                gate_open = True
+                best_metric = float("inf")
+                patience_counter = 0
+                if uses_density and min_density_active > 0.0:
+                    self._log(f"Density dojrzałe (active={density_active:.2f}) @e{epoch} "
+                              f"— start wyboru best.pt / early-stopping")
+
             improved = current < best_metric - min_delta
             if improved:
                 best_metric = current
                 patience_counter = 0
                 self._save_best_checkpoint(epoch, val_loss)   # copies epoch ckpt → best.pt
-            else:
+            elif gate_open:
                 patience_counter += 1
+            # gate closed → hold patience (training continues until density wakes)
 
             # Keep only best.pt — drop this epoch's checkpoint (best.pt already holds the
             # best model). Stops the run dir ballooning (each checkpoint ~265 MB).
@@ -306,7 +332,8 @@ class Trainer:
                 except OSError:
                     pass
 
-            if not improved and patience > 0 and patience_counter >= patience:
+            if (gate_open and not improved and patience > 0
+                    and patience_counter >= patience and epoch >= min_epochs):
                 self._log(
                     f"Early stopping — brak poprawy {metric_name} przez {patience} epok "
                     f"(best={best_metric:.4f})"
