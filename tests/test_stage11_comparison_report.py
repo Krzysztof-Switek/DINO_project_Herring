@@ -316,8 +316,9 @@ def test_section_c_confusion_bias_n_per_age(tmp_path):
     assert "Ile obrazów testowych" in content         # n-per-age caption
 
 
-def test_section_opencv_reference_widget(tmp_path):
-    """Kierunek A: opencv_reference renders the interactive Section H (11.07 Punkt 7/A)."""
+def test_section_opencv_removed(tmp_path):
+    """20.07: Section H (interactive OpenCV) is REMOVED from the report even when
+    opencv_reference is passed (kept out until cards/decision process are refined)."""
     from src.comparison_report import build_comparison_report
     out = tmp_path / "report.html"
     ref = {"a.jpg": {"img": "data:image/png;base64,iVBORw0KGgo=", "w": 60, "h": 40,
@@ -331,8 +332,7 @@ def test_section_opencv_reference_widget(tmp_path):
         output_path=out, opencv_reference=ref,
     )
     content = out.read_text(encoding="utf-8")
-    assert "H. OpenCV" in content
-    assert "cv-widgets" in content and "OPENCV_DATA" in content
+    assert "H. OpenCV" not in content and "OPENCV_DATA" not in content
 
 
 def test_section_e_reasoning_cards_embedded(tmp_path):
@@ -352,14 +352,16 @@ def test_section_e_reasoning_cards_embedded(tmp_path):
     assert "data:image/png;base64," in content   # karta osadzona
 
 
-def test_section_localization_methods_ijk(tmp_path):
-    """Sekcje I/J/K (bake-off density | klasyka | fuzja) renderują się z localization_methods."""
+def test_section_localization_methods_removed(tmp_path):
+    """20.07: the 20-otolith bake-off (sekcje I/J/K/L) is REMOVED from the report even when
+    localization_methods is passed — deferred until the reasoning cards + walkthrough are done."""
     from src.comparison_report import build_comparison_report
     out = tmp_path / "report.html"
     b64 = "data:image/png;base64,AAAA"
     loc = {m: [{"image_id": "fishA.jpg", "true_age": 3, "pred_age": 3, "b64": b64, "n_final": 3}]
-           for m in ("density", "classical", "consensus")}
+           for m in ("density", "classical", "consensus", "dp")}
     build_comparison_report(output_path=out, localization_methods=loc, **_base_kwargs())
     content = out.read_text(encoding="utf-8")
-    assert 'id="I"' in content and 'id="J"' in content and 'id="K"' in content
-    assert "density (model)" in content and "fuzja (konsensus)" in content
+    for sec in ('id="I"', 'id="J"', 'id="K"', 'id="L"'):
+        assert sec not in content
+    assert "density (model)" not in content

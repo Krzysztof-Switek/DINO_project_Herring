@@ -1053,9 +1053,10 @@ def build_comparison_report(
         body += _section_d(results)     # cross-evaluation is meaningless for 1 condition
     body += _section_e(increment_cards)
     body += _section_f(model_info)
-    body += _section_opencv(opencv_reference)
+    # Sekcja H (_section_opencv) oraz bake-off I/J/K/L (_section_localization_methods) USUNIĘTE
+    # 20.07 — nie wnoszą na tym etapie; wracamy do wielu otolitów po dopracowaniu kart i procesu
+    # decyzji. Zostaje sekcja „krok po kroku" (do redesignu). Metryki per_method dalej w JSON.
     body += _section_localization_walkthrough(localization_walkthrough)
-    body += _section_localization_methods(localization_methods)
 
     html = f"""<!DOCTYPE html>
 <html lang="pl">

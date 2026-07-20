@@ -650,6 +650,20 @@ def _localization_quality(axis_data: dict, samples: list[dict]) -> list[dict]:
         dists = np.sqrt(((fa[:, None, :] - ca[None, :, :]) ** 2).sum(-1))       # (F, C)
         return round(float(dists.min(axis=1).mean()), 2)
 
+    def _attn_bg_frac(grid, mask):
+        """Udział masy uwagi CLS poza maską (diagnostyka tła, 20.07). Model dostaje CAŁY
+        obraz (z tłem) → sprawdzamy, ile uwagi ucieka poza otolit."""
+        if grid is None or mask is None:
+            return None
+        m = np.asarray(mask)
+        import cv2 as _cv2
+        hm = _cv2.resize(np.asarray(grid, dtype=np.float32), (m.shape[1], m.shape[0]))
+        hm = np.clip(hm, 0.0, None)
+        tot = float(hm.sum())
+        if tot <= 1e-9:
+            return None
+        return round(float(hm[m == 0].sum() / tot), 4)
+
     rows: list[dict] = []
     for iid, d in axis_data.items():
         s = by_id.get(iid, {})
@@ -673,6 +687,7 @@ def _localization_quality(axis_data: dict, samples: list[dict]) -> list[dict]:
             "n_candidates": len(d.get("candidate_pts") or []),
             "n_classical": len(classical),
             "mean_dist_final_to_classical_px": _mean_dist(finals, classical),
+            "attn_bg_frac": _attn_bg_frac(d.get("cls_attention"), d.get("mask")),
             "per_method": per_method,
         })
     return rows
@@ -789,6 +804,9 @@ def _step_cards(
                                                     if dists else None),
                 "mean_n_candidates": (round(float(np.mean([r["n_candidates"] for r in rows])), 2)
                                       if rows else None),
+                "mean_attn_bg_frac": (round(float(np.mean(
+                    [r["attn_bg_frac"] for r in rows if r.get("attn_bg_frac") is not None])), 4)
+                    if any(r.get("attn_bg_frac") is not None for r in rows) else None),
                 "per_method": per_method_summary,
                 "per_card": rows,
             }

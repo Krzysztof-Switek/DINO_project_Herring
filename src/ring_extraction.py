@@ -219,22 +219,54 @@ def _all_ray_peaks(
 def _cluster_by_radius(peaks, t_tol: float = 0.06) -> List[Tuple[float, int, float]]:
     """peaks ``[(t, strength, ...)]`` → clusters ``[(mean_t, support, mean_strength)]``.
 
-    Greedy grouping on sorted normalised radius ``t`` (a real ring shows up at the
-    same radius across many rays). ``support`` = #peaks (rays) in the cluster.
+    Finds MODES of the radius-vote density (a real ring shows up at the same radius across
+    many rays), then assigns each peak to its nearest mode. ``support`` = #peaks (rays) in
+    the cluster. Modes are kept ≥ ``t_tol`` apart, so clusters have bounded width.
+
+    (16.07 E1 fix.) The old greedy chaining — "extend the current group while the next peak
+    is within ``t_tol`` of the previous" — collapsed DENSE peak sets: ~273 near-uniform
+    classical peaks (spacing ~0.003 ≪ t_tol) chained into 1–2 mega-clusters, so dp/consensus
+    got far fewer rings than the age. Voting on a smoothed histogram + non-max suppression
+    spreads such peaks into distinct radii instead (dendro-style radial vote peak-finding).
     """
     if not peaks:
         return []
-    ps = sorted(peaks, key=lambda r: r[0])
-    groups = [[ps[0]]]
-    for r in ps[1:]:
-        if r[0] - groups[-1][-1][0] <= t_tol:
-            groups[-1].append(r)
-        else:
-            groups.append([r])
+    ts = np.asarray([r[0] for r in peaks], dtype=np.float64)
+    ss = np.asarray([r[1] for r in peaks], dtype=np.float64)
+    if len(ts) == 1:
+        return [(float(ts[0]), 1, float(ss[0]))]
+
+    # Smoothed vote histogram over [0, 1] (bin ≈ t_tol/3, moving-average window ≈ t_tol).
+    nbins = max(4, int(round(1.0 / max(t_tol / 3.0, 1e-3))))
+    edges = np.linspace(0.0, 1.0, nbins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    counts, _ = np.histogram(np.clip(ts, 0.0, 1.0), bins=edges)
+    win = max(1, int(round(t_tol * nbins)))
+    smooth = (np.convolve(counts.astype(np.float64), np.ones(win) / win, mode="same")
+              if win > 1 else counts.astype(np.float64))
+
+    # Non-max suppression: greedily take the highest-vote bin, claim ±t_tol around it.
+    modes: List[float] = []
+    claimed = np.zeros(nbins, dtype=bool)
+    for bi in np.argsort(smooth)[::-1]:
+        if smooth[bi] <= 0 or claimed[bi]:
+            continue
+        c = float(centers[bi])
+        claimed |= np.abs(centers - c) <= t_tol
+        modes.append(c)
+    if not modes:
+        return []
+    modes_arr = np.asarray(sorted(modes))
+
+    # Assign each peak to its NEAREST mode (within t_tol) → no double counting.
+    nearest = np.abs(ts[:, None] - modes_arr[None, :]).argmin(axis=1)
     out: List[Tuple[float, int, float]] = []
-    for g in groups:
-        mean_t = float(np.mean([r[0] for r in g]))
-        out.append((mean_t, len(g), float(np.mean([r[1] for r in g]))))
+    for mi in range(len(modes_arr)):
+        sel = (nearest == mi) & (np.abs(ts - modes_arr[mi]) <= t_tol)
+        if not sel.any():
+            continue
+        out.append((float(ts[sel].mean()), int(sel.sum()), float(ss[sel].mean())))
+    out.sort(key=lambda c: c[0])
     return out
 
 

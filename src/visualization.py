@@ -380,20 +380,51 @@ def draw_reasoning_card(
             np.array([int(round(t * (n - 1))) for t in final_t], dtype=int), 0, n - 1)
 
     def _heat_panel(grid, robust: bool = False) -> np.ndarray:
-        g = grid
-        if robust and grid is not None:
-            # Utnij pojedynczy dominujący patch (artefakt wysokiej normy), inaczej globalna
-            # normalizacja czyni resztę mapy czarną — mimo że struktura tam jest (widać w kandydatach).
-            arr = np.asarray(grid, dtype=np.float32)
-            hi = float(np.percentile(arr, 99.0))
-            if hi > float(arr.min()):
-                g = np.clip(arr, None, hi)
-        hm = importance_to_heatmap_2d(g, H, W)
-        panel = apply_colormap_with_mask(hm, original_rgb, mask=mask, alpha=0.55,
-                                         colormap=DEFAULT_COLORMAP)
+        """Nakładka mapy ciepła z (a) robust-normalizacją percentylową (2–98) — środkowe
+        tony widoczne, outliery przycięte — i (b) ALFĄ PER-PIKSEL: zimne piksele przezroczyste
+        (widać otolit), gorące nieprzezroczyste i jaskrawe. Naprawia „ciemne kolory giną"
+        i „density nic nie widać" (20.07): jednorodna alfa robiła muł, w którym niski sygnał
+        (ciemny koniec inferno) zlewał się z ciemnym otolitem."""
+        if grid is None:
+            return _placeholder_panel(H, W, "niedostepne")
+        arr = np.asarray(grid, dtype=np.float32)
+        lo, hi = float(np.percentile(arr, 2.0)), float(np.percentile(arr, 98.0))
+        if hi <= lo:
+            lo, hi = float(arr.min()), float(arr.max())
+        norm = np.clip((arr - lo) / (hi - lo + 1e-9), 0.0, 1.0)
+        hm = cv2.resize(norm, (W, H), interpolation=cv2.INTER_LINEAR).clip(0.0, 1.0)
+        bgr = cv2.applyColorMap((hm * 255).astype(np.uint8), DEFAULT_COLORMAP)
+        rgb_map = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+        alpha = np.power(hm, 1.5) * 0.9                          # gamma>1 → tylko piki mocne
+        if mask is not None:
+            alpha = alpha * (np.asarray(mask) > 0)
+        a = alpha[..., None]
+        panel = (a * rgb_map + (1.0 - a) * original_rgb.astype(np.float32)
+                 ).clip(0, 255).astype(np.uint8)
         _draw_colorbar(panel)
         _draw_contour(panel)                 # obrys otolitu — widać, gdzie kończy się overlay
         return panel
+
+    def _letterbox_to(img: np.ndarray) -> np.ndarray:
+        """Wpasuj obraz w płótno (H, W) zachowując proporcje (czarne pasy)."""
+        ih, iw = img.shape[:2]
+        s = min(W / iw, H / ih)
+        nw, nh = max(1, int(iw * s)), max(1, int(ih * s))
+        canvas = np.zeros((H, W, 3), dtype=np.uint8)
+        y0, x0 = (H - nh) // 2, (W - nw) // 2
+        canvas[y0:y0 + nh, x0:x0 + nw] = cv2.resize(img, (nw, nh))
+        return canvas
+
+    def _attn_outside_frac(grid) -> float | None:
+        """Udział masy uwagi CLS POZA maską (diagnostyka: czy model patrzy na tło)."""
+        if grid is None or mask is None:
+            return None
+        hm = cv2.resize(np.asarray(grid, dtype=np.float32), (W, H), interpolation=cv2.INTER_LINEAR)
+        hm = np.clip(hm, 0.0, None)
+        total = float(hm.sum())
+        if total <= 1e-9:
+            return None
+        return float(hm[np.asarray(mask) == 0].sum() / total)
 
     def _draw_contour(panel) -> None:
         """Narysuj cyjanowy kontur otolitu (jeśli dostępny) — na KAŻDYM panelu ze zdjęciem."""
@@ -401,8 +432,11 @@ def draw_reasoning_card(
             cv2.drawContours(panel, [axis_info["contour"]], -1, _CONTOUR_COLOR, line_thickness)
 
     # ===== Rząd 1 — GŁOWICA WIEKU (CORAL) =====
-    panel1 = (_heat_panel(coral_gradcam) if coral_gradcam is not None
-              else _placeholder_panel(H, W, "Grad-CAM niedostepny"))
+    # Panel 1 — WEJŚCIE MODELU (zastąpiło Grad-CAM, 20.07): model dostaje CAŁE zdjęcie
+    # ściśnięte do 518×518 (z tłem!), NIE maskę. Pokazujemy ten realny, kwadratowy input,
+    # żeby było widać squash proporcji i obecność tła (patrz „% uwagi poza maską" w panelu 2).
+    panel1 = _letterbox_to(cv2.resize(original_rgb, (518, 518)))
+    attn_bg_frac = _attn_outside_frac(cls_attention)
     panel2 = (_heat_panel(cls_attention) if cls_attention is not None
               else _placeholder_panel(H, W, "Uwaga CLS niedostepna"))
     # Panel 3 — werdykt: etykieta wieku + ramka OK/błąd
@@ -428,6 +462,16 @@ def draw_reasoning_card(
     # Panel 5 — kandydaci
     if axis_info is not None:
         panel5 = original_rgb.copy()
+        # Dorysuj 48 osi jądro→kontur (20.07) — POKAZUJE, skąd biorą się kandydaci: piki
+        # sygnału wzdłuż każdego z 48 promieni (per-promień normalizacja + find_peaks).
+        _contour = axis_info.get("contour")
+        _cent = axis_info.get("centroid")
+        if _contour is not None and _cent is not None:
+            _cx, _cy = int(_cent[0]), int(_cent[1])
+            _cpts = np.asarray(_contour).reshape(-1, 2)
+            for _ci in np.linspace(0, len(_cpts) - 1, min(48, len(_cpts)), dtype=int):
+                cv2.line(panel5, (_cx, _cy), (int(_cpts[_ci][0]), int(_cpts[_ci][1])),
+                         _RAY_COLOR, 1, cv2.LINE_AA)
         _draw_axis_overlay(panel5, axis_info, line_thickness, cross_size)
         if use_new:
             _draw_small_points(panel5, candidate_pts or [], _CAND_COLOR, max(2, H // 300))
@@ -450,24 +494,40 @@ def draw_reasoning_card(
         # Classical (OpenCV) cross-check peaks as hollow green rings — model vs classic.
         if classical_pts:
             _draw_hollow_points(panel6, classical_pts, _CLASSICAL_COLOR, max(3, H // 110))
+        # Legenda znaczników (20.07) — żeby czerwone/zielone/krzyż były jednoznaczne.
+        _legend_items = [(_FINAL_COLOR, True, "finalne (N=wiek)"),
+                         (_CLASSICAL_COLOR, False, "klasyka (OpenCV)"),
+                         (_AXIS_COLOR, None, "os pomiaru")]
+        _ly, _fs = max(10, H // 40), max(0.4, H / 900.0)
+        for _col, _filled, _txt in _legend_items:
+            if _filled is None:
+                cv2.line(panel6, (8, _ly - 4), (22, _ly - 4), _col, max(2, H // 300))
+            elif _filled:
+                cv2.circle(panel6, (15, _ly - 4), max(4, H // 150), _col, -1)
+            else:
+                cv2.circle(panel6, (15, _ly - 4), max(4, H // 150), _col, max(2, H // 400))
+            cv2.putText(panel6, _txt, (30, _ly), cv2.FONT_HERSHEY_SIMPLEX, _fs,
+                        (255, 255, 255), max(1, int(_fs * 2)), cv2.LINE_AA)
+            _ly += max(16, H // 28)
     else:
         panel6 = _placeholder_panel(H, W, "Os niedostepna")
 
     # ===== Kompozycja 3×2: rząd 1 = GŁOWICA WIEKU (CORAL), rząd 2 = GŁOWICA LOKALIZACJI (density) =====
     # ASCII "-" jako separator — cv2 (Hershey) NIE renderuje "·" i pokazuje "??".
     # Nazwa głowicy w każdym tytule (CORAL / density) — jasne, która głowica daje który obraz.
-    gc_flat = (coral_gradcam is not None and
-               float(np.ptp(np.asarray(coral_gradcam, dtype=np.float32))) < 1e-6)
-    gradcam_title = ("WIEK (CORAL) - Grad-CAM (plaski/nieinform.)" if gc_flat
-                     else "WIEK (CORAL) - Grad-CAM (co wplywa na wiek)")
-    cls_title = ("WIEK (CORAL) - proxy L2 (CLS niedost.)" if cls_is_fallback
-                 else "WIEK (CORAL) - uwaga CLS")
+    input_title = "WIEK (CORAL) - wejscie modelu (518x518, tlo+squash)"
+    if cls_is_fallback:
+        cls_title = "WIEK (CORAL) - proxy L2 (CLS niedost.)"
+    elif attn_bg_frac is not None:
+        cls_title = f"WIEK (CORAL) - uwaga CLS (tlo {attn_bg_frac * 100:.0f}%)"
+    else:
+        cls_title = "WIEK (CORAL) - uwaga CLS"
     mil_title = ("PRZYROSTY (density) - mapa + pierscienie" if has_rings
                  else "PRZYROSTY (density) - mapa")
     final_title = (f"PRZYROSTY (density) - finalne (N={n_final}) vs klasyka" if classical_pts
                    else f"PRZYROSTY (density) - finalne (N={n_final})")
     row1_titles = [
-        gradcam_title,
+        input_title,
         cls_title,
         f"WIEK (CORAL) - werdykt = {int(predicted_age)}",
     ]

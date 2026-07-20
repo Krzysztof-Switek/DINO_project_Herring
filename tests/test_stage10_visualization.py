@@ -264,6 +264,27 @@ def test_density_peaks_shape():
         assert len(peaks[0]) == 4          # (t, strength, x, y)
 
 
+def test_cluster_by_radius_no_collapse_on_dense_peaks():
+    """E1 (16.07): dense near-uniform peaks must NOT collapse into 1–2 mega-clusters
+    (the greedy-chaining bug), and tight groups must still form distinct clusters."""
+    import numpy as np
+    from src.ring_extraction import _cluster_by_radius
+    # ~270 near-uniform peaks across [0.05, 0.95] (spacing ~0.003 ≪ t_tol) — old code → 1 cluster.
+    dense = [(float(t), 1.0) for t in np.linspace(0.05, 0.95, 270)]
+    cl = _cluster_by_radius(dense, t_tol=0.06)
+    assert len(cl) >= 8, f"dense peaks collapsed into {len(cl)} clusters (E1 regression)"
+    assert all(0.0 <= c[0] <= 1.0 for c in cl)
+    assert sum(c[1] for c in cl) <= len(dense)          # each peak counted at most once
+    # Two tight, well-separated groups → exactly 2 clusters at ~0.3 and ~0.7.
+    two = [(0.30, 1.0)] * 5 + [(0.31, 1.0)] * 4 + [(0.70, 1.0)] * 6
+    cl2 = _cluster_by_radius(two, t_tol=0.06)
+    assert len(cl2) == 2
+    ts = sorted(c[0] for c in cl2)
+    assert abs(ts[0] - 0.305) < 0.03 and abs(ts[1] - 0.70) < 0.03
+    # Degenerate: single peak → single cluster.
+    assert _cluster_by_radius([(0.5, 2.0)], t_tol=0.06) == [(0.5, 1, 2.0)]
+
+
 def test_fuse_increments_three_methods():
     """fuse_increments: density/classical/consensus → <= age finals; consensus preferuje zgodność."""
     from src.ring_extraction import fuse_increments
