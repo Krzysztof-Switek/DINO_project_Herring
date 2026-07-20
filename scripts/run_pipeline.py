@@ -529,7 +529,8 @@ def _compute_axis_data_for_samples(
             try:
                 from src.ring_extraction import dp_walkthrough_data
                 from src.visualization import (render_rays_and_candidates,
-                                               render_localization_overlay)
+                                               render_localization_overlay,
+                                               render_patch_grid, render_candidate_rings)
                 import base64 as _b64w
                 import io as _iow
                 _wsc = min(1.0, 480 / max(H_img, W_img))
@@ -537,8 +538,13 @@ def _compute_axis_data_for_samples(
                 _wage = int(row.get("predicted_age", 0))
                 _wd = dp_walkthrough_data(grid, orig_rgb, axis_info, H_img, W_img, _wage,
                                           density_min_distance=min_dist, density_prominence=prominence)
+                _p0 = render_patch_grid(orig_rgb, axis_info)          # krok 0: siatka patchy 37×37
                 _p1 = render_rays_and_candidates(orig_rgb, axis_info,
                                                  _wd["density_pts"], _wd["classical_pts"])
+                # krok 3 przestrzennie: pierścienie-kandydaci (klastry promieni) na otolicie
+                _dring = [c[0] for c in (_wd.get("density_clusters") or [])]
+                _cring = [c[0] for c in (_wd.get("classical_clusters") or [])]
+                _p3 = render_candidate_rings(orig_rgb, axis_info, _dring, _cring)
                 _wcand = list(_wd["density_pts"]) + list(_wd["classical_pts"])
                 _p5 = render_localization_overlay(orig_rgb, axis_info, _wd["final_axis_pts"], _wcand)
 
@@ -551,7 +557,9 @@ def _compute_axis_data_for_samples(
                     "image_id": iid,
                     "true_age": int(row.get("age", 0)),
                     "pred_age": _wage,
+                    "panel_patchgrid_b64": _wb64(_p0),
                     "panel_rays_b64": _wb64(_p1),
+                    "panel_rings_b64": _wb64(_p3),
                     "panel_final_b64": _wb64(_p5),
                     "data": _wd,
                 }

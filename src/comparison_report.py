@@ -648,38 +648,41 @@ Rząd dolny (pasek pomarańczowy) to <b>GŁOWICA LOKALIZACJI (density)</b> — �
 widzi przyrosty". Wszystkie panele renderowane są na zdjęciu w oryginalnej rozdzielczości;
 cyjanowy obrys = kontur otolitu, żółta linia = oś biologiczna od jądra do najdalszej
 krawędzi konturu.</p>
+<p>Układ kolumn dobrano tak, by <b>mapa uwagi CLS (rząd 1, środek) była DOKŁADNIE NAD mapą
+density (rząd 2, środek)</b> — łatwo je porównać.</p>
 <p><b>Rząd 1 — GŁOWICA WIEKU (CORAL):</b></p>
 <ol>
-  <li><b>Grad-CAM werdyktu</b> — mapa (inferno), które rejony najbardziej wpływają na
-      przewidziany wiek. Uwaga: na ścieżce tokenu CLS gradient bywa rozmyty i mapa jest
-      wtedy niemal płaska — tytuł panelu sygnalizuje to jako „(plaski/nieinform.)". To
-      znane ograniczenie tej atrybucji, nie brak renderu.</li>
-  <li><b>Uwaga CLS</b> — z których patchy token CLS złożył „streszczenie" obrazu, z
-      którego CORAL liczy wiek. Gdy backbone używa fused-attention (nie wystawia macierzy
-      uwagi), panel pokazuje <b>oznaczone proxy L2</b> (norma tokenów) zamiast prawdziwej
-      uwagi — tytuł mówi wtedy „proxy L2 patchy (CLS niedost.)".</li>
+  <li><b>Surowy obraz + nazwa pliku</b> — niezmieniony oryginał, na którym liczone są
+      wszystkie overlaye (kontekst „na czym patrzymy"). <i>Uwaga: model dostaje ten obraz
+      ściśnięty do kwadratu 518×518 wraz z tłem — patrz „% tła" w panelu uwagi.</i></li>
+  <li><b>Uwaga CLS</b> — z których patchy token CLS złożył „streszczenie" obrazu, z którego
+      CORAL liczy wiek (prawdziwa uwaga, wyliczana chwilową podmianą ostatniego bloku DINOv2).
+      Nowa kolorystyka: gorące miejsca się wybijają, chłodne pokazują otolit pod spodem.
+      W tytule podajemy <b>% uwagi padającej poza otolit</b> („tło N%") — diagnostyka, czy
+      model reaguje na tło/krawędź.</li>
   <li><b>Werdykt</b> — zdjęcie + etykieta „Wiek: X (true: Y)" + ramka: <b>zielona</b> =
       trafny, <b>czerwona</b> = błąd.</li>
 </ol>
 <p><b>Rząd 2 — GŁOWICA LOKALIZACJI (density):</b></p>
 <ol start="4">
-  <li><b>Mapa density</b> — kolormap inferno wewnątrz otolitu: ciemne = niski sygnał,
-      jasno-żółte = wysoki. Wartość = <b>prawdopodobieństwo przyrostu na patch</b>
-      (odsprzęgnięta głowica density, uczona słabo — samą liczbą wieku). Gdy znaleziono
-      sensowny zestaw pierścieni-konsensusu (≥2), nakładane są ich krzywe.</li>
-  <li><b>Kandydaci</b> — <b>żółte kropki</b> = wszystkie lokalne maksima mapy density
-      wzdłuż <b>48 promieni</b> z jądra we wszystkich kierunkach (nie jednej osi). Cyjanowy
-      kontur, żółta oś pomiaru, niebieski krzyżyk = jądro. To „surowy" sygnał lokalizacji.</li>
-  <li><b>Finalne (N = wiek)</b> — <b>czerwone kropki</b> = top-<code>wiek</code> „pierścieni-
-      konsensusu" (piki na tym samym promieniu w wielu kierunkach), rzutowane na oś pomiaru.
-      <b>Zielone puste okręgi</b> = piki klasyczne (OpenCV) — kontrola „model vs technik".</li>
+  <li><b>Kandydaci</b> — <b>żółte kropki</b> = piki sygnału wzdłuż <b>48 promieni</b> z jądra
+      (rysowane cienkie promienie). Piki liczone są po <b>normalizacji każdego promienia
+      osobno</b>, więc kandydaci ujawniają strukturę wnętrza, której mapa density (wartości
+      absolutne) może nie pokazywać. Niebieski krzyżyk = jądro, żółta oś pomiaru.</li>
+  <li><b>Mapa density</b> — <b>prawdopodobieństwo przyrostu na patch</b> (siatka 37×37;
+      odsprzęgnięta głowica density, uczona słabo — samą liczbą wieku). Nowa kolorystyka:
+      gorące punkty się wybijają, reszta pokazuje otolit.</li>
+  <li><b>Finalne (N = wiek)</b> — <b>czerwone kropki</b> = wybrane przyrosty rzutowane na oś
+      pomiaru (liczba = wiek; po naprawie grupowania z 20.07 liczba zgadza się z wiekiem).
+      <b>Zielone puste okręgi</b> = piki klasyczne (OpenCV) — kontrola „model vs technik".
+      Panel ma <b>legendę</b> znaczników.</li>
 </ol>
 <p style="font-size:90%;color:#444;">
-  <b>Wiek (werdykt) vs liczba pierścieni.</b> Werdykt wiekowy pochodzi z głowicy
-  <b>liczącej</b> (CORAL, rząd 1), a kropki/finalne z głowicy <b>lokalizującej</b>
-  (density, rząd 2, odsprzęgniętej stop-gradientem) — to dwa niezależne sygnały. Mogą się
-  różnić (np. wiek = 3, a zlokalizowane 2 przyrosty); trafność lokalizacji jest wciąż
-  wąskim gardłem — patrz sekcja H i dziennik Kierunku B.
+  <b>Wiek (werdykt) vs pozycje przyrostów.</b> Werdykt wiekowy pochodzi z głowicy
+  <b>liczącej</b> (CORAL, rząd 1), a kropki/finalne z głowicy <b>lokalizującej</b> (density,
+  rząd 2, odsprzęgniętej stop-gradientem) — to dwa niezależne sygnały. Liczba przyrostów
+  zgadza się już z wiekiem; otwartym problemem pozostaje <b>trafność pozycji</b> (patrz
+  sekcja G „krok po kroku" i dziennik Kierunku B).
 </p>
 """
     for label, paths in increment_cards.items():
@@ -822,24 +825,29 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
     age = int(payload.get("pred_age", 0))
     gap = float(d.get("dp_min_gap", 0.04))
 
-    # --- Panel 2: profile 3 promieni (surowy vs znormalizowany per-promień) + piki ---
+    # --- Panel 2: profile przykładowych promieni (znormalizowane per-promień) + wykryte piki ---
+    # 20.07: usunięto bezużyteczną „surową" linię (leżała na zerze, bo surowe density ≈0 na skali
+    # [0,1]); pokazujemy sam profil znormalizowany z zaznaczonymi pikami (= kandydaci na tym promieniu).
     profiles = d.get("sample_profiles") or []
     prof_b64 = ""
     if profiles:
+        import numpy as _np
         n = len(profiles)
-        fig, axes = plt.subplots(1, n, figsize=(3.6 * n, 2.8), squeeze=False)
+        fig, axes = plt.subplots(1, n, figsize=(3.7 * n, 2.8), squeeze=False)
         for j, pr in enumerate(profiles):
             ax = axes[0][j]
-            t = pr["t"]
-            ax.plot(t, pr["raw"], color="#999", lw=1.0, label="surowy")
-            ax.plot(t, pr["norm"], color="#2a78d6", lw=1.6, label="znorm. [0,1]")
+            t = _np.asarray(pr["t"]); norm = _np.asarray(pr["norm"])
+            ax.fill_between(t, 0, norm, color="#2a78d6", alpha=0.18)
+            ax.plot(t, norm, color="#2a78d6", lw=1.7)
             for pt in pr.get("peak_t", []):
+                yi = float(norm[int(round(pt * (len(norm) - 1)))]) if len(norm) else 1.0
                 ax.axvline(pt, color="#e01e1e", ls="--", lw=1.0)
-            ax.set_title(f"promień {j + 1}", fontsize=9)
+                ax.plot([pt], [yi], "o", color="#e01e1e", ms=6)
+            npk = len(pr.get("peak_t", []))
+            ax.set_title(f"promień {j + 1} — {npk} pik(ów)", fontsize=9)
             ax.set_xlabel("t (jądro→brzeg)", fontsize=8)
-            ax.set_ylim(-0.05, 1.05)
-            if j == 0:
-                ax.legend(fontsize=7, loc="upper right")
+            ax.set_ylabel("sygnał (znorm. 0–1)" if j == 0 else "", fontsize=8)
+            ax.set_ylim(-0.05, 1.08)
         fig.tight_layout()
         prof_b64 = _fig_to_b64(fig)
         plt.close(fig)
@@ -853,14 +861,19 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         dt = [p[0] for p in dpk]
         ct = [p[0] for p in cpk]
         if dt:
-            ax.hist(dt, bins=40, range=(0, 1), color="#f4b400", alpha=0.75, label="density (48 promieni)")
+            ax.hist(dt, bins=25, range=(0, 1), color="#f4b400", alpha=0.75, label="density (piki z 48 promieni)")
         if ct:
-            ax.hist(ct, bins=40, range=(0, 1), color="#0a9d6e", alpha=0.55, label="klasyka (48 promieni)")
+            ax.hist(ct, bins=25, range=(0, 1), color="#0a9d6e", alpha=0.5, label="klasyka (piki z 48 promieni)")
+        # Klastry (mody rozkładu, po E1) jako pionowe PASY — „tu zbiega się wiele kierunków = pierścień".
+        _t_tol = 0.06
         for (mt, _s, _st) in (d.get("density_clusters") or []):
-            ax.axvline(mt, color="#c58a00", ls=":", lw=0.8)
+            ax.axvspan(mt - _t_tol / 2, mt + _t_tol / 2, color="#c58a00", alpha=0.12)
+            ax.axvline(mt, color="#c58a00", ls="--", lw=1.0)
+        ax.set_xlim(0, 1)
         ax.set_xlabel("t (znormalizowany promień, jądro→brzeg)", fontsize=9)
-        ax.set_ylabel("liczba pików (kierunków)", fontsize=9)
-        ax.set_title("Głosowanie po promieniu — ile z 48 kierunków ma pik na danym promieniu", fontsize=10)
+        ax.set_ylabel("ile promieni ma tu pik", fontsize=9)
+        ax.set_title("Głosowanie po promieniu — słupki = histogram promieni pików; "
+                     "pomarańczowe pasy = klastry (pierścienie-kandydaci)", fontsize=9)
         ax.legend(fontsize=8)
         fig.tight_layout()
         vote_b64 = _fig_to_b64(fig)
@@ -905,42 +918,61 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
 
     n_final = len(d.get("chosen_t") or [])
     note = ("" if n_final >= age else
-            f' <b>Uwaga:</b> tu DP znalazło tylko <b>{n_final}</b> odrębnych pierścieni (wiek {age}) — '
-            'gęste piki klasyki sklejają się w klastrowaniu po promieniu; to znane ograniczenie do poprawy.')
+            f' <b>Uwaga:</b> tu wybrano tylko <b>{n_final}</b> odrębnych pierścieni (wiek {age}).')
     html = (
-        f'<section id="loc-walkthrough"><h2>Lokalizacja — jak wybieramy przyrosty (krok po kroku)</h2>'
+        f'<section id="G"><h2>G. Lokalizacja — jak wybieramy przyrosty (krok po kroku)</h2>'
         f'<p>Na jednym otolicie (<code>{payload.get("image_id","")[:60]}</code>, wiek modelu '
-        f'<b>{age}</b>, prawdziwy {int(payload.get("true_age",0))}) pokazujemy, jak z kandydatów na '
-        f'<b>48 promieniach</b> (density modelu + klasyka obrazu) metoda <b>DP</b> (sekcja L) wybiera '
-        f'finalne przyrosty (czerwone).{note} Ta sama logika działa na wszystkich 20 otolitach niżej.</p>'
+        f'<b>{age}</b>, prawdziwy {int(payload.get("true_age",0))}) pokazujemy krok po kroku, jak z kandydatów '
+        f'na <b>48 promieniach</b> (density modelu + klasyka obrazu) wybieramy '
+        f'finalne przyrosty (czerwone).{note}</p>'
     )
     html += _fig_block(
+        "Krok 0 — jak model dzieli obraz (siatka patchy 37×37)",
+        "DINOv2 tnie wejście na <b>nienakładające się kwadraty 14×14 px → siatka 37×37</b>. "
+        "Głowica density daje <b>jedną liczbę na kwadracik</b> (nie na piksel) — stąd kanciasta "
+        "rozdzielczość mapy. To pokazuje, jak grubo model widzi przyrosty.",
+        payload.get("panel_patchgrid_b64", ""))
+    html += _fig_block(
         "Krok 1 — kandydaci ze wszystkich 48 kierunków",
-        "Z jądra rzucamy 48 promieni do konturu. Wzdłuż każdego szukamy pików: "
-        "<b>żółte</b> = mapa density modelu, <b>zielone</b> = klasyka (jasność obrazu). "
-        "Cyjan = kontur, żółta linia = oś pomiaru.",
+        "Z jądra (niebieski krzyżyk) rzucamy 48 promieni do konturu. Wzdłuż każdego szukamy pików: "
+        "<b>żółte</b> = z mapy density modelu, <b>zielone</b> = z klasyki (jasność obrazu). "
+        "Cyjan = kontur, żółta linia = oś pomiaru. Piki liczymy po <b>normalizacji każdego promienia "
+        "osobno</b> — dlatego kandydaci mogą ujawnić strukturę wnętrza, której mapa density (wartości "
+        "absolutne) nie pokazuje.",
         payload.get("panel_rays_b64", ""))
     html += _fig_block(
-        "Krok 2 — profil promienia i normalizacja per-promień",
-        "Każdy promień normalizujemy osobno do [0,1] (żeby jasne i ciemne kierunki były "
-        "porównywalne), potem szukamy pików (czerwone linie). Trzy przykładowe promienie:",
+        "Krok 2 — profil pojedynczego promienia i jego piki",
+        "Bierzemy sygnał wzdłuż jednego promienia (jądro→brzeg) i normalizujemy do [0,1] "
+        "(żeby jasne i ciemne kierunki były porównywalne). <b>Pik</b> = lokalne maksimum wystające "
+        "ponad otoczenie (czerwone kropki) — to kandydat na przyrost na tym promieniu; drobne "
+        "falowanie poniżej progu to szum. Kilka przykładowych promieni z 48:",
         prof_b64)
     html += _fig_block(
         "Krok 3 — głosowanie po promieniu",
         "Każdy pik ma promień <code>t</code> (0=jądro, 1=brzeg). Prawdziwy pierścień jest "
-        "koncentryczny → pojawia się na tym samym <code>t</code> w wielu kierunkach. Skupiska = "
-        "pierścienie-kandydaci.",
+        "<b>koncentryczny</b> → pojawia się na tym samym <code>t</code> w wielu kierunkach. Słupki = "
+        "histogram promieni wszystkich pików (to zliczenia w przedziałach <code>t</code>, nie 48 promieni). "
+        "<b>Pomarańczowe pasy</b> = wykryte skupiska (mody) = pierścienie-kandydaci.",
         vote_b64)
     html += _fig_block(
-        "Krok 4 — score pierścieni i wybór DP",
+        "Krok 3b — pierścienie-kandydaci na otolicie",
+        "Te same skupiska rzutowane na zdjęcie: każdy klaster promienia to <b>pierścień</b> "
+        "(ułamek <code>t</code> drogi jądro→kontur we wszystkich 48 kierunkach). <b>Żółte</b> = "
+        "z density, <b>zielone</b> = z klasyki. Od razu widać, gdzie pojawiają się pierścienie-kandydaci.",
+        payload.get("panel_rings_b64", ""))
+    html += _fig_block(
+        "Krok 4 — score pierścieni i wybór finalny",
         "Score pierścienia = ile kierunków go widziało × siła; gdy density i klasyka zgadzają się "
-        "co do promienia, score się <b>sumuje</b> (konsensus). DP wybiera dokładnie <code>wiek</code> "
-        "pierścieni o najwyższym łącznym score, z <b>wymuszonym rozstawem</b> (nie skupia pików).",
+        "co do promienia, score się <b>sumuje</b> (konsensus). Wybieramy <code>wiek</code> pierścieni "
+        "o najwyższym score, z <b>wymuszonym minimalnym rozstawem</b> — bo realne roczne przyrosty są "
+        "rozłożone wzdłuż osi, a bez tego algorytm skupiłby kilka pików w jednym, najsilniejszym miejscu. "
+        "(To jeden z możliwych sposobów separacji — inne progi/metody dają inną liczbę; do eksploracji "
+        "suwakami w kolejnej wersji.)",
         dp_b64)
     html += _fig_block(
         "Krok 5 — rzut na oś: finalne przyrosty",
         "Wybrane promienie rzutujemy na oś pomiaru (jądro→brzeg) — <b>czerwone</b> punkty. "
-        "To jest wynik sekcji L dla tego otolitu.",
+        "To finalny wynik lokalizacji dla tego otolitu.",
         payload.get("panel_final_b64", ""))
     html += '</section>'
     return html

@@ -345,6 +345,7 @@ def draw_reasoning_card(
     cls_is_fallback: bool = False,
     ring_curves: Optional[list] = None,
     classical_pts: Optional[list] = None,
+    image_name: str = "",
 ) -> np.ndarray:
     """Compose a 6-panel reasoning card (3 columns × 2 rows) — two rows = two heads.
 
@@ -432,10 +433,18 @@ def draw_reasoning_card(
             cv2.drawContours(panel, [axis_info["contour"]], -1, _CONTOUR_COLOR, line_thickness)
 
     # ===== Rząd 1 — GŁOWICA WIEKU (CORAL) =====
-    # Panel 1 — WEJŚCIE MODELU (zastąpiło Grad-CAM, 20.07): model dostaje CAŁE zdjęcie
-    # ściśnięte do 518×518 (z tłem!), NIE maskę. Pokazujemy ten realny, kwadratowy input,
-    # żeby było widać squash proporcji i obecność tła (patrz „% uwagi poza maską" w panelu 2).
-    panel1 = _letterbox_to(cv2.resize(original_rgb, (518, 518)))
+    # Panel 1 — SUROWY OBRAZ + NAZWA PLIKU (20.07 wiecz): zdeformowany „wejście modelu (squash)"
+    # nic nie wnosił; pokazujemy niezmieniony oryginał z nazwą pliku, na którym liczone są WSZYSTKIE
+    # overlaye (kontekst „na czym patrzymy"). Uwaga CLS jest teraz w kol.2 DOKŁADNIE nad mapą density.
+    panel1 = original_rgb.copy()
+    _draw_contour(panel1)
+    if image_name:
+        _name = Path(image_name).name
+        _fs1 = _fit_font_scale(_name, W - 12, max(0.4, H / 900.0))
+        (_tw1, _th1), _ = cv2.getTextSize(_name, cv2.FONT_HERSHEY_SIMPLEX, _fs1, 1)
+        cv2.rectangle(panel1, (4, 4), (min(8 + _tw1, W - 2), 10 + _th1), (0, 0, 0), -1)
+        cv2.putText(panel1, _name, (6, 8 + _th1), cv2.FONT_HERSHEY_SIMPLEX, _fs1,
+                    (255, 255, 255), 1, cv2.LINE_AA)
     attn_bg_frac = _attn_outside_frac(cls_attention)
     panel2 = (_heat_panel(cls_attention) if cls_attention is not None
               else _placeholder_panel(H, W, "Uwaga CLS niedostepna"))
@@ -515,7 +524,7 @@ def draw_reasoning_card(
     # ===== Kompozycja 3×2: rząd 1 = GŁOWICA WIEKU (CORAL), rząd 2 = GŁOWICA LOKALIZACJI (density) =====
     # ASCII "-" jako separator — cv2 (Hershey) NIE renderuje "·" i pokazuje "??".
     # Nazwa głowicy w każdym tytule (CORAL / density) — jasne, która głowica daje który obraz.
-    input_title = "WIEK (CORAL) - wejscie modelu (518x518, tlo+squash)"
+    input_title = "WIEK (CORAL) - surowy obraz + nazwa pliku"
     if cls_is_fallback:
         cls_title = "WIEK (CORAL) - proxy L2 (CLS niedost.)"
     elif attn_bg_frac is not None:
@@ -531,9 +540,10 @@ def draw_reasoning_card(
         cls_title,
         f"WIEK (CORAL) - werdykt = {int(predicted_age)}",
     ]
+    # Kol.2 rzędu 2 = mapa density → DOKŁADNIE pod uwagą CLS (kol.2 rzędu 1) dla łatwego porównania.
     row2_titles = [
-        mil_title,
         f"PRZYROSTY (density) - kandydaci (N={n_cand})",
+        mil_title,
         final_title,
     ]
     row1 = np.concatenate(
@@ -541,7 +551,7 @@ def draw_reasoning_card(
          for p, t in zip([panel1, panel2, panel3], row1_titles)], axis=1)
     row2 = np.concatenate(
         [_add_title(p, t, _HEAD_MIL_BAR)
-         for p, t in zip([panel4, panel5, panel6], row2_titles)], axis=1)
+         for p, t in zip([panel5, panel4, panel6], row2_titles)], axis=1)
     card = np.concatenate([row1, row2], axis=0)
     return card
 
@@ -620,6 +630,59 @@ def render_rays_and_candidates(
     return img
 
 
+def render_patch_grid(image: np.ndarray, axis_info: Optional[dict],
+                      n_patches: int = 37) -> np.ndarray:
+    """Krok 0 walkthrough: siatka patchy DINOv2 (37×37) na otolicie. Pokazuje realną,
+    grubą rozdzielczość, na której model „widzi" — density = 1 liczba na kwadracik 14×14 px
+    (NIE na piksel). Patche są nienakładające się."""
+    img = np.ascontiguousarray(image[..., :3]).copy()
+    H, W = img.shape[:2]
+    for i in range(1, n_patches):
+        x, y = int(round(i * W / n_patches)), int(round(i * H / n_patches))
+        cv2.line(img, (x, 0), (x, H), (90, 90, 90), 1, cv2.LINE_AA)
+        cv2.line(img, (0, y), (W, y), (90, 90, 90), 1, cv2.LINE_AA)
+    if axis_info is not None and axis_info.get("contour") is not None:
+        cv2.drawContours(img, [axis_info["contour"]], -1, _CONTOUR_COLOR, max(2, H // 300))
+    return img
+
+
+def render_candidate_rings(image: np.ndarray, axis_info: Optional[dict],
+                           density_ring_ts: Optional[list],
+                           classical_ring_ts: Optional[list],
+                           n_dirs: int = 48) -> np.ndarray:
+    """Krok 3 walkthrough (przestrzennie): pierścienie-kandydaci narysowane NA otolicie.
+    Każdy klaster promienia ``t`` (pomarańczowy pas z histogramu) rzutujemy na wszystkie 48
+    kierunków (jądro→kontur na ułamku ``t``) i łączymy w zamkniętą krzywą — „tu, na tych
+    pierścieniach, zbiega się wiele kierunków". Żółte = density, zielone = klasyka."""
+    img = np.ascontiguousarray(image[..., :3]).copy()
+    H = img.shape[0]
+    lt = max(2, H // 350)
+    if axis_info is None:
+        return img
+    contour = axis_info.get("contour")
+    centroid = axis_info.get("centroid")
+    if contour is None or centroid is None:
+        return img
+    cx, cy = float(centroid[0]), float(centroid[1])
+    cpts = contour.reshape(-1, 2)
+    idx = np.linspace(0, len(cpts) - 1, min(n_dirs, len(cpts)), dtype=int)
+    base = cpts[idx].astype(np.float64)                       # (n_dirs, 2) punkty konturu
+    cv2.drawContours(img, [contour], -1, _CONTOUR_COLOR, lt)
+
+    def _ring(t, color):
+        pts = np.stack([cx + t * (base[:, 0] - cx), cy + t * (base[:, 1] - cy)],
+                       axis=1).astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(img, [pts], True, color, lt, cv2.LINE_AA)
+
+    for t in (classical_ring_ts or []):
+        _ring(float(t), _CLASSICAL_COLOR)
+    for t in (density_ring_ts or []):
+        _ring(float(t), _CAND_COLOR)
+    cv2.drawMarker(img, (int(cx), int(cy)), (60, 120, 255), cv2.MARKER_CROSS,
+                   max(10, H // 60), lt)
+    return img
+
+
 # ---------------------------------------------------------------------------
 # Saving helpers
 # ---------------------------------------------------------------------------
@@ -683,6 +746,7 @@ def save_reasoning_cards(
             cls_is_fallback=axis.get("cls_is_fallback", False),
             ring_curves=axis.get("ring_curves"),
             classical_pts=axis.get("classical_pts"),
+            image_name=str(image_id),
         )
 
         stem = Path(image_id).stem
