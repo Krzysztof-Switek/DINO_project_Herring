@@ -318,6 +318,52 @@ def find_centroid(mask: np.ndarray) -> Optional[tuple[int, int]]:
     return int(round(M["m10"] / M["m00"])), int(round(M["m01"] / M["m00"]))
 
 
+def find_intensity_centroid(rgb: np.ndarray, mask: np.ndarray) -> Optional[tuple[int, int]]:
+    """Intensity-weighted centroid within ``mask`` (nucleus/primordium estimate).
+
+    The geometric mask centroid (:func:`find_centroid`) can sit away from the true
+    nucleus when the otolith grows asymmetrically — the primordium is usually the
+    most OPAQUE point, not the middle of the outline. This weights every mask pixel
+    by its (polarity-corrected) brightness, pulling the estimate toward that opaque
+    core. Polarity-aware (reuses :func:`_detect_polarity`) so both bright-core and
+    dark-core preparations weight toward their own opaque region.
+
+    Falls back to :func:`find_centroid` when the weighted sum is degenerate (a
+    perfectly uniform mask interior — no intensity signal to weight by).
+    """
+    m = np.asarray(mask) > 0
+    if not m.any():
+        return None
+    arr = np.asarray(rgb)
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY) if arr.ndim == 3 else arr
+    gray = gray.astype(np.float64)
+    if _detect_polarity(gray.astype(np.uint8)) == "dark":
+        gray = 255.0 - gray                          # otolith is the bright region either way
+    ys, xs = np.nonzero(m)
+    weights = gray[ys, xs]
+    total = float(weights.sum())
+    if total <= 1e-9:
+        return find_centroid((m.astype(np.uint8)) * 255)
+    cx = float((xs * weights).sum() / total)
+    cy = float((ys * weights).sum() / total)
+    return int(round(cx)), int(round(cy))
+
+
+def resolve_centroid(
+    rgb: np.ndarray, mask: np.ndarray, method: str = "geometric",
+) -> Optional[tuple[int, int]]:
+    """Dispatch to :func:`find_centroid` (default) or :func:`find_intensity_centroid`.
+
+    Single entry point so every caller (fresh segmentation in :func:`detect_axis` and
+    the cached-mask path in ``run_pipeline.py``) picks the nucleus the same way.
+    """
+    if method == "intensity":
+        c = find_intensity_centroid(rgb, mask)
+        if c is not None:
+            return c
+    return find_centroid(mask)
+
+
 def _largest_contour(mask: np.ndarray) -> Optional[np.ndarray]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
@@ -365,12 +411,18 @@ def find_farthest_edge(
 # High-level entry point
 # ---------------------------------------------------------------------------
 
-def detect_axis(rgb: np.ndarray, seg_params: Optional[dict] = None) -> Optional[dict]:
+def detect_axis(
+    rgb: np.ndarray, seg_params: Optional[dict] = None, nucleus_method: str = "geometric",
+) -> Optional[dict]:
     """Run full pipeline: segment → centroid → farthest edge.
 
     ``seg_params`` (optional): keyword overrides forwarded to ``segment_otolith``
     (e.g. ``{"method": "radial", "frac": 0.2}``). Typically built from
     ``ProjectConfig.segmentation`` — see ``SegmentationConfig.as_params``.
+
+    ``nucleus_method``: ``"geometric"`` (default, unchanged behaviour) uses the mask's
+    geometric centroid; ``"intensity"`` uses :func:`find_intensity_centroid` — see
+    ``SegmentationConfig.nucleus_method``.
 
     Returns:
         dict with keys:
@@ -384,7 +436,7 @@ def detect_axis(rgb: np.ndarray, seg_params: Optional[dict] = None) -> Optional[
     mask = segment_otolith(rgb, **(seg_params or {}))
     if mask is None:
         return None
-    centroid = find_centroid(mask)
+    centroid = resolve_centroid(rgb, mask, nucleus_method)
     if centroid is None:
         return None
     contour = _largest_contour(mask)

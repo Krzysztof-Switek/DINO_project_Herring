@@ -11,7 +11,9 @@ from src.otolith_axis import (
     detect_axis,
     find_centroid,
     find_farthest_edge,
+    find_intensity_centroid,
     load_mask,
+    resolve_centroid,
     sample_profile_along_axis,
     save_mask,
     segment_otolith,
@@ -163,6 +165,68 @@ def test_centroid_returns_none_for_empty_mask():
     assert find_centroid(empty) is None
 
 
+# ---------------------------------------------------------------------------
+# find_intensity_centroid / resolve_centroid (nucleus estimate, 20.07)
+# ---------------------------------------------------------------------------
+
+def _make_ellipse_with_dark_core(
+    core_center: tuple[int, int] = (360, 260),
+    core_radius: int = 25,
+) -> np.ndarray:
+    """Medium-dark ellipse (uniform body) with an off-centre, much darker "core" patch —
+    stands in for an asymmetric primordium the geometric centroid would miss."""
+    img = np.full((600, 800, 3), 255, dtype=np.uint8)
+    cv2.ellipse(img, (400, 300), (100, 200), angle=0, startAngle=0, endAngle=360,
+                color=(150, 150, 150), thickness=-1)
+    cv2.circle(img, core_center, core_radius, (5, 5, 5), -1)
+    return img
+
+
+def test_intensity_centroid_uniform_matches_geometric():
+    """No intensity variation inside the mask → intensity-weighted centroid reduces to
+    the geometric centroid (constant weight everywhere)."""
+    img = _make_dark_ellipse(center=(400, 300), axes=(100, 200))
+    mask = segment_otolith(img)
+    geo = find_centroid(mask)
+    intensity = find_intensity_centroid(img, mask)
+    assert intensity is not None
+    assert abs(geo[0] - intensity[0]) <= 2
+    assert abs(geo[1] - intensity[1]) <= 2
+
+
+def test_intensity_centroid_pulls_toward_darker_core():
+    """An off-centre, more opaque sub-region should pull the intensity centroid toward
+    it, further than the plain geometric centroid."""
+    core = np.array([360, 260])
+    img = _make_ellipse_with_dark_core(core_center=tuple(core))
+    mask = segment_otolith(img)
+    assert mask is not None
+    geo = np.array(find_centroid(mask))
+    intensity = np.array(find_intensity_centroid(img, mask))
+    d_geo = float(np.hypot(*(geo - core)))
+    d_int = float(np.hypot(*(intensity - core)))
+    assert d_int < d_geo
+
+
+def test_intensity_centroid_returns_none_for_empty_mask():
+    empty = np.zeros((100, 100), dtype=np.uint8)
+    img = np.zeros((100, 100, 3), dtype=np.uint8)
+    assert find_intensity_centroid(img, empty) is None
+
+
+def test_resolve_centroid_geometric_is_default():
+    img = _make_dark_ellipse()
+    mask = segment_otolith(img)
+    assert resolve_centroid(img, mask) == find_centroid(mask)
+    assert resolve_centroid(img, mask, "geometric") == find_centroid(mask)
+
+
+def test_resolve_centroid_intensity_dispatches():
+    img = _make_ellipse_with_dark_core()
+    mask = segment_otolith(img)
+    assert resolve_centroid(img, mask, "intensity") == find_intensity_centroid(img, mask)
+
+
 def test_farthest_point_along_major_axis():
     """Vertical ellipse (taller than wide) → farthest point near top or bottom pole."""
     img = _make_dark_ellipse(center=(400, 300), axes=(100, 200))
@@ -189,6 +253,29 @@ def test_detect_axis_returns_dict_for_valid_ellipse():
 def test_detect_axis_returns_none_for_uniform():
     img = np.full((400, 400, 3), 255, dtype=np.uint8)
     assert detect_axis(img) is None
+
+
+def test_detect_axis_intensity_nucleus_method_shifts_centroid():
+    """nucleus_method="intensity" must change the centroid picked by detect_axis (and
+    nothing else breaks — this exercises the whole segment→centroid→far_edge chain)."""
+    img = _make_ellipse_with_dark_core(core_center=(360, 260))
+    info_geo = detect_axis(img)
+    info_intensity = detect_axis(img, nucleus_method="intensity")
+    assert info_geo is not None and info_intensity is not None
+    assert info_geo["centroid"] != info_intensity["centroid"]
+
+
+def test_segmentation_config_as_params_excludes_nucleus_method():
+    """nucleus_method is consumed by detect_axis(), NOT a segment_otolith() kwarg —
+    as_params() must exclude it or segment_otolith(**params) raises TypeError."""
+    from src.config import SegmentationConfig
+
+    cfg = SegmentationConfig()
+    assert cfg.nucleus_method == "geometric"      # default = unchanged behaviour
+    params = cfg.as_params()
+    assert "nucleus_method" not in params
+    img = _make_dark_ellipse()
+    assert segment_otolith(img, **params) is not None   # would TypeError if leaked
 
 
 def test_axis_info_json_serializable():

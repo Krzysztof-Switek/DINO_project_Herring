@@ -384,3 +384,74 @@ def test_dp_walkthrough_data_keys_and_consistency():
     cpk = classical_increments(gray, axis_info)["peaks"]
     ref = fuse_increments(dpk, cpk, age, axis_info, method="dp")["final_t"]
     assert wd["chosen_t"] == ref
+
+
+def test_dp_interactive_data_profiles_match_server_peaks():
+    """dp_interactive_data's raw per-ray profiles must reproduce EXACTLY the peaks that
+    density_peaks/classical_increments (the real server pipeline) find at the same
+    prominence/min-distance — this is the contract the Krok-4 JS slider widget relies
+    on (it reruns peak-finding on these profiles client-side; if they drifted from the
+    server's own profiles, the live widget would silently show wrong ring counts)."""
+    import numpy as np
+    from scipy.signal import find_peaks
+    from src.ring_extraction import dp_interactive_data, density_peaks, classical_increments
+
+    H, W = 140, 220
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    rng = np.random.default_rng(1)
+    grid = rng.random((10, 16)).astype(np.float32)
+    gray = rng.random((H, W)).astype(np.float32)
+    age = 3
+
+    interactive = dp_interactive_data(grid, gray, axis_info, H, W, age)
+    for key in ("predicted_age", "n_samples", "inner_margin", "edge_margin",
+                "density_min_distance", "classical_min_distance", "centroid",
+                "contour_pts", "density_profiles", "classical_profiles"):
+        assert key in interactive
+    n_dirs = len(interactive["contour_pts"])
+    assert n_dirs > 0
+    assert len(interactive["density_profiles"]) == n_dirs
+    assert len(interactive["classical_profiles"]) == n_dirs
+
+    prom, min_d = 0.1, interactive["density_min_distance"]
+    n_samples = interactive["n_samples"]
+    js_t = []
+    for prof in interactive["density_profiles"]:
+        if prof is None:
+            continue
+        arr = np.asarray(prof)
+        idxs, _ = find_peaks(arr, distance=max(1, min_d), prominence=prom)
+        for idx in idxs:
+            t = idx / max(1, n_samples - 1)
+            if interactive["inner_margin"] <= t <= 1.0 - interactive["edge_margin"]:
+                js_t.append(round(t, 6))
+
+    server_peaks, _ = density_peaks(grid, axis_info, H, W, prominence=prom, min_distance=min_d)
+    server_t = sorted(round(p[0], 6) for p in server_peaks)
+    assert sorted(js_t) == server_t
+
+
+def test_render_single_ray_draws_highlighted_line():
+    """render_single_ray (20.07, Krok 2 companion): same shape as input, and pixels
+    along the highlighted jądro→contour_pt line actually change."""
+    from src.visualization import render_single_ray
+    H, W = 140, 220
+    original = np.full((H, W, 3), 200, dtype=np.uint8)
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    contour_pt = axis_info["far_edge"]
+    out = render_single_ray(original, axis_info, contour_pt, peak_ts=[0.3, 0.7])
+    assert out.shape == original.shape
+    assert not np.array_equal(out, original)
+    # midpoint of the ray should no longer be the flat background colour
+    cx, cy = axis_info["centroid"]
+    fx, fy = contour_pt
+    mx, my = int((cx + fx) / 2), int((cy + fy) / 2)
+    assert not np.array_equal(out[my, mx], original[my, mx])
+
+
+def test_render_single_ray_none_axis_info_returns_copy():
+    from src.visualization import render_single_ray
+    H, W = 60, 90
+    original = np.zeros((H, W, 3), dtype=np.uint8)
+    out = render_single_ray(original, None, (10, 10))
+    assert out.shape == original.shape

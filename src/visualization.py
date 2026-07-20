@@ -630,6 +630,43 @@ def render_rays_and_candidates(
     return img
 
 
+_RAY_HIGHLIGHT_COLOR = (230, 30, 30)   # red — the ONE ray singled out for Krok 2
+
+
+def render_single_ray(
+    image: np.ndarray,
+    axis_info: Optional[dict],
+    contour_pt: tuple[float, float],
+    peak_ts: Optional[list] = None,
+) -> np.ndarray:
+    """Krok 2 walkthrough companion: ONE highlighted ray (jądro→contour_pt) on the
+    otolith, with its detected peaks marked along it — the image counterpart of one
+    per-ray profile chart (``ring_extraction._example_ray_profiles``), so „pik na t=0.6"
+    can be read directly off the photo instead of only off an abstract axis."""
+    img = np.ascontiguousarray(image[..., :3]).copy()
+    H = img.shape[0]
+    lt = max(2, H // 250)
+    if axis_info is None:
+        return img
+    contour = axis_info.get("contour")
+    centroid = axis_info.get("centroid")
+    if contour is not None:
+        cv2.drawContours(img, [contour], -1, _CONTOUR_COLOR, max(1, H // 400))
+    if centroid is None:
+        return img
+    cx, cy = int(centroid[0]), int(centroid[1])
+    fx, fy = int(contour_pt[0]), int(contour_pt[1])
+    cv2.line(img, (cx, cy), (fx, fy), _RAY_HIGHLIGHT_COLOR, lt, cv2.LINE_AA)
+    cv2.drawMarker(img, (cx, cy), _CENTROID_COLOR, cv2.MARKER_CROSS,
+                   max(10, H // 60), lt)
+    for t in (peak_ts or []):
+        px = int(round(cx + float(t) * (fx - cx)))
+        py = int(round(cy + float(t) * (fy - cy)))
+        cv2.circle(img, (px, py), max(4, H // 110) + 1, (0, 0, 0), -1)
+        cv2.circle(img, (px, py), max(4, H // 110), _RAY_HIGHLIGHT_COLOR, -1)
+    return img
+
+
 def render_patch_grid(image: np.ndarray, axis_info: Optional[dict],
                       n_patches: int = 37) -> np.ndarray:
     """Krok 0 walkthrough: siatka patchy DINOv2 (37×37) na otolicie. Pokazuje realną,

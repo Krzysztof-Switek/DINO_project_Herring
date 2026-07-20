@@ -328,9 +328,9 @@ def _compute_axis_data_for_samples(
                                      compute_cls_attention, compute_cls_attention_patched)
     from src.otolith_axis import (
         detect_axis,
-        find_centroid,
         find_farthest_edge,
         load_mask,
+        resolve_centroid,
         sample_profile_along_axis,
         save_mask,
     )
@@ -405,7 +405,7 @@ def _compute_axis_data_for_samples(
         axis_info = None
         mask_arr = load_mask(mask_path)
         if mask_arr is not None:
-            cent = find_centroid(mask_arr)
+            cent = resolve_centroid(orig_rgb, mask_arr, cfg.segmentation.nucleus_method)
             far = find_farthest_edge(mask_arr, cent) if cent else None
             if cent and far:
                 contours, _ = cv2.findContours(mask_arr, cv2.RETR_EXTERNAL,
@@ -421,7 +421,8 @@ def _compute_axis_data_for_samples(
                                                      far[1] - cent[1])),
                     }
         if axis_info is None:
-            axis_info = detect_axis(orig_rgb, seg_params=cfg.segmentation.as_params())
+            axis_info = detect_axis(orig_rgb, seg_params=cfg.segmentation.as_params(),
+                                    nucleus_method=cfg.segmentation.nucleus_method)
             if axis_info is not None:
                 mask_arr = axis_info["mask"]
                 save_mask(mask_arr, mask_path)
@@ -527,10 +528,11 @@ def _compute_axis_data_for_samples(
         # Sekcja „krok po kroku" (jeden przykładowy otolit): pełne dane DP + panele przestrzenne.
         if iid == walkthrough_iid:
             try:
-                from src.ring_extraction import dp_walkthrough_data
+                from src.ring_extraction import dp_walkthrough_data, dp_interactive_data
                 from src.visualization import (render_rays_and_candidates,
                                                render_localization_overlay,
-                                               render_patch_grid, render_candidate_rings)
+                                               render_patch_grid, render_candidate_rings,
+                                               render_single_ray)
                 import base64 as _b64w
                 import io as _iow
                 _wsc = min(1.0, 480 / max(H_img, W_img))
@@ -547,11 +549,33 @@ def _compute_axis_data_for_samples(
                 _p3 = render_candidate_rings(orig_rgb, axis_info, _dring, _cring)
                 _wcand = list(_wd["density_pts"]) + list(_wd["classical_pts"])
                 _p5 = render_localization_overlay(orig_rgb, axis_info, _wd["final_axis_pts"], _wcand)
+                # krok 2: JEDEN promień podświetlony na zdjęciu — obok jego profilu (20.07 pass 2).
+                _p2_list = [render_single_ray(orig_rgb, axis_info, pr["contour_pt"], pr.get("peak_t"))
+                           for pr in (_wd.get("sample_profiles") or [])]
 
-                def _wb64(arr):
+                def _wb64(arr, size=(_wdw, _wdh)):
+                    # Raw base64 (NO "data:image/png;base64," prefix) — _section_localization_walkthrough
+                    # renders these via _img_tag(), which adds the prefix itself (same convention as
+                    # every other b64 helper: fig_to_b64/png_to_b64). A pre-prefixed string here double-
+                    # prefixes the <img src>, producing an invalid data URI (broken image, no error).
                     _bb = _iow.BytesIO()
-                    PILImage.fromarray(arr).resize((_wdw, _wdh)).save(_bb, format="PNG")
-                    return "data:image/png;base64," + _b64w.b64encode(_bb.getvalue()).decode("ascii")
+                    PILImage.fromarray(arr).resize(size).save(_bb, format="PNG")
+                    return _b64w.b64encode(_bb.getvalue()).decode("ascii")
+
+                _wsc2 = min(1.0, 300 / max(H_img, W_img))
+                _wdw2, _wdh2 = max(1, int(W_img * _wsc2)), max(1, int(H_img * _wsc2))
+
+                # krok 4: dane dla ŻYWEGO widgetu suwaków (prominencja / min-rozstaw DP / t_tol) —
+                # surowe profile promieni; JS przelicza piki→klastry→DP przy KAŻDEJ zmianie suwaka.
+                _p6 = render_localization_overlay(orig_rgb, axis_info, None, None)   # czyste tło (kontur+oś)
+                _interactive = dp_interactive_data(grid, orig_rgb, axis_info, H_img, W_img, _wage,
+                                                   density_min_distance=min_dist)
+                _interactive["img"] = "data:image/png;base64," + _wb64(_p6)
+                _interactive["w"], _interactive["h"] = _wdw, _wdh
+                _icx, _icy = _interactive["centroid"]
+                _interactive["centroid"] = [int(round(_icx * _wsc)), int(round(_icy * _wsc))]
+                _interactive["contour_pts"] = [[int(round(x * _wsc)), int(round(y * _wsc))]
+                                               for (x, y) in _interactive["contour_pts"]]
 
                 walkthrough_payload = {
                     "image_id": iid,
@@ -561,6 +585,8 @@ def _compute_axis_data_for_samples(
                     "panel_rays_b64": _wb64(_p1),
                     "panel_rings_b64": _wb64(_p3),
                     "panel_final_b64": _wb64(_p5),
+                    "panel_ray_examples_b64": [_wb64(_p2, (_wdw2, _wdh2)) for _p2 in _p2_list],
+                    "krok4_interactive": _interactive,
                     "data": _wd,
                 }
                 print(f"    [cards] walkthrough zbudowany dla {iid} (wiek {_wage})")

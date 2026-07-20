@@ -219,6 +219,69 @@ def test_no_gallery_section_g(tmp_path):
     assert 'id="G"' not in out.read_text(encoding="utf-8")
 
 
+def test_walkthrough_section_g_renders_raw_b64_without_double_prefix(tmp_path):
+    """Regression (20.07): every panel_*_b64 in localization_walkthrough must be raw
+    base64. _section_localization_walkthrough renders them via _img_tag(), which adds
+    the "data:image/..." prefix itself — a pre-prefixed input silently double-prefixes
+    the <img src> (invalid data URI, broken image, no exception)."""
+    from src.comparison_report import build_comparison_report
+    from src.report_common import png_to_b64
+    from PIL import Image as PILImage
+
+    tiny_path = tmp_path / "tiny.png"
+    PILImage.fromarray(np.zeros((4, 4, 3), dtype=np.uint8)).save(tiny_path)
+    raw_b64 = png_to_b64(tiny_path)
+    assert not raw_b64.startswith("data:image")
+
+    walkthrough = {
+        "image_id": "fish1.jpg", "true_age": 4, "pred_age": 4,
+        "panel_patchgrid_b64": raw_b64,
+        "panel_rays_b64": raw_b64,
+        "panel_rings_b64": raw_b64,
+        "panel_final_b64": raw_b64,
+        "panel_ray_examples_b64": [raw_b64, raw_b64],
+        "krok4_interactive": {
+            "predicted_age": 4, "n_samples": 3,
+            "inner_margin": 0.05, "edge_margin": 0.08,
+            "density_min_distance": 3, "classical_min_distance": 1,
+            "centroid": [20, 20], "contour_pts": [[40, 20], [20, 40]],
+            "density_profiles": [[0.0, 1.0, 0.2], [0.1, 0.3, 1.0]],
+            "classical_profiles": [[0.2, 0.9, 0.1], None],
+            "img": "data:image/png;base64," + raw_b64, "w": 60, "h": 60,
+        },
+        "data": {
+            "dp_min_gap": 0.04,
+            "density_peaks": [(0.3, 0.8, 10, 10)],
+            "classical_peaks": [(0.3, 0.5, 12, 12)],
+            "density_clusters": [(0.3, 5, 0.8)],
+            "merged": [(0.3, 4.0, "consensus")],
+            "chosen_t": [0.3],
+            "sample_profiles": [
+                {"t": [0.0, 0.5, 1.0], "raw": [0, 1, 0], "norm": [0.0, 1.0, 0.0],
+                 "peak_t": [0.5], "contour_pt": (20, 20)},
+                {"t": [0.0, 0.5, 1.0], "raw": [0, 1, 0], "norm": [0.0, 1.0, 0.0],
+                 "peak_t": [], "contour_pt": (5, 30)},
+            ],
+        },
+    }
+    out = tmp_path / "report.html"
+    build_comparison_report(output_path=out, localization_walkthrough=walkthrough, **_base_kwargs())
+    html = out.read_text(encoding="utf-8")
+    assert 'id="G"' in html
+    assert "Krok 2" in html
+    assert "data:image/png;base64,data:image/png;base64," not in html
+    # patchgrid/rays/rings/final (4) + 2 ray-example pairs × (ray image + chart) = 8 → 12 total
+    assert html.count("data:image/png;base64,") >= 12
+    # Krok 4 interactive widget: mount point + JSON payload + JS present, valid JSON.
+    assert 'id="krok4-widget"' in html
+    assert "const KROK4_DATA=" in html
+    import json as _json
+    payload_json = html.split("const KROK4_DATA=", 1)[1].split(";</script>", 1)[0]
+    parsed = _json.loads(payload_json)
+    assert parsed["predicted_age"] == 4
+    assert parsed["classical_profiles"][1] is None   # degenerate ray survives JSON round-trip
+
+
 # ---------------------------------------------------------------------------
 # Faza C — condition-aware (embedded-only) report
 # ---------------------------------------------------------------------------

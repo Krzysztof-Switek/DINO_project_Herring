@@ -779,6 +779,200 @@ _OPENCV_JS = r"""
 """
 
 
+# Krok 4 (sekcja G) — ŻYWY widget suwaków: prominencja / min-rozstaw DP / tolerancja klastra.
+# Python wysyła surowe, znormalizowane profile WSZYSTKICH 48 promieni (density + klasyka);
+# JS przelicza piki→klastry (mody histogramu, jak `_cluster_by_radius`)→scalanie (jak
+# `_merge_clusters`)→wybór DP (jak `_dp_select_t`) przy KAŻDEJ zmianie suwaka i rysuje wybrane
+# pierścienie na canvasie. Ta sama matematyka co po stronie serwera — sprawdzone testem
+# `test_dp_interactive_data_profiles_match_server_peaks` (Python) na spójność profili.
+_KROK4_JS = r"""
+(function(){
+  function findPeaksIdx(a, prom, minD){
+    // Mirrors scipy.signal.find_peaks: a PLATEAU (run of equal values that is a local
+    // max) reports its MIDPOINT as the peak, not its first/last index. The density
+    // profiles here are heavily plateaued (coarse density grid resampled to n_samples
+    // points → many samples land on the same patch), so this matters for every peak,
+    // not just an edge case — a naive "last point of the run" pick silently shifts
+    // every marker (caught by cross-checking against scipy, 20.07).
+    var n=a.length, iMax=n-1, i=1, t;
+    var cand=[];
+    while(i<iMax){
+      if(a[i-1]<a[i]){
+        var iAhead=i+1;
+        while(iAhead<iMax && a[iAhead]===a[i]) iAhead++;
+        if(a[iAhead]<a[i]){
+          var mid=Math.floor((i+iAhead-1)/2);
+          var val=a[mid];
+          var l=mid; while(l>0 && a[l-1]<=val) l--;
+          var rr=mid; while(rr<n-1 && a[rr+1]<=val) rr++;
+          var lmin=val; for(t=l;t<=mid;t++) lmin=Math.min(lmin,a[t]);
+          var rmin=val; for(t=mid;t<=rr;t++) rmin=Math.min(rmin,a[t]);
+          if(val-Math.max(lmin,rmin)>=prom) cand.push(mid);
+          i=iAhead;
+        }
+      }
+      i++;
+    }
+    cand.sort(function(x,y){return a[y]-a[x];});
+    var kept=[];
+    cand.forEach(function(p){ if(kept.every(function(q){return Math.abs(q-p)>=minD;})) kept.push(p); });
+    kept.sort(function(x,y){return x-y;});
+    return kept;
+  }
+  function rayPeaks(profiles, nSamples, prom, minD, innerM, edgeM){
+    var flat=[];
+    profiles.forEach(function(p){
+      if(!p) return;
+      findPeaksIdx(p, prom, minD).forEach(function(idx){
+        var t = idx/(nSamples-1);
+        if(t<innerM || t>1-edgeM) return;
+        flat.push([t, p[idx]]);
+      });
+    });
+    return flat;
+  }
+  function clusterByRadius(peaks, tTol){
+    if(peaks.length===0) return [];
+    var ts = peaks.map(function(p){return p[0];});
+    var ss = peaks.map(function(p){return p[1];});
+    if(ts.length===1) return [[ts[0], 1, ss[0]]];
+    var nbins = Math.max(4, Math.round(1.0/Math.max(tTol/3.0, 1e-3)));
+    var edges=[], centers=[], i;
+    for(i=0;i<=nbins;i++) edges.push(i/nbins);
+    for(i=0;i<nbins;i++) centers.push((edges[i]+edges[i+1])/2);
+    var counts = new Array(nbins).fill(0);
+    ts.forEach(function(tv){
+      var bi = Math.min(nbins-1, Math.max(0, Math.floor(Math.min(1,Math.max(0,tv))*nbins)));
+      counts[bi]++;
+    });
+    var win = Math.max(1, Math.round(tTol*nbins));
+    var half = Math.floor(win/2);
+    var smooth = counts.map(function(_,idx){
+      var s=0; for(var k=-half;k<=half;k++){ var j=idx+k; if(j>=0&&j<nbins) s+=counts[j]; }
+      return win>1 ? s/win : counts[idx];
+    });
+    var order = smooth.map(function(_,idx){return idx;}).sort(function(a,b){return smooth[b]-smooth[a];});
+    var claimed = new Array(nbins).fill(false);
+    var modes=[];
+    order.forEach(function(bi){
+      if(smooth[bi]<=0 || claimed[bi]) return;
+      var c = centers[bi];
+      for(var j=0;j<nbins;j++){ if(Math.abs(centers[j]-c)<=tTol) claimed[j]=true; }
+      modes.push(c);
+    });
+    if(modes.length===0) return [];
+    modes.sort(function(a,b){return a-b;});
+    var out=[];
+    modes.forEach(function(m){
+      var selT=[], selS=[];
+      ts.forEach(function(tv, idx){
+        var bestD=Infinity, bestM=null;
+        modes.forEach(function(mm){ var dd=Math.abs(tv-mm); if(dd<bestD){bestD=dd; bestM=mm;} });
+        if(bestM===m && bestD<=tTol){ selT.push(tv); selS.push(ss[idx]); }
+      });
+      if(selT.length===0) return;
+      var meanT = selT.reduce(function(a,b){return a+b;},0)/selT.length;
+      var meanS = selS.reduce(function(a,b){return a+b;},0)/selS.length;
+      out.push([meanT, selT.length, meanS]);
+    });
+    out.sort(function(a,b){return a[0]-b[0];});
+    return out;
+  }
+  function mergeClusters(dclust, cclust, tTol){
+    var merged=[], used=new Array(cclust.length).fill(false);
+    dclust.forEach(function(dc){
+      var dt=dc[0], score=dc[1]*dc[2], t=dt;
+      var bestI=-1, bestD=tTol;
+      cclust.forEach(function(c,i){
+        if(!used[i] && Math.abs(c[0]-dt)<=bestD){ bestI=i; bestD=Math.abs(c[0]-dt); }
+      });
+      if(bestI>=0){ var c=cclust[bestI]; used[bestI]=true; score+=c[1]*c[2]; t=0.5*(dt+c[0]); }
+      merged.push([t, score]);
+    });
+    cclust.forEach(function(c,i){ if(!used[i]) merged.push([c[0], c[1]*c[2]]); });
+    return merged;
+  }
+  function dpSelectT(cands, k, minGap){
+    if(k<=0 || cands.length===0) return [];
+    var cs = cands.slice().sort(function(a,b){return a[0]-b[0];});
+    var ts = cs.map(function(c){return c[0];}), ss = cs.map(function(c){return c[1];});
+    var M = ts.length; k = Math.min(k, M);
+    var NEG = -Infinity, dp=[], par=[], i, j, p;
+    for(j=0;j<=k;j++){ dp.push(new Array(M).fill(NEG)); par.push(new Array(M).fill(-1)); }
+    for(i=0;i<M;i++) dp[1][i]=ss[i];
+    for(j=2;j<=k;j++){
+      for(i=0;i<M;i++){
+        var best=NEG, bp=-1;
+        for(p=0;p<i;p++){ if(ts[i]-ts[p]>=minGap && dp[j-1][p]>best){ best=dp[j-1][p]; bp=p; } }
+        if(best>NEG){ dp[j][i]=best+ss[i]; par[j][i]=bp; }
+      }
+    }
+    var end=-1, bestVal=NEG;
+    for(i=0;i<M;i++){ if(dp[k][i]>bestVal){ bestVal=dp[k][i]; end=i; } }
+    if(end===-1){
+      var top = ts.map(function(_,idx){return idx;}).sort(function(a,b){return ss[b]-ss[a];}).slice(0,k);
+      return top.map(function(idx){return ts[idx];}).sort(function(a,b){return a-b;});
+    }
+    var chosen=[], jj=k;
+    while(end!==-1 && jj>=1){ chosen.push(ts[end]); end=par[jj][end]; jj-=1; }
+    chosen.sort(function(a,b){return a-b;});
+    return chosen;
+  }
+  function widget(d){
+    var box=document.createElement('div');
+    var cv=document.createElement('canvas'); cv.width=d.w; cv.height=d.h; cv.style.maxWidth='100%'; cv.style.border='1px solid #ccc';
+    var img=new Image();
+    var ctrls=document.createElement('div'); ctrls.style.cssText='font-size:13px;margin-top:8px;display:flex;flex-wrap:wrap;gap:18px;align-items:center;';
+    function mk(label,min,max,step,val){
+      var wrap=document.createElement('label'); wrap.style.cssText='display:inline-block;';
+      var sp=document.createElement('span'); sp.textContent=label+': ';
+      var inp=document.createElement('input'); inp.type='range'; inp.min=min; inp.max=max; inp.step=step; inp.value=val; inp.style.cssText='vertical-align:middle;width:140px;';
+      var out=document.createElement('span'); out.textContent=val; out.style.marginLeft='4px'; out.style.fontWeight='bold';
+      inp.addEventListener('input',function(){out.textContent=inp.value; recompute();});
+      wrap.appendChild(sp); wrap.appendChild(inp); wrap.appendChild(out); ctrls.appendChild(wrap);
+      return inp;
+    }
+    var sProm = mk('próg prominencji', 0.02, 0.5, 0.02, 0.1);
+    var sGap  = mk('min. rozstaw (DP)', 0.01, 0.15, 0.01, 0.04);
+    var sTol  = mk('tolerancja klastra', 0.02, 0.15, 0.01, 0.06);
+    var readout=document.createElement('div'); readout.style.cssText='font-weight:bold;margin-top:6px;color:#222;';
+    box.appendChild(cv); box.appendChild(ctrls); box.appendChild(readout);
+
+    function project(t){
+      return d.contour_pts.map(function(cp){
+        return [d.centroid[0]+t*(cp[0]-d.centroid[0]), d.centroid[1]+t*(cp[1]-d.centroid[1])];
+      });
+    }
+    function recompute(){
+      var prom=parseFloat(sProm.value), gap=parseFloat(sGap.value), tol=parseFloat(sTol.value);
+      var densPk = rayPeaks(d.density_profiles, d.n_samples, prom, d.density_min_distance, d.inner_margin, d.edge_margin);
+      var classPk = rayPeaks(d.classical_profiles, d.n_samples, prom, d.classical_min_distance, d.inner_margin, d.edge_margin);
+      var dclust = clusterByRadius(densPk, tol);
+      var cclust = clusterByRadius(classPk, tol);
+      var merged = mergeClusters(dclust, cclust, tol);
+      var chosen = dpSelectT(merged, d.predicted_age, gap);
+      var ctx = cv.getContext('2d');
+      ctx.clearRect(0,0,cv.width,cv.height);
+      if(img.complete) ctx.drawImage(img,0,0,cv.width,cv.height);
+      chosen.forEach(function(t){
+        var pts = project(t);
+        ctx.strokeStyle='rgba(230,30,30,0.95)'; ctx.lineWidth=2.5;
+        ctx.beginPath();
+        pts.forEach(function(p,i){ if(i===0) ctx.moveTo(p[0],p[1]); else ctx.lineTo(p[0],p[1]); });
+        ctx.closePath(); ctx.stroke();
+      });
+      readout.textContent = 'wykryto pierścieni: ' + chosen.length + ' (wiek modelu: ' + d.predicted_age + ')' +
+        (chosen.length !== d.predicted_age ? '  — nie zgadza się z wiekiem przy tych ustawieniach' : '  ✔ zgadza się z wiekiem');
+    }
+    img.onload=recompute; img.src=d.img;
+    return box;
+  }
+  var root=document.getElementById('krok4-widget');
+  if(root && typeof KROK4_DATA!=='undefined'){ root.appendChild(widget(KROK4_DATA)); }
+})();
+"""
+
+
 def _section_opencv(opencv_reference: dict | None) -> str:
     """Section H — interactive classical (OpenCV-style) increment detection for
     technicians (11.07 Punkt 7 / Kierunek A). Profile is precomputed in Python;
@@ -812,6 +1006,28 @@ def _section_opencv(opencv_reference: dict | None) -> str:
     return html
 
 
+def _section_krok4_interactive(krok4_data: dict | None) -> str:
+    """Krok 4 — ŻYWY widget: suwaki (prominencja / min-rozstaw DP / tolerancja klastra)
+    przeliczają piki→klastry→wybór DP w przeglądarce (``_KROK4_JS``) z surowych profili
+    ``krok4_data`` (``ring_extraction.dp_interactive_data``, zbudowany w run_pipeline).
+    """
+    if not krok4_data:
+        return ""
+    import json as _json
+    html = (
+        '<h3 style="margin:0.8em 0 0.2em;">Krok 4 (interaktywnie) — pokrętl suwakami</h3>'
+        '<p style="margin:0 0 0.4em;color:#555;">Te same 48 promieni, ale <b>na żywo</b>: '
+        'zmieniając próg prominencji (jak silny musi być pik), minimalny rozstaw DP (jak blisko '
+        'mogą leżeć dwa wybrane pierścienie) i tolerancję klastra (jak blisko musi być <code>t</code> '
+        'w różnych kierunkach, żeby uznać je za ten sam pierścień) — widać wprost, jak wrażliwa jest '
+        'liczba i rozstaw wykrytych przyrostów na te trzy wybory.</p>'
+        '<div id="krok4-widget"></div>'
+        '<script>const KROK4_DATA=' + _json.dumps(krok4_data) + ';</script>'
+        '<script>' + _KROK4_JS + '</script>'
+    )
+    return html
+
+
 def _section_localization_walkthrough(payload: dict | None) -> str:
     """Sekcja edukacyjna „krok po kroku": na JEDNYM otolicie pokazuje, jak z kandydatów
     z 48 promieni (density + klasyka) metoda DP wybiera finalne przyrosty (czerwone).
@@ -825,17 +1041,18 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
     age = int(payload.get("pred_age", 0))
     gap = float(d.get("dp_min_gap", 0.04))
 
-    # --- Panel 2: profile przykładowych promieni (znormalizowane per-promień) + wykryte piki ---
-    # 20.07: usunięto bezużyteczną „surową" linię (leżała na zerze, bo surowe density ≈0 na skali
-    # [0,1]); pokazujemy sam profil znormalizowany z zaznaczonymi pikami (= kandydaci na tym promieniu).
+    # --- Panel 2: JEDEN promień na zdjęciu + jego profil (znormalizowany), obok siebie ---
+    # 20.07 pass 2: dawniej same wykresy w oderwaniu od obrazu ("którego to promienia?"). Teraz
+    # KAŻDY profil ma parę: podświetlony promień na otolicie (panel_ray_examples_b64, wyliczony
+    # w run_pipeline.render_single_ray) + jego własny wykres — łatwo odczytać "pik na t=0.6" wprost
+    # ze zdjęcia. Usunięto też bezużyteczną „surową" linię (surowe density ≈0 na skali [0,1]).
     profiles = d.get("sample_profiles") or []
-    prof_b64 = ""
+    ray_imgs = payload.get("panel_ray_examples_b64") or []
+    krok2_html = ""
     if profiles:
         import numpy as _np
-        n = len(profiles)
-        fig, axes = plt.subplots(1, n, figsize=(3.7 * n, 2.8), squeeze=False)
         for j, pr in enumerate(profiles):
-            ax = axes[0][j]
+            fig, ax = plt.subplots(figsize=(3.4, 2.6))
             t = _np.asarray(pr["t"]); norm = _np.asarray(pr["norm"])
             ax.fill_between(t, 0, norm, color="#2a78d6", alpha=0.18)
             ax.plot(t, norm, color="#2a78d6", lw=1.7)
@@ -846,35 +1063,47 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
             npk = len(pr.get("peak_t", []))
             ax.set_title(f"promień {j + 1} — {npk} pik(ów)", fontsize=9)
             ax.set_xlabel("t (jądro→brzeg)", fontsize=8)
-            ax.set_ylabel("sygnał (znorm. 0–1)" if j == 0 else "", fontsize=8)
+            ax.set_ylabel("sygnał (znorm. 0–1)", fontsize=8)
             ax.set_ylim(-0.05, 1.08)
-        fig.tight_layout()
-        prof_b64 = _fig_to_b64(fig)
-        plt.close(fig)
+            fig.tight_layout()
+            chart_b64 = _fig_to_b64(fig)
+            plt.close(fig)
+            ray_b64 = ray_imgs[j] if j < len(ray_imgs) else ""
+            krok2_html += '<div style="display:inline-block;vertical-align:top;margin:4px 10px 4px 0;">'
+            if ray_b64:
+                krok2_html += _img_tag(ray_b64, "230px") + "<br>"
+            krok2_html += _img_tag(chart_b64, "230px") + "</div>"
 
     # --- Panel 3: głosowanie po promieniu (piki density vs klasyka, x=t) ---
     dpk = d.get("density_peaks") or []
     cpk = d.get("classical_peaks") or []
     vote_b64 = ""
     if dpk or cpk:
+        from matplotlib.patches import Patch
         fig, ax = plt.subplots(figsize=(9, 2.6))
         dt = [p[0] for p in dpk]
         ct = [p[0] for p in cpk]
+        # Density = solid fill; klasyka = hatched OUTLINE only (no fill) — overlapping bins stay
+        # readable as "orange fill + green hatch" instead of blending into a muddy third colour.
         if dt:
-            ax.hist(dt, bins=25, range=(0, 1), color="#f4b400", alpha=0.75, label="density (piki z 48 promieni)")
+            ax.hist(dt, bins=25, range=(0, 1), color="#f4b400", alpha=0.75, zorder=2,
+                    label="density (piki z 48 promieni)")
         if ct:
-            ax.hist(ct, bins=25, range=(0, 1), color="#0a9d6e", alpha=0.5, label="klasyka (piki z 48 promieni)")
+            ax.hist(ct, bins=25, range=(0, 1), facecolor="none", edgecolor="#0a9d6e",
+                    hatch="///", linewidth=1.2, zorder=3, label="klasyka (piki z 48 promieni)")
         # Klastry (mody rozkładu, po E1) jako pionowe PASY — „tu zbiega się wiele kierunków = pierścień".
         _t_tol = 0.06
         for (mt, _s, _st) in (d.get("density_clusters") or []):
-            ax.axvspan(mt - _t_tol / 2, mt + _t_tol / 2, color="#c58a00", alpha=0.12)
-            ax.axvline(mt, color="#c58a00", ls="--", lw=1.0)
+            ax.axvspan(mt - _t_tol / 2, mt + _t_tol / 2, color="#c58a00", alpha=0.12, zorder=1)
+            ax.axvline(mt, color="#c58a00", ls="--", lw=1.0, zorder=1)
         ax.set_xlim(0, 1)
         ax.set_xlabel("t (znormalizowany promień, jądro→brzeg)", fontsize=9)
         ax.set_ylabel("ile promieni ma tu pik", fontsize=9)
-        ax.set_title("Głosowanie po promieniu — słupki = histogram promieni pików; "
-                     "pomarańczowe pasy = klastry (pierścienie-kandydaci)", fontsize=9)
-        ax.legend(fontsize=8)
+        ax.set_title("Głosowanie po promieniu — słupki = histogram promieni pików", fontsize=9)
+        handles, labels = ax.get_legend_handles_labels()
+        handles.append(Patch(facecolor="#c58a00", alpha=0.3, edgecolor="#c58a00", linestyle="--",
+                             label="klaster (pierścień-kandydat, z density)"))
+        ax.legend(handles=handles, fontsize=8)
         fig.tight_layout()
         vote_b64 = _fig_to_b64(fig)
         plt.close(fig)
@@ -916,6 +1145,12 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         return (f'<h3 style="margin:0.8em 0 0.2em;">{title}</h3>'
                 f'<p style="margin:0 0 0.4em;color:#555;">{desc}</p>{_img_tag(b64)}')
 
+    def _html_block(title, desc, body_html):
+        if not body_html:
+            return ""
+        return (f'<h3 style="margin:0.8em 0 0.2em;">{title}</h3>'
+                f'<p style="margin:0 0 0.4em;color:#555;">{desc}</p><div>{body_html}</div>')
+
     n_final = len(d.get("chosen_t") or [])
     note = ("" if n_final >= age else
             f' <b>Uwaga:</b> tu wybrano tylko <b>{n_final}</b> odrębnych pierścieni (wiek {age}).')
@@ -940,13 +1175,14 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         "osobno</b> — dlatego kandydaci mogą ujawnić strukturę wnętrza, której mapa density (wartości "
         "absolutne) nie pokazuje.",
         payload.get("panel_rays_b64", ""))
-    html += _fig_block(
-        "Krok 2 — profil pojedynczego promienia i jego piki",
-        "Bierzemy sygnał wzdłuż jednego promienia (jądro→brzeg) i normalizujemy do [0,1] "
-        "(żeby jasne i ciemne kierunki były porównywalne). <b>Pik</b> = lokalne maksimum wystające "
-        "ponad otoczenie (czerwone kropki) — to kandydat na przyrost na tym promieniu; drobne "
-        "falowanie poniżej progu to szum. Kilka przykładowych promieni z 48:",
-        prof_b64)
+    html += _html_block(
+        "Krok 2 — jeden promień: obraz i jego profil",
+        "Bierzemy sygnał wzdłuż jednego promienia (jądro→brzeg, <b>czerwona linia</b> na zdjęciu) "
+        "i normalizujemy do [0,1] (żeby jasne i ciemne kierunki były porównywalne). <b>Pik</b> = "
+        "lokalne maksimum wystające ponad otoczenie (czerwone kropki na zdjęciu i na wykresie) — "
+        "to kandydat na przyrost na tym promieniu; drobne falowanie poniżej progu to szum. Kilka "
+        "przykładowych promieni z 48, zdjęcie obok jego własnego wykresu:",
+        krok2_html)
     html += _fig_block(
         "Krok 3 — głosowanie po promieniu",
         "Każdy pik ma promień <code>t</code> (0=jądro, 1=brzeg). Prawdziwy pierścień jest "
@@ -966,9 +1202,10 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         "co do promienia, score się <b>sumuje</b> (konsensus). Wybieramy <code>wiek</code> pierścieni "
         "o najwyższym score, z <b>wymuszonym minimalnym rozstawem</b> — bo realne roczne przyrosty są "
         "rozłożone wzdłuż osi, a bez tego algorytm skupiłby kilka pików w jednym, najsilniejszym miejscu. "
-        "(To jeden z możliwych sposobów separacji — inne progi/metody dają inną liczbę; do eksploracji "
-        "suwakami w kolejnej wersji.)",
+        "To jeden z możliwych sposobów separacji — poniżej można pokrętlić suwakami i zobaczyć, jak "
+        "zmienia się liczba i rozstaw wykrytych pierścieni.",
         dp_b64)
+    html += _section_krok4_interactive(payload.get("krok4_interactive"))
     html += _fig_block(
         "Krok 5 — rzut na oś: finalne przyrosty",
         "Wybrane promienie rzutujemy na oś pomiaru (jądro→brzeg) — <b>czerwone</b> punkty. "

@@ -165,10 +165,16 @@ class SegmentationConfig(BaseModel):
     n_angles: int = Field(720, ge=32)             # rays cast from the nucleus
     smooth_sigma: float = Field(4.0, ge=0.0)      # periodic r(θ) smoothing: low = follow teeth, high = smooth envelope
     gap_tolerance: int = Field(8, ge=0)           # px below threshold tolerated before commit
+    # Nucleus (jądro) estimate — "geometric" (default) is the mask's plain centroid;
+    # "intensity" (otolith_axis.find_intensity_centroid) weights by pixel brightness,
+    # pulling toward the otolith's opaque core (closer to the true primordium when
+    # growth is asymmetric). NOT a segment_otolith kwarg — excluded in as_params(),
+    # consumed directly by detect_axis(nucleus_method=...).
+    nucleus_method: Literal["geometric", "intensity"] = "geometric"
 
     def as_params(self) -> dict:
         """Kwargs for ``segment_otolith`` / ``detect_axis(seg_params=...)``."""
-        return self.model_dump()
+        return self.model_dump(exclude={"nucleus_method"})
 
 
 class DemoConfig(BaseModel):

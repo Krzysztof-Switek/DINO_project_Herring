@@ -21,7 +21,7 @@ Reuses ``otolith_axis.sample_profile_along_axis`` for the radial sampling.
 """
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -161,6 +161,55 @@ def draw_ring_curves(panel: np.ndarray, curves: List[np.ndarray],
 # classical_increments and fuse_increments — one implementation, no duplication)
 # ---------------------------------------------------------------------------
 
+def _all_ray_profiles(
+    signal_grid, axis_info: dict, image_h: int, image_w: int,
+    *, n_dirs: int = 48, n_samples: int = 64, smooth_sigma: float = 0.0,
+) -> Tuple[List[Optional[np.ndarray]], List[np.ndarray], List[Tuple[int, int]]]:
+    """Sample + per-ray normalise ALL ``n_dirs`` rays (jądro→kontur); NO peak-finding.
+
+    Split out of :func:`_all_ray_peaks` so the interactive Krok-4 widget (JS sliders)
+    can redo peak-finding client-side at an arbitrary prominence from the SAME raw
+    profiles the server uses — see :func:`dp_interactive_data`.
+
+    Returns ``(profiles, line_xys, contour_pts)``: ``profiles[i]`` is the ray's
+    ``(n_samples,)`` float32 profile normalised to ``[0, 1]``, or ``None`` for a
+    degenerate (flat) ray; ``line_xys[i]`` is that ray's ``(n_samples, 2)`` pixel path;
+    ``contour_pts[i]`` is the ray's contour endpoint.
+    """
+    contour = axis_info.get("contour") if axis_info else None
+    centroid = axis_info.get("centroid") if axis_info else None
+    if contour is None or centroid is None:
+        return [], [], []
+    grid = _to_numpy(signal_grid)
+    if grid.ndim == 3:
+        grid = grid.mean(axis=2).astype(np.float32)
+    cpts = contour.reshape(-1, 2)
+    if len(cpts) < 3:
+        return [], [], []
+    idx_sel = np.linspace(0, len(cpts) - 1, min(n_dirs, len(cpts)), dtype=int)
+
+    smoother = None
+    if smooth_sigma > 0:
+        from scipy.ndimage import gaussian_filter1d
+        smoother = lambda a: gaussian_filter1d(a, float(smooth_sigma))
+
+    profiles: List[Optional[np.ndarray]] = []
+    line_xys: List[np.ndarray] = []
+    contour_pts: List[Tuple[int, int]] = []
+    for ci in idx_sel:
+        cpt = (int(cpts[ci][0]), int(cpts[ci][1]))
+        contour_pts.append(cpt)
+        profile, line_xy = sample_profile_along_axis(
+            grid, centroid, cpt, image_h, image_w, n_samples=n_samples)
+        line_xys.append(line_xy)
+        p = profile.astype(np.float32)
+        if smoother is not None:
+            p = smoother(p)
+        rng = float(p.max() - p.min())
+        profiles.append((p - p.min()) / rng if rng > 1e-6 else None)
+    return profiles, line_xys, contour_pts
+
+
 def _all_ray_peaks(
     signal_grid, axis_info: dict, image_h: int, image_w: int,
     *, n_dirs: int = 48, n_samples: int = 64, min_distance: int = 3,
@@ -174,36 +223,15 @@ def _all_ray_peaks(
     positions to grid indices either way. Returns ``(peaks, candidate_pts)`` where
     ``peaks = [(t, strength, x, y)]`` (t = normalised radius, 0=nucleus, 1=edge).
     """
-    contour = axis_info.get("contour") if axis_info else None
-    centroid = axis_info.get("centroid") if axis_info else None
-    if contour is None or centroid is None:
-        return [], []
-    grid = _to_numpy(signal_grid)
-    if grid.ndim == 3:
-        grid = grid.mean(axis=2).astype(np.float32)
-    cpts = contour.reshape(-1, 2)
-    if len(cpts) < 3:
-        return [], []
-    idx_sel = np.linspace(0, len(cpts) - 1, min(n_dirs, len(cpts)), dtype=int)
-
-    smoother = None
-    if smooth_sigma > 0:
-        from scipy.ndimage import gaussian_filter1d
-        smoother = lambda a: gaussian_filter1d(a, float(smooth_sigma))
+    profiles, line_xys, _contour_pts = _all_ray_profiles(
+        signal_grid, axis_info, image_h, image_w,
+        n_dirs=n_dirs, n_samples=n_samples, smooth_sigma=smooth_sigma)
 
     peaks: List[Tuple[float, float, int, int]] = []
     candidate_pts: List[Tuple[int, int]] = []
-    for ci in idx_sel:
-        cpt = (int(cpts[ci][0]), int(cpts[ci][1]))
-        profile, line_xy = sample_profile_along_axis(
-            grid, centroid, cpt, image_h, image_w, n_samples=n_samples)
-        p = profile.astype(np.float32)
-        if smoother is not None:
-            p = smoother(p)
-        rng = float(p.max() - p.min())
-        if rng <= 1e-6:
+    for pn, line_xy in zip(profiles, line_xys):
+        if pn is None:
             continue
-        pn = (p - p.min()) / rng
         idxs, _ = find_peaks(pn, distance=max(1, int(min_distance)),
                              prominence=float(prominence))
         for idx in idxs:
@@ -246,9 +274,15 @@ def _cluster_by_radius(peaks, t_tol: float = 0.06) -> List[Tuple[float, int, flo
               if win > 1 else counts.astype(np.float64))
 
     # Non-max suppression: greedily take the highest-vote bin, claim ±t_tol around it.
+    # Ties (equal smoothed vote, common with small integer counts) broken by ascending
+    # bin index — np.argsort's default quicksort is NOT stable, so without an explicit
+    # tie-break this order (and thus which bin claims a contested region) is unspecified
+    # and can differ between equivalent implementations (caught by cross-checking this
+    # exact function against a JS port for the Krok-4 live widget, 20.07).
     modes: List[float] = []
     claimed = np.zeros(nbins, dtype=bool)
-    for bi in np.argsort(smooth)[::-1]:
+    order = np.lexsort((np.arange(nbins), -smooth))
+    for bi in order:
         if smooth[bi] <= 0 or claimed[bi]:
             continue
         c = float(centers[bi])
@@ -612,4 +646,45 @@ def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int,
             density_grid, axis_info, image_h, image_w, n_dirs=n_dirs, n_samples=n_samples,
             min_distance=density_min_distance, prominence=density_prominence,
             inner_margin=inner_margin, edge_margin=edge_margin, n_example=n_example_rays),
+    }
+
+
+def dp_interactive_data(density_grid, gray_image, axis_info: dict, image_h: int, image_w: int,
+                        predicted_age: int, *, n_dirs: int = 48, n_samples: int = 64,
+                        inner_margin: float = 0.05, edge_margin: float = 0.08,
+                        density_min_distance: int = 3, classical_min_distance: int = 1,
+                        classical_smooth_sigma: float = 0.0) -> dict:
+    """RAW per-ray profiles (density + classical) + geometry for the Krok-4 LIVE slider
+    widget (prominencja / min-rozstaw DP / tolerancja klastra).
+
+    Unlike :func:`dp_walkthrough_data` (which bakes in ONE prominence/t_tol/min-gap and
+    returns already-detected peaks/clusters), this exposes the un-peaked normalised
+    profiles for ALL ``n_dirs`` rays so the browser can rerun peak-finding → clustering →
+    DP selection at ANY prominence/tolerance/gap the user picks — using the SAME math as
+    ``_all_ray_peaks`` / ``_cluster_by_radius`` / ``_dp_select_t`` (reimplemented in JS;
+    see ``comparison_report._KROK4_JS``), so the widget's output matches what a real
+    server run would produce at those settings. ``density_min_distance`` /
+    ``classical_min_distance`` / ``classical_smooth_sigma`` stay fixed (not sliders) —
+    only the 3 requested parameters are interactive.
+    """
+    density_profiles, _dl, contour_pts = _all_ray_profiles(
+        density_grid, axis_info, image_h, image_w, n_dirs=n_dirs, n_samples=n_samples)
+    gray = _to_numpy(gray_image)
+    if gray.ndim == 3:
+        gray = gray.mean(axis=2).astype(np.float32)
+    classical_profiles, _cl, _ = _all_ray_profiles(
+        gray, axis_info, image_h, image_w, n_dirs=n_dirs, n_samples=n_samples,
+        smooth_sigma=classical_smooth_sigma)
+    cx, cy = axis_info["centroid"]
+    return {
+        "predicted_age": max(0, int(predicted_age)),
+        "n_samples": n_samples,
+        "inner_margin": inner_margin,
+        "edge_margin": edge_margin,
+        "density_min_distance": density_min_distance,
+        "classical_min_distance": classical_min_distance,
+        "centroid": [int(cx), int(cy)],
+        "contour_pts": [[int(x), int(y)] for (x, y) in contour_pts],
+        "density_profiles": [(p.tolist() if p is not None else None) for p in density_profiles],
+        "classical_profiles": [(p.tolist() if p is not None else None) for p in classical_profiles],
     }

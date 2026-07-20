@@ -328,3 +328,68 @@ def test_full_smoke(tmp_path):
     assert report_path.exists()
     content = report_path.read_text(encoding="utf-8")
     assert "<html" in content
+
+
+# ---------------------------------------------------------------------------
+# test_walkthrough_panel_b64_is_raw (regression, 20.07)
+# ---------------------------------------------------------------------------
+
+def test_walkthrough_panel_b64_is_raw(tmp_path, monkeypatch):
+    """panel_*_b64 in the walkthrough payload must be RAW base64 (no "data:image/..."
+    prefix) — src/comparison_report.py renders them via _img_tag(), which adds the
+    prefix itself. A pre-prefixed string here silently double-prefixes the <img src>,
+    producing an invalid data URI (broken image, no exception — bug found 20.07 via
+    screenshots showing Krok 0/1/3b/5 panels missing while the matplotlib panels,
+    which already used raw base64, rendered fine)."""
+    import base64
+    import cv2
+    from src.inference import load_model_from_checkpoint as _real_load
+    from scripts.run_pipeline import _compute_axis_data_for_samples
+
+    # _compute_axis_data_for_samples always calls load_model_from_checkpoint(cfg, ckpt)
+    # with the REAL DINOv2 backbone; inject the mock backbone (matches the checkpoint
+    # trained below) so this test stays offline/fast like the rest of the suite.
+    monkeypatch.setattr(
+        "src.inference.load_model_from_checkpoint",
+        lambda cfg, ckpt_path, backbone=None: _real_load(cfg, ckpt_path, backbone=_MockDinoBackbone()),
+    )
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True)
+    # A real segmentable otolith-like shape (dark ellipse on light background) so
+    # detect_axis succeeds and the walkthrough branch actually runs.
+    img = np.full((300, 220, 3), 255, dtype=np.uint8)
+    cv2.ellipse(img, (110, 150), (60, 100), angle=0, startAngle=0, endAngle=360,
+                color=(40, 40, 40), thickness=-1)
+
+    rows = []
+    for i, split in enumerate(["train", "val", "test"]):
+        fname = f"2022_BIAS_HER_Loc_Embedded_Sharp_FishIndex{i}_Single1_Left.png"
+        PILImage.fromarray(img, "RGB").save(img_dir / fname)
+        rows.append({"image_id": fname, "age": 4, "split": split})
+    labels_csv = tmp_path / "labels.csv"
+    pd.DataFrame(rows).to_csv(labels_csv, index=False)
+    test_fname = rows[-1]["image_id"]
+
+    cfg = _make_cfg(tmp_path, labels_csv, img_dir)
+    ckpt = _save_mock_checkpoint(cfg, labels_csv, img_dir)
+
+    samples = [{"image_id": test_fname, "age": 4, "predicted_age": 4}]
+    _grids, _axis_data, wt = _compute_axis_data_for_samples(
+        samples, img_dir, cfg, ckpt, tmp_path / "cond",
+    )
+
+    assert wt is not None, "walkthrough payload was not built — otolith failed to segment"
+    for key in ("panel_patchgrid_b64", "panel_rays_b64", "panel_rings_b64", "panel_final_b64"):
+        b64 = wt[key]
+        assert b64, f"{key} is empty"
+        assert not b64.startswith("data:image"), (
+            f"{key} is pre-prefixed with a data URI — will be double-prefixed by _img_tag()")
+        assert base64.b64decode(b64)[:8] == b"\x89PNG\r\n\x1a\n", f"{key} is not a valid PNG"
+
+    # Krok 2 companion images (one per sample_profiles entry) — same raw-base64 contract.
+    ray_imgs = wt["panel_ray_examples_b64"]
+    assert len(ray_imgs) == len(wt["data"]["sample_profiles"]) >= 1
+    for b64 in ray_imgs:
+        assert b64 and not b64.startswith("data:image")
+        assert base64.b64decode(b64)[:8] == b"\x89PNG\r\n\x1a\n"
