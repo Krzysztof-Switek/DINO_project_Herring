@@ -8,11 +8,14 @@ import numpy as np
 import pytest
 
 from src.otolith_axis import (
+    apply_background_mask,
     detect_axis,
     find_centroid,
     find_farthest_edge,
     find_intensity_centroid,
+    get_or_compute_mask,
     load_mask,
+    MASK_FILL_RGB,
     resolve_centroid,
     sample_profile_along_axis,
     save_mask,
@@ -334,3 +337,46 @@ def test_save_and_load_mask_roundtrip(tmp_path):
 
 def test_load_mask_missing_returns_none(tmp_path):
     assert load_mask(tmp_path / "missing.png") is None
+
+
+# ---------------------------------------------------------------------------
+# get_or_compute_mask / apply_background_mask (input masking, 20.07)
+# ---------------------------------------------------------------------------
+
+def test_get_or_compute_mask_computes_and_caches(tmp_path):
+    img = _make_dark_ellipse()
+    cache_path = tmp_path / "fish1_mask.png"
+    assert not cache_path.exists()
+    mask = get_or_compute_mask(img, cache_path)
+    assert mask is not None
+    assert cache_path.exists()
+
+
+def test_get_or_compute_mask_reuses_cache(tmp_path, monkeypatch):
+    img = _make_dark_ellipse()
+    cache_path = tmp_path / "fish1_mask.png"
+    first = get_or_compute_mask(img, cache_path)
+
+    def _boom(*a, **kw):
+        raise AssertionError("segment_otolith should NOT be called on a cache hit")
+    monkeypatch.setattr("src.otolith_axis.segment_otolith", _boom)
+
+    second = get_or_compute_mask(img, cache_path)
+    assert np.array_equal(first, second)
+
+
+def test_get_or_compute_mask_returns_none_without_caching_on_failure(tmp_path):
+    uniform = np.full((100, 100, 3), 255, dtype=np.uint8)   # no segmentable foreground
+    cache_path = tmp_path / "fail_mask.png"
+    assert get_or_compute_mask(uniform, cache_path) is None
+    assert not cache_path.exists()
+
+
+def test_apply_background_mask_fills_outside_only():
+    img = np.full((20, 20, 3), 200, dtype=np.uint8)
+    mask = np.zeros((20, 20), dtype=np.uint8)
+    mask[5:15, 5:15] = 255
+    out = apply_background_mask(img, mask)
+    assert tuple(out[0, 0]) == MASK_FILL_RGB               # outside mask → filled
+    assert tuple(out[10, 10]) == (200, 200, 200)           # inside mask → untouched
+    assert img[10, 10].tolist() == [200, 200, 200]         # original not mutated

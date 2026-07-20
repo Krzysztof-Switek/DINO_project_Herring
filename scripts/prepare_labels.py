@@ -36,6 +36,21 @@ PAIR_TYPE    = "Raw Pair"
 BAD_TYPES    = {"LowQuality", "Wrong", "Broken"}
 UNKNOWN_AGE  = -9
 
+# Filename-level quality flags (distinct from the Excel "Typ otolitu" column check
+# above): a broken/low-quality IMAGE can share its fish's metadata row with a good
+# one, so the Excel filter alone doesn't catch it — the filename itself must be
+# checked (20.07 data-hygiene item). Usually the last underscore-separated token
+# (e.g. ..._Single1_Broken.jpg), but checked across all tokens defensively.
+_BAD_FILENAME_TOKENS = {t.lower() for t in BAD_TYPES}
+
+
+def has_bad_quality_token(filename: str) -> bool:
+    """True if any underscore-separated token in ``filename`` is a quality flag
+    (Broken/LowQuality/Wrong, any casing) — shared by prepare_labels.build_labels
+    and scan_labels.parse_filename so both label-building paths agree."""
+    stem = Path(filename).stem
+    return any(p.lower() in _BAD_FILENAME_TOKENS for p in stem.split("_"))
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -163,6 +178,14 @@ def build_labels(
     print(f"  Zachowano typy: {sorted(allowed)}")
     print(f"  Usunieto {removed} wierszy ({BAD_TYPES | ({PAIR_TYPE} if not include_raw_pair else set())})")
     print(f"  Pozostalo: {len(df_filtered)} wierszy")
+
+    # Filename-level quality flag (Broken/LowQuality/Wrong) — catches images whose
+    # own filename is flagged even when their fish's "Typ otolitu" row says otherwise.
+    bad_name = df_filtered["FilePath"].str.strip().apply(has_bad_quality_token)
+    n_bad_name = int(bad_name.sum())
+    if n_bad_name:
+        print(f"  Usunieto dodatkowo {n_bad_name} wierszy po nazwie pliku (Broken/LowQuality/Wrong)")
+        df_filtered = df_filtered[~bad_name].copy()
 
     # ------------------------------------------------------------------ #
     # [3] Mapowanie kolumn + wyciagnięcie fish_id

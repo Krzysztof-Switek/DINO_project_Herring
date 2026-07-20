@@ -21,7 +21,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.prepare_labels import scan_image_dir, assign_split_by_fish, GOOD_TYPES
+from scripts.prepare_labels import scan_image_dir, assign_split_by_fish, GOOD_TYPES, has_bad_quality_token
 
 UNKNOWN_AGE = -9
 
@@ -57,10 +57,15 @@ def parse_filename(name: str) -> dict | None:
     else:
         return None
 
+    # Reject quality-flagged images (Broken/LowQuality/Wrong) BEFORE they ever reach
+    # the Excel-metadata join — the Excel "Typ otolitu" column filter (GOOD_TYPES,
+    # applied in load_excel_metadata) only screens rows that got a distinct Excel
+    # entry; a broken image sharing its fish's metadata row with a good one would
+    # otherwise slip through untouched (20.07, pre-training data-hygiene item).
+    if has_bad_quality_token(name):
+        return None
     neutral_fish_key = f"{parts[0]}_{parts[1]}_{parts[2]}_{parts[3]}_{parts[6]}"
     side_token = parts[8].lower()
-    if side_token == "wrong":
-        return None                     # explicitly rejected image — skip
     side = parts[8] if side_token in {"left", "right"} else None
 
     return {

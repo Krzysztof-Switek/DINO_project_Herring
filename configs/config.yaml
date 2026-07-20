@@ -41,6 +41,12 @@ data:
     - weight_g
     - sex
     - population
+  # Input masking (20.07 pre-training item): feed the model ONLY the segmented
+  # otolith — CLS-attention diagnostic showed ~12-17% of attention landing on
+  # background/edge. Masks computed once (otolith_axis.get_or_compute_mask) and
+  # cached under data/masks_cache/ (mask_cache_dir: null → that default).
+  mask_background: true
+  mask_cache_dir: null
 
 training:
   epochs: 50                      # sufit; early_stopping zdecyduje kiedy faktycznie zakończyć (poprzednie dobre biegi ~e37)
@@ -69,8 +75,8 @@ inference:
   save_overlays: true
   save_candidates: true
   increment_samples:
-    top_k_best: 10
-    top_k_worst: 10
+    top_k_best: 5
+    top_k_worst: 5
     annotate_all: false   # true = kropki + galeria (sekcja G raportu) dla WSZYSTKICH
                           # obrazów testowych (wolniej, większy HTML); false = tylko top-k
 

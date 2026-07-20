@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
@@ -11,6 +12,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 from src.config import OtolithConfig
+from src.otolith_axis import apply_background_mask, get_or_compute_mask
 
 REQUIRED_COLUMNS = {"image_id", "age", "split"}
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
@@ -124,6 +126,16 @@ class OtolithDataset(Dataset):
         csv_path = Path(labels_csv) if labels_csv else root / cfg.data.labels_csv
         self.img_dir = Path(image_dir) if image_dir else root / cfg.data.image_dir
 
+        self.mask_background = cfg.data.mask_background
+        self.mask_cache_dir: Optional[Path] = None
+        if self.mask_background:
+            # Project-relative by default (NOT under img_dir, which may be a
+            # read-only network share) — one cache shared across every run, keyed
+            # only by image_id since a mask depends solely on the raw image.
+            self.mask_cache_dir = (Path(cfg.data.mask_cache_dir) if cfg.data.mask_cache_dir
+                                   else root / "data" / "masks_cache")
+            self.mask_cache_dir.mkdir(parents=True, exist_ok=True)
+
         if not csv_path.exists():
             raise FileNotFoundError(f"Labels CSV not found: {csv_path}")
 
@@ -221,7 +233,22 @@ class OtolithDataset(Dataset):
                     path = candidate
                     break
         image = Image.open(path).convert("RGB")
+        if self.mask_background:
+            image = self._mask_background(image, image_id)
         return self.transform(image)
+
+    def _mask_background(self, image: Image.Image, image_id: str) -> Image.Image:
+        """Blank out everything outside the segmented otolith (MASK_FILL_RGB).
+
+        Falls back to the unmasked image when segmentation fails (e.g. a uniform or
+        unusual photo) — masking must never be able to crash training on a bad image.
+        """
+        rgb = np.array(image, dtype=np.uint8)
+        cache_path = self.mask_cache_dir / f"{Path(image_id).stem}_mask.png"
+        mask = get_or_compute_mask(rgb, cache_path, seg_params=self.cfg.segmentation.as_params())
+        if mask is None:
+            return image
+        return Image.fromarray(apply_background_mask(rgb, mask))
 
     # ------------------------------------------------------------------
     # Metadata encoding

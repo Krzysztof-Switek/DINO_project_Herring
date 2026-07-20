@@ -272,6 +272,15 @@ class Trainer:
         min_density_active = getattr(self.cfg.training, "min_density_active", 0.0)
         uses_density = bool(getattr(self.model, "use_density_head", False))
         gate_open = False
+        # Two-checkpoint fix (20.07_trening_summary.md §5 pkt 2): the gate above makes
+        # best.pt track the AGE metric only AFTER density matures, sacrificing the raw
+        # best age epoch (typically much earlier — e.g. e17 vs e23+, 16.07_rx). Track
+        # the single best age epoch SEPARATELY and UNGATED so it survives regardless
+        # of when/whether density wakes up — best.pt stays the density-mature pick
+        # (unchanged filename/behaviour), best_age.pt is the age-optimal one. No-op
+        # (no extra file) when the model has no density head — best.pt already IS the
+        # age-best checkpoint in that case.
+        best_age_metric = float("inf")
 
         for epoch in range(1, self.cfg.training.epochs + 1):
             if freeze_until > 0 and epoch == freeze_until + 1:
@@ -314,6 +323,13 @@ class Trainer:
                 if uses_density and min_density_active > 0.0:
                     self._log(f"Density dojrzałe (active={density_active:.2f}) @e{epoch} "
                               f"— start wyboru best.pt / early-stopping")
+
+            # Ungated age-best tracking (two-checkpoint fix) — runs every epoch,
+            # independent of gate_open, so the age-optimal checkpoint is never lost to
+            # the gate reset below. Uses the SAME (possibly EMA-smoothed) `current`.
+            if uses_density and current < best_age_metric - min_delta:
+                best_age_metric = current
+                self._save_best_checkpoint(epoch, val_loss, filename="best_age.pt")
 
             improved = current < best_metric - min_delta
             if improved:
@@ -366,11 +382,11 @@ class Trainer:
         )
         return path
 
-    def _save_best_checkpoint(self, epoch: int, val_loss: float) -> None:
+    def _save_best_checkpoint(self, epoch: int, val_loss: float, filename: str = "best.pt") -> None:
         import shutil as _shutil
         src = self.checkpoint_dir / f"checkpoint_epoch{epoch:03d}_loss{val_loss:.4f}.pt"
         if src.exists():
-            _shutil.copy2(src, self.checkpoint_dir / "best.pt")
+            _shutil.copy2(src, self.checkpoint_dir / filename)
 
     def load_checkpoint(self, path: str | Path) -> int:
         """Restore model + optimizer from checkpoint. Returns saved epoch."""

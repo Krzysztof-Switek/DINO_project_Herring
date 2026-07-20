@@ -50,6 +50,15 @@ class DataConfig(BaseModel):
     test_split: float = Field(0.15, gt=0.0, lt=1.0)
     num_workers: int = Field(2, ge=0)
     metadata_cols: List[str] = Field(default_factory=list)
+    # Input masking (20.07 pre-training item): feed the model ONLY the segmented
+    # otolith instead of the whole squashed image with background — the CLS-attention
+    # diagnostic showed ~12-17% of attention landing outside the otolith. Off by
+    # default (unchanged behaviour); masks are computed once via
+    # otolith_axis.get_or_compute_mask and cached under mask_cache_dir (one PNG per
+    # image_id, keyed only by the raw image — reused across train/val/test/inference
+    # and across runs). None → "<image_dir>/../masks_cache".
+    mask_background: bool = False
+    mask_cache_dir: Optional[str] = None
 
     @field_validator("image_size")
     @classmethod

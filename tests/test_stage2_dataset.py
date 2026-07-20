@@ -156,6 +156,100 @@ def test_dataset_image_id_is_string(dummy_data):
 
 
 # ---------------------------------------------------------------------------
+# Input masking (20.07 pre-training item)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def ellipse_data(tmp_path):
+    """One real segmentable otolith-like image (dark ellipse on light background)."""
+    import cv2
+    import numpy as np
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    arr = np.full((200, 160, 3), 255, dtype=np.uint8)
+    cv2.ellipse(arr, (80, 100), (50, 80), 0, 0, 360, (40, 40, 40), -1)
+    name = "fish_ellipse.png"
+    Image.fromarray(arr).save(img_dir / name)
+
+    csv_path = tmp_path / "labels.csv"
+    pd.DataFrame([{"image_id": name, "age": 4, "split": "train"}]).to_csv(csv_path, index=False)
+    return csv_path, img_dir
+
+
+def test_mask_background_disabled_by_default(dummy_data):
+    from src.config import OtolithConfig
+    assert OtolithConfig().data.mask_background is False
+
+
+def test_mask_background_gracefully_skips_unsegmentable_image(dummy_data, tmp_path):
+    """dummy_data's images are flat solid colour — no foreground to segment. Masking
+    must fall back to the unmasked image, never crash the dataset."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = dummy_data
+    cfg = _make_cfg()
+    cfg.data.mask_background = True
+    cfg.data.mask_cache_dir = str(tmp_path / "masks_cache")
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert item["image"].shape == (3, 56, 56)   # produced normally, no crash
+
+
+def test_mask_background_changes_pixels_for_segmentable_image(ellipse_data, tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+
+    cfg_plain = _make_cfg()
+    cfg_plain.data.image_size = 200
+    ds_plain = OtolithDataset(cfg_plain, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    cfg_masked = _make_cfg()
+    cfg_masked.data.image_size = 200
+    cfg_masked.data.mask_background = True
+    cfg_masked.data.mask_cache_dir = str(tmp_path / "masks_cache")
+    ds_masked = OtolithDataset(cfg_masked, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    plain_img = ds_plain[0]["image"]
+    masked_img = ds_masked[0]["image"]
+    assert not torch.allclose(plain_img, masked_img)
+    assert any((tmp_path / "masks_cache").glob("*_mask.png"))
+
+
+def test_mask_background_cache_reused_on_second_access(tmp_path, monkeypatch):
+    """Second access to the same image must hit the on-disk cache, not re-segment.
+
+    Uses split="test" deliberately — the "train" transform pipeline applies random
+    flips/jitter per call, which would make two accesses differ regardless of caching.
+    """
+    import cv2
+    import numpy as np
+    from src.dataset import OtolithDataset
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    arr = np.full((200, 160, 3), 255, dtype=np.uint8)
+    cv2.ellipse(arr, (80, 100), (50, 80), 0, 0, 360, (40, 40, 40), -1)
+    name = "fish_ellipse.png"
+    Image.fromarray(arr).save(img_dir / name)
+    csv_path = tmp_path / "labels.csv"
+    pd.DataFrame([{"image_id": name, "age": 4, "split": "test"}]).to_csv(csv_path, index=False)
+
+    cfg = _make_cfg()
+    cfg.data.image_size = 200
+    cfg.data.mask_background = True
+    cfg.data.mask_cache_dir = str(tmp_path / "masks_cache")
+    ds = OtolithDataset(cfg, "test", labels_csv=str(csv_path), image_dir=str(img_dir))
+    first = ds[0]["image"]                          # populates the cache file
+
+    def _boom(*a, **kw):
+        raise AssertionError("segment_otolith should NOT run again on a cache hit")
+    monkeypatch.setattr("src.otolith_axis.segment_otolith", _boom)
+
+    second = ds[0]["image"]
+    assert torch.allclose(first, second)
+
+
+# ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
 

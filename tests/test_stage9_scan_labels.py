@@ -65,6 +65,35 @@ def test_parse_unknown_type():
     assert parse_filename(unknown) is None
 
 
+@pytest.mark.parametrize("flag", ["Wrong", "Broken", "LowQuality", "broken", "lowquality"])
+def test_parse_rejects_quality_flagged_images(flag):
+    """Broken/LowQuality/Wrong in the filename (any casing) must be rejected — data
+    hygiene item from 20.07: the Excel 'Typ otolitu' filter alone doesn't catch a
+    broken image sharing its fish's metadata row with a good one."""
+    name = f"2021_BASS_HER_GlebiaGdanska_Embedded_Sharpest_FishIndex6_Single1_{flag}.jpg"
+    assert parse_filename(name) is None
+
+
+def test_parse_still_accepts_good_left_right():
+    """Sanity check the new filter doesn't reject legitimate images."""
+    assert parse_filename(EMB_FISH1) is not None
+    assert parse_filename(EMB_FISH2) is not None
+
+
+@pytest.mark.parametrize("flag", ["Wrong", "Broken", "LowQuality", "broken"])
+def test_has_bad_quality_token_detects_flags(flag):
+    """prepare_labels.has_bad_quality_token — shared helper used by BOTH
+    prepare_labels.build_labels and scan_labels.parse_filename."""
+    from scripts.prepare_labels import has_bad_quality_token
+    name = f"2021_BASS_HER_GlebiaGdanska_Embedded_Sharpest_FishIndex6_Single1_{flag}.jpg"
+    assert has_bad_quality_token(name) is True
+
+
+def test_has_bad_quality_token_false_for_good_filename():
+    from scripts.prepare_labels import has_bad_quality_token
+    assert has_bad_quality_token(EMB_FISH1) is False
+
+
 def test_neutral_key_same_fish():
     emb_key = parse_filename(EMB_FISH1)["neutral_fish_key"]
     notemb_key = parse_filename(NOTEMB_FISH1)["neutral_fish_key"]

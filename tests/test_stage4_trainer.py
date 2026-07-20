@@ -415,6 +415,65 @@ def test_density_gate_noop_without_density_head(tmp_path):
     assert len(ckpt_files) == 3
 
 
+def test_two_checkpoints_age_best_survives_gate_reset(tmp_path):
+    """best_age.pt must keep the best RAW age epoch even after the density-maturity
+    gate resets best_metric and best.pt moves to a worse (but density-mature) epoch —
+    the two-checkpoint fix (20.07_trening_summary.md §5 pkt 2)."""
+    from src.trainer import Trainer
+    import torch as _torch
+
+    class ScriptedTrainer(Trainer):
+        def validate(self):
+            self._vc = getattr(self, "_vc", 0) + 1
+            # epochs 1-2: density dead, val_mae=2.0 (age-best).
+            # epochs 3-4: density wakes (gate opens, best_metric resets), val_mae
+            # degrades to 3.0 — worse than the pre-gate age-best.
+            density_active = 0.0 if self._vc < 3 else 2.0
+            val_mae = 2.0 if self._vc < 3 else 3.0
+            self.last_val_metrics = {"density_active": density_active}
+            return 1.0, val_mae
+
+    cfg = _make_cfg(tmp_path, epochs=4)
+    cfg.model.use_density_head = True
+    cfg.training.early_stopping_patience = 0   # run all epochs
+    cfg.training.min_epochs = 0
+    cfg.training.min_density_active = 1.0
+
+    model = _make_model(cfg)
+    trainer = ScriptedTrainer(cfg, model, _make_loader(), _make_loader())
+    trainer.fit()
+
+    best_path = trainer.checkpoint_dir / "best.pt"
+    best_age_path = trainer.checkpoint_dir / "best_age.pt"
+    assert best_path.exists()
+    assert best_age_path.exists()
+
+    age_ckpt = _torch.load(best_age_path, map_location="cpu", weights_only=False)
+    density_ckpt = _torch.load(best_path, map_location="cpu", weights_only=False)
+    assert age_ckpt["epoch"] in (1, 2), "best_age.pt must come from the pre-gate age-best epoch"
+    assert density_ckpt["epoch"] in (3, 4), "best.pt must come from a density-mature epoch"
+
+
+def test_no_best_age_checkpoint_without_density_head(tmp_path):
+    """best_age.pt is only meaningful (and only created) when a density head exists —
+    without one, best.pt is already the age-best checkpoint."""
+    from src.trainer import Trainer
+
+    class ConstantValTrainer(Trainer):
+        def validate(self):
+            self.last_val_metrics = {}
+            return 1.0, 5.0
+
+    cfg = _make_cfg(tmp_path, epochs=2)
+    cfg.model.use_density_head = False
+    model = _make_model(cfg)
+    trainer = ConstantValTrainer(cfg, model, _make_loader(), _make_loader())
+    trainer.fit()
+
+    assert (trainer.checkpoint_dir / "best.pt").exists()
+    assert not (trainer.checkpoint_dir / "best_age.pt").exists()
+
+
 def test_trainer_supports_mil_head_type(tmp_path):
     """Trener musi działać dla head_type='mil' (bez CORAL)."""
     cfg = _make_cfg(tmp_path, epochs=1)

@@ -524,3 +524,38 @@ def load_mask(path: str | Path) -> Optional[np.ndarray]:
     except Exception:
         return None
     return arr
+
+
+def get_or_compute_mask(
+    rgb: np.ndarray, cache_path: str | Path, seg_params: Optional[dict] = None,
+) -> Optional[np.ndarray]:
+    """Load ``cache_path`` if present, else segment ``rgb`` and cache the result there.
+
+    Single entry point for "one mask per image, computed once, reused everywhere" —
+    used by the input-masking dataset path (``dataset.OtolithDataset``) and can replace
+    the equivalent inline cache-or-segment logic in ``scripts/run_pipeline.py``'s card
+    generation. Returns ``None`` (without writing anything) when segmentation fails.
+    """
+    cached = load_mask(cache_path)
+    if cached is not None:
+        return cached
+    mask = segment_otolith(rgb, **(seg_params or {}))
+    if mask is not None:
+        save_mask(mask, cache_path)
+    return mask
+
+
+# Fill colour for masked-out background (0–255 uint8): the per-channel ImageNet mean.
+# After ImageNet normalisation (src/dataset.py, src/utils.py) this becomes ~0 — the
+# background contributes essentially no signal, instead of the strong, high-contrast
+# edge a flat black fill would create right at the mask boundary (register-token /
+# high-norm-patch artifacts already fire on exactly this kind of sharp edge — see
+# DINO_proces.md §4.7).
+MASK_FILL_RGB = (124, 116, 104)
+
+
+def apply_background_mask(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Return a copy of ``rgb`` with pixels outside ``mask`` set to ``MASK_FILL_RGB``."""
+    out = rgb.copy()
+    out[mask == 0] = MASK_FILL_RGB
+    return out
