@@ -238,13 +238,12 @@ def test_walkthrough_section_g_renders_raw_b64_without_double_prefix(tmp_path):
         "panel_patchgrid_b64": raw_b64,
         "panel_rays_b64": raw_b64,
         "panel_rings_b64": raw_b64,
-        "panel_final_b64": raw_b64,
         "panel_ray_examples_b64": [raw_b64, raw_b64],
         "krok4_interactive": {
             "predicted_age": 4, "n_samples": 3,
             "inner_margin": 0.05, "edge_margin": 0.08,
             "density_min_distance": 3, "classical_min_distance": 1,
-            "centroid": [20, 20], "contour_pts": [[40, 20], [20, 40]],
+            "centroid": [20, 20], "far_edge": [20, 60], "contour_pts": [[40, 20], [20, 40]],
             "density_profiles": [[0.0, 1.0, 0.2], [0.1, 0.3, 1.0]],
             "classical_profiles": [[0.2, 0.9, 0.1], None],
             "img": "data:image/png;base64," + raw_b64, "w": 60, "h": 60,
@@ -270,8 +269,10 @@ def test_walkthrough_section_g_renders_raw_b64_without_double_prefix(tmp_path):
     assert 'id="G"' in html
     assert "Krok 2" in html
     assert "data:image/png;base64,data:image/png;base64," not in html
-    # patchgrid/rays/rings/final (4) + 2 ray-example pairs × (ray image + chart) = 8 → 12 total
-    assert html.count("data:image/png;base64,") >= 12
+    # patchgrid/rays/rings (3, Krok 5 merged into Krok 4 — no standalone panel, 20.07) +
+    # 2 ray-example pairs × (ray image + chart) = 4 → 7, + krok4_interactive's own "img" = 8
+    assert html.count("data:image/png;base64,") >= 8
+    assert "panel_final_b64" not in html  # Krok 5 heading/panel removed
     # Krok 4 interactive widget: mount point + JSON payload + JS present, valid JSON.
     assert 'id="krok4-widget"' in html
     assert "const KROK4_DATA=" in html

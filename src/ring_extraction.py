@@ -210,36 +210,75 @@ def _all_ray_profiles(
     return profiles, line_xys, contour_pts
 
 
+def _shift_peak_to_falling_edge(p: np.ndarray, idx: int) -> int:
+    """Move a detected peak index to the boundary where it biologically belongs.
+
+    Under transmitted light (this project's images) the translucent, fast-growth zone
+    is BRIGHT and the opaque, slow-growth "winter" zone — the annulus itself — is DARK;
+    standard otolith age-reading marks the increment at that light→dark boundary, not
+    at the brightness peak (Campana lab / DFO / NOAA otolith-ageing references — see
+    ``plans and summaries/20.07_session_summary.md``). This applies the same falling-
+    edge convention to any per-ray signal (density or classical): walk forward from the
+    peak to the next trough, then return the index where the signal crosses HALFWAY
+    down between them (a standard, noise-robust edge/half-max-crossing location).
+    Falls back to ``idx`` unchanged when the signal doesn't descend after the peak
+    (e.g. a peak sitting at the very end of the profile).
+    """
+    n = len(p)
+    end = idx
+    while end + 1 < n and p[end + 1] <= p[end]:
+        end += 1
+    if end == idx:
+        return idx
+    half = 0.5 * (float(p[idx]) + float(p[end]))
+    for i in range(idx, end):
+        if p[i] >= half > p[i + 1]:
+            return i + 1
+    return end
+
+
 def _all_ray_peaks(
     signal_grid, axis_info: dict, image_h: int, image_w: int,
     *, n_dirs: int = 48, n_samples: int = 64, min_distance: int = 3,
     prominence: float = 0.1, inner_margin: float = 0.05, edge_margin: float = 0.08,
     smooth_sigma: float = 0.0,
-) -> Tuple[List[Tuple[float, float, int, int]], List[Tuple[int, int]]]:
+) -> Tuple[List[Tuple[float, float, int, int, int]], List[Tuple[int, int]]]:
     """Cast ``n_dirs`` rays nucleus→contour, per-ray normalise + find peaks.
 
     ``signal_grid`` may be the model density map ``(H_p, W_p)`` or a full-res
     grayscale image ``(H_img, W_img)`` — ``sample_profile_along_axis`` maps pixel
     positions to grid indices either way. Returns ``(peaks, candidate_pts)`` where
-    ``peaks = [(t, strength, x, y)]`` (t = normalised radius, 0=nucleus, 1=edge).
+    ``peaks = [(t, strength, x, y, ray_idx)]`` (t = normalised radius, 0=nucleus,
+    1=edge; ``ray_idx`` in ``[0, n_dirs)`` identifies WHICH of the ``n_dirs`` rays
+    this peak came from — used to tell a ring seen along a compact angular arc apart
+    from one seen at scattered, unrelated directions; see
+    :func:`_cluster_by_radius_with_arcs`). Each peak's reported POSITION is shifted to
+    its falling edge (:func:`_shift_peak_to_falling_edge`) — ``strength`` still
+    reflects the peak's own height (for scoring/clustering), only WHERE we say the
+    ring sits moves. ``inner_margin``/``edge_margin`` are checked against the RAW
+    (pre-shift) peak position — a genuine peak found safely inside the valid window
+    must not be dropped just because shifting it toward its biological (falling-edge)
+    marker pushes the reported ``t`` past the edge cutoff.
     """
     profiles, line_xys, _contour_pts = _all_ray_profiles(
         signal_grid, axis_info, image_h, image_w,
         n_dirs=n_dirs, n_samples=n_samples, smooth_sigma=smooth_sigma)
 
-    peaks: List[Tuple[float, float, int, int]] = []
+    peaks: List[Tuple[float, float, int, int, int]] = []
     candidate_pts: List[Tuple[int, int]] = []
-    for pn, line_xy in zip(profiles, line_xys):
+    for ray_idx, (pn, line_xy) in enumerate(zip(profiles, line_xys)):
         if pn is None:
             continue
         idxs, _ = find_peaks(pn, distance=max(1, int(min_distance)),
                              prominence=float(prominence))
         for idx in idxs:
-            t = idx / max(1, n_samples - 1)
-            if t < inner_margin or t > 1.0 - edge_margin:
+            t_orig = idx / max(1, n_samples - 1)
+            if t_orig < inner_margin or t_orig > 1.0 - edge_margin:
                 continue
-            x, y = int(line_xy[idx][0]), int(line_xy[idx][1])
-            peaks.append((t, float(pn[idx]), x, y))
+            edge_idx = _shift_peak_to_falling_edge(pn, int(idx))
+            t = edge_idx / max(1, n_samples - 1)
+            x, y = int(line_xy[edge_idx][0]), int(line_xy[edge_idx][1])
+            peaks.append((t, float(pn[idx]), x, y, ray_idx))
             candidate_pts.append((x, y))
     return peaks, candidate_pts
 
@@ -300,6 +339,99 @@ def _cluster_by_radius(peaks, t_tol: float = 0.06) -> List[Tuple[float, int, flo
         if not sel.any():
             continue
         out.append((float(ts[sel].mean()), int(sel.sum()), float(ss[sel].mean())))
+    out.sort(key=lambda c: c[0])
+    return out
+
+
+def _best_arc(ray_idxs: np.ndarray, strengths: np.ndarray, n_dirs: int,
+             max_gap: int) -> Tuple[int, float]:
+    """Longest run of angularly-CONSECUTIVE ray indices among a cluster's members.
+
+    The ray circle wraps (ray ``n_dirs-1`` is adjacent to ray ``0``); a run tolerates
+    gaps of up to ``max_gap`` missing rays (real bands are rarely unbroken for their
+    whole visible stretch). Returns ``(run_len, run_strength)``: ``run_len`` is the
+    SPAN in ray-slots the run covers (inclusive of tolerated gaps — one missing ray in
+    an otherwise solid arc still counts its full width), ``run_strength`` is the mean
+    peak strength of the members actually inside that run.
+    """
+    uniq = sorted(set(int(r) for r in ray_idxs))
+    if not uniq:
+        return 0, 0.0
+    if len(uniq) == 1:
+        return 1, float(strengths[ray_idxs == uniq[0]].mean())
+
+    # Unroll the circle by duplicating the sequence shifted by n_dirs, so a run that
+    # wraps past n_dirs-1 -> 0 is just a normal contiguous slice — no special-casing.
+    doubled = uniq + [r + n_dirs for r in uniq]
+    n = len(doubled)
+    best_len, best_strength = 0, 0.0
+    for start in range(len(uniq)):
+        end = start
+        while (end + 1 < n and doubled[end + 1] - doubled[end] - 1 <= max_gap
+               and doubled[end + 1] - doubled[start] < n_dirs):
+            end += 1
+        span = min(doubled[end] - doubled[start] + 1, n_dirs)
+        members = {x % n_dirs for x in doubled[start:end + 1]}
+        mask = np.isin(ray_idxs, list(members))
+        strength = float(strengths[mask].mean()) if mask.any() else 0.0
+        if span > best_len or (span == best_len and strength > best_strength):
+            best_len, best_strength = span, strength
+    return best_len, best_strength
+
+
+def _cluster_by_radius_with_arcs(
+    peaks, t_tol: float = 0.06, n_dirs: int = 48, max_gap: int = 2,
+) -> List[Tuple[float, int, float, int, float]]:
+    """Like :func:`_cluster_by_radius`, but each cluster also reports its strongest
+    CONTIGUOUS angular arc: ``(mean_t, support, mean_strength, arc_len, arc_strength)``.
+
+    A ring genuinely visible along a compact stretch of the circumference (e.g. only
+    the upper-left quadrant of an otolith) is stronger evidence than the same total
+    ray count scattered randomly around all ``n_dirs`` directions — ``_cluster_by_radius``
+    gives both the same ``support`` and can't tell them apart. This is a SEPARATE
+    function (not a change to ``_cluster_by_radius``) so its many existing consumers
+    (``_topk_cluster_t``, ``select_increments``, the JS ``clusterByRadius``) are
+    untouched; only :func:`_merge_clusters` (the ``dp`` fusion path) uses this one.
+    Peaks must be ``_all_ray_peaks``-shaped tuples with a ray index at position 4.
+    """
+    if not peaks:
+        return []
+    ts = np.asarray([r[0] for r in peaks], dtype=np.float64)
+    ss = np.asarray([r[1] for r in peaks], dtype=np.float64)
+    rays = np.asarray([r[4] for r in peaks], dtype=np.int64)
+    if len(ts) == 1:
+        return [(float(ts[0]), 1, float(ss[0]), 1, float(ss[0]))]
+
+    nbins = max(4, int(round(1.0 / max(t_tol / 3.0, 1e-3))))
+    edges = np.linspace(0.0, 1.0, nbins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    counts, _ = np.histogram(np.clip(ts, 0.0, 1.0), bins=edges)
+    win = max(1, int(round(t_tol * nbins)))
+    smooth = (np.convolve(counts.astype(np.float64), np.ones(win) / win, mode="same")
+              if win > 1 else counts.astype(np.float64))
+
+    modes: List[float] = []
+    claimed = np.zeros(nbins, dtype=bool)
+    order = np.lexsort((np.arange(nbins), -smooth))
+    for bi in order:
+        if smooth[bi] <= 0 or claimed[bi]:
+            continue
+        c = float(centers[bi])
+        claimed |= np.abs(centers - c) <= t_tol
+        modes.append(c)
+    if not modes:
+        return []
+    modes_arr = np.asarray(sorted(modes))
+
+    nearest = np.abs(ts[:, None] - modes_arr[None, :]).argmin(axis=1)
+    out: List[Tuple[float, int, float, int, float]] = []
+    for mi in range(len(modes_arr)):
+        sel = (nearest == mi) & (np.abs(ts - modes_arr[mi]) <= t_tol)
+        if not sel.any():
+            continue
+        arc_len, arc_strength = _best_arc(rays[sel], ss[sel], n_dirs, max_gap)
+        out.append((float(ts[sel].mean()), int(sel.sum()), float(ss[sel].mean()),
+                   arc_len, arc_strength))
     out.sort(key=lambda c: c[0])
     return out
 
@@ -455,12 +587,12 @@ def density_peaks(
     prob_grid, axis_info: dict, image_h: int, image_w: int,
     *, n_dirs: int = 48, n_samples: int = 64, min_distance: int = 3,
     prominence: float = 0.1, inner_margin: float = 0.05, edge_margin: float = 0.08,
-) -> Tuple[List[Tuple[float, float, int, int]], List[Tuple[int, int]]]:
+) -> Tuple[List[Tuple[float, float, int, int, int]], List[Tuple[int, int]]]:
     """Per-ray peaks of the model DENSITY map (for fusion). ``(peaks, candidate_pts)``.
 
     Same ray-casting as :func:`select_increments`, but exposes the raw
-    ``[(t, strength, x, y)]`` peaks so :func:`fuse_increments` can combine them with
-    the classical peaks before choosing the final increments.
+    ``[(t, strength, x, y, ray_idx)]`` peaks so :func:`fuse_increments` can combine them
+    with the classical peaks before choosing the final increments.
     """
     return _all_ray_peaks(
         prob_grid, axis_info, image_h, image_w,
@@ -469,21 +601,36 @@ def density_peaks(
     )
 
 
-def _merge_clusters(density_pks, classical_pks, t_tol: float = 0.06):
+def _merge_clusters(density_pks, classical_pks, t_tol: float = 0.06, n_dirs: int = 48):
     """Merge density + classical radius-clusters into candidate rings ``[(t, score, source)]``.
 
     A density ring corroborated by a classical ring at a similar radius (``t_tol``) becomes
-    one **consensus** ring whose score is the SUM of both ``support × mean_strength`` — this is
-    how ``fuse_increments(method="dp")`` (and the step-by-step walkthrough) reward agreement
+    one **consensus** ring whose score is the SUM of both sources' scores — this is how
+    ``fuse_increments(method="dp")`` (and the step-by-step walkthrough) reward agreement
     between the two sources. Rings seen by only one source stay in with their own score.
     ``source`` ∈ {``"consensus"``, ``"density"``, ``"classical"``}.
+
+    Each source's clusters come from :func:`_cluster_by_radius_with_arcs`, so a cluster's
+    score blends its overall support with its strongest CONTIGUOUS angular arc (20.07):
+    a ring genuinely visible along a compact stretch of the circumference outscores one
+    with the same total support scattered randomly around all ``n_dirs`` directions —
+    rings on real otoliths are very often clearly banded only in PART of the image (e.g.
+    one otolith's user-reported example: sharp bands visible in the top/left arcs only,
+    faint elsewhere). Weighted 0.4 total-support + 0.6 best-arc — a reasonable first-pass
+    split, not yet tuned/validated against real cards.
     """
-    dclust = _cluster_by_radius(density_pks, t_tol)
-    cclust = _cluster_by_radius(classical_pks, t_tol)
+    dclust = _cluster_by_radius_with_arcs(density_pks, t_tol, n_dirs)
+    cclust = _cluster_by_radius_with_arcs(classical_pks, t_tol, n_dirs)
+
+    def _score(c) -> float:
+        _t, support, mean_strength, arc_len, arc_strength = c
+        return support * mean_strength * 0.4 + arc_len * arc_strength * 0.6
+
     merged: List[Tuple[float, float, str]] = []
     used = [False] * len(cclust)
-    for (dt, ds, dstr) in dclust:
-        score = ds * dstr
+    for dc in dclust:
+        dt = dc[0]
+        score = _score(dc)
         t, source = dt, "density"
         best_i, best_d = -1, t_tol
         for i, c in enumerate(cclust):
@@ -492,23 +639,26 @@ def _merge_clusters(density_pks, classical_pks, t_tol: float = 0.06):
         if best_i >= 0:                                  # density ring corroborated by classical
             c = cclust[best_i]
             used[best_i] = True
-            score += c[1] * c[2]
+            score += _score(c)
             t, source = 0.5 * (dt + c[0]), "consensus"
         merged.append((t, score, source))
     for i, c in enumerate(cclust):                       # classical-only rings still eligible
         if not used[i]:
-            merged.append((c[0], c[1] * c[2], "classical"))
+            merged.append((c[0], _score(c), "classical"))
     return merged
 
 
 def fuse_increments(
     density_pks, classical_pks, predicted_age: int, axis_info: dict,
     *, method: str = "consensus", t_tol: float = 0.06, dp_min_gap: float = 0.04,
+    n_dirs: int = 48,
 ) -> dict:
     """Choose the final ``predicted_age`` increments on the axis from peak sources.
 
-    ``density_pks`` / ``classical_pks`` are ``[(t, strength, x, y)]`` lists
-    (from :func:`density_peaks` / :func:`classical_increments`). ``method``:
+    ``density_pks`` / ``classical_pks`` are ``[(t, strength, x, y, ray_idx)]`` lists
+    (from :func:`density_peaks` / :func:`classical_increments`); ``n_dirs`` must match
+    the ray count they were cast with (only used by ``method="dp"``, for the arc-aware
+    scoring in :func:`_merge_clusters`). ``method``:
       * ``"density"``   — top-`age` clusters of density peaks only (model localisation).
       * ``"classical"`` — top-`age` clusters of classical (image-intensity) peaks only.
       * ``"consensus"`` — clusters where density AND classical agree on radius ``t``
@@ -531,7 +681,7 @@ def fuse_increments(
         chosen = _topk_cluster_t(_cluster_by_radius(classical_pks, t_tol), k)
         cand = [(p[2], p[3]) for p in classical_pks]
     elif method == "dp":
-        merged = _merge_clusters(density_pks, classical_pks, t_tol)
+        merged = _merge_clusters(density_pks, classical_pks, t_tol, n_dirs)
         chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap)
         cand = [(p[2], p[3]) for p in density_pks] + [(p[2], p[3]) for p in classical_pks]
     else:  # consensus
@@ -592,8 +742,13 @@ def _example_ray_profiles(grid, axis_info: dict, image_h: int, image_w: int, *,
         peak_t: List[float] = []
         if rng > 1e-6:
             idxs, _ = find_peaks(norm, distance=max(1, int(min_distance)), prominence=float(prominence))
-            peak_t = [float(i / max(1, n_samples - 1)) for i in idxs
-                      if inner_margin <= i / max(1, n_samples - 1) <= 1.0 - edge_margin]
+            # Margin checked against the RAW peak index, not the falling-edge-shifted
+            # one — see _all_ray_peaks: shifting toward the biological marker must not
+            # cause a genuinely valid peak to be dropped for landing near the edge.
+            valid_idxs = [int(i) for i in idxs
+                          if inner_margin <= i / max(1, n_samples - 1) <= 1.0 - edge_margin]
+            edge_idxs = [_shift_peak_to_falling_edge(norm, i) for i in valid_idxs]
+            peak_t = [float(i / max(1, n_samples - 1)) for i in edge_idxs]
         out.append({
             "t": np.linspace(0.0, 1.0, n_samples).tolist(),
             "raw": p.tolist(),
@@ -626,7 +781,7 @@ def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int,
                                 prominence=classical_prominence, inner_margin=inner_margin,
                                 edge_margin=edge_margin, t_tol=t_tol)
     cpk, cpts = cinc["peaks"], cinc["candidate_pts"]
-    merged = _merge_clusters(dpk, cpk, t_tol)
+    merged = _merge_clusters(dpk, cpk, t_tol, n_dirs)
     k = max(0, int(predicted_age))
     chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap)
     return {
@@ -676,6 +831,7 @@ def dp_interactive_data(density_grid, gray_image, axis_info: dict, image_h: int,
         gray, axis_info, image_h, image_w, n_dirs=n_dirs, n_samples=n_samples,
         smooth_sigma=classical_smooth_sigma)
     cx, cy = axis_info["centroid"]
+    fx, fy = axis_info["far_edge"]
     return {
         "predicted_age": max(0, int(predicted_age)),
         "n_samples": n_samples,
@@ -684,6 +840,7 @@ def dp_interactive_data(density_grid, gray_image, axis_info: dict, image_h: int,
         "density_min_distance": density_min_distance,
         "classical_min_distance": classical_min_distance,
         "centroid": [int(cx), int(cy)],
+        "far_edge": [int(fx), int(fy)],
         "contour_pts": [[int(x), int(y)] for (x, y) in contour_pts],
         "density_profiles": [(p.tolist() if p is not None else None) for p in density_profiles],
         "classical_profiles": [(p.tolist() if p is not None else None) for p in classical_profiles],

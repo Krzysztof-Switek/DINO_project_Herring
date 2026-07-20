@@ -819,17 +819,122 @@ _KROK4_JS = r"""
     kept.sort(function(x,y){return x-y;});
     return kept;
   }
+  function shiftPeakToFallingEdge(p, idx){
+    // Mirrors ring_extraction._shift_peak_to_falling_edge: annulus boundary = the
+    // light→dark (half-max) crossing AFTER the peak, not the peak itself (biological
+    // convention — translucent/fast-growth zone is bright, opaque/winter zone is dark
+    // under transmitted light; the year's growth is read to end at that transition).
+    var n=p.length, end=idx;
+    while(end+1<n && p[end+1]<=p[end]) end++;
+    if(end===idx) return idx;
+    var half=0.5*(p[idx]+p[end]);
+    for(var i=idx;i<end;i++){
+      if(p[i]>=half && p[i+1]<half) return i+1;
+    }
+    return end;
+  }
   function rayPeaks(profiles, nSamples, prom, minD, innerM, edgeM){
     var flat=[];
-    profiles.forEach(function(p){
+    profiles.forEach(function(p, rayIdx){
       if(!p) return;
       findPeaksIdx(p, prom, minD).forEach(function(idx){
-        var t = idx/(nSamples-1);
-        if(t<innerM || t>1-edgeM) return;
-        flat.push([t, p[idx]]);
+        // Margin checked against the RAW peak index (mirrors ring_extraction._all_ray_peaks):
+        // shifting toward the falling edge must not drop a peak that was safely valid
+        // before the shift.
+        var tOrig = idx/(nSamples-1);
+        if(tOrig<innerM || tOrig>1-edgeM) return;
+        var edgeIdx = shiftPeakToFallingEdge(p, idx);
+        var t = edgeIdx/(nSamples-1);
+        flat.push([t, p[idx], rayIdx]);
       });
     });
     return flat;
+  }
+  function bestArc(rayIdxs, strengths, nDirs, maxGap){
+    // Mirrors ring_extraction._best_arc — longest run of angularly-consecutive ray
+    // indices (circular, gaps <= maxGap tolerated); returns [runLen, runStrength].
+    var uniq = Array.from(new Set(rayIdxs)).sort(function(a,b){return a-b;});
+    if(uniq.length===0) return [0, 0.0];
+    if(uniq.length===1){
+      var only=uniq[0], vals=[];
+      rayIdxs.forEach(function(r,idx){ if(r===only) vals.push(strengths[idx]); });
+      return [1, vals.reduce(function(a,b){return a+b;},0)/vals.length];
+    }
+    var doubled = uniq.concat(uniq.map(function(r){return r+nDirs;}));
+    var n = doubled.length;
+    var bestLen=0, bestStrength=0.0;
+    for(var start=0; start<uniq.length; start++){
+      var end=start;
+      while(end+1<n && (doubled[end+1]-doubled[end]-1)<=maxGap && (doubled[end+1]-doubled[start])<nDirs){
+        end++;
+      }
+      var span = Math.min(doubled[end]-doubled[start]+1, nDirs);
+      var members = {};
+      for(var k=start;k<=end;k++){ members[((doubled[k]%nDirs)+nDirs)%nDirs] = true; }
+      var vals=[];
+      rayIdxs.forEach(function(r,idx){ if(members[r]) vals.push(strengths[idx]); });
+      var strength = vals.length ? vals.reduce(function(a,b){return a+b;},0)/vals.length : 0.0;
+      if(span>bestLen || (span===bestLen && strength>bestStrength)){ bestLen=span; bestStrength=strength; }
+    }
+    return [bestLen, bestStrength];
+  }
+  function clusterByRadiusWithArcs(peaks, tTol, nDirs, maxGap){
+    // Mirrors ring_extraction._cluster_by_radius_with_arcs — same histogram-mode
+    // clustering as clusterByRadius, plus each cluster's strongest contiguous arc.
+    if(peaks.length===0) return [];
+    var ts = peaks.map(function(p){return p[0];});
+    var ss = peaks.map(function(p){return p[1];});
+    var rays = peaks.map(function(p){return p[2];});
+    if(ts.length===1) return [[ts[0], 1, ss[0], 1, ss[0]]];
+    var nbins = Math.max(4, Math.round(1.0/Math.max(tTol/3.0, 1e-3)));
+    var step = 1.0/nbins;
+    var edges=[], centers=[], i;
+    for(i=0;i<nbins;i++) edges.push(i*step);
+    edges.push(1.0);
+    for(i=0;i<nbins;i++) centers.push((edges[i]+edges[i+1])/2);
+    var counts = new Array(nbins).fill(0);
+    ts.forEach(function(tv){
+      var tc = Math.min(1, Math.max(0, tv));
+      var bi = nbins - 1;
+      for(var k=0;k<nbins;k++){ if(tc < edges[k+1]){ bi = k; break; } }
+      counts[bi]++;
+    });
+    var win = Math.max(1, Math.round(tTol*nbins));
+    var half = Math.floor(win/2);
+    var smooth = counts.map(function(_,idx){
+      var s=0; for(var k=-half;k<=half;k++){ var j=idx+k; if(j>=0&&j<nbins) s+=counts[j]; }
+      return win>1 ? s/win : counts[idx];
+    });
+    var order = smooth.map(function(_,idx){return idx;}).sort(function(a,b){return smooth[b]-smooth[a];});
+    var claimed = new Array(nbins).fill(false);
+    var modes=[];
+    order.forEach(function(bi){
+      if(smooth[bi]<=0 || claimed[bi]) return;
+      var c = centers[bi];
+      for(var j=0;j<nbins;j++){ if(Math.abs(centers[j]-c)<=tTol) claimed[j]=true; }
+      modes.push(c);
+    });
+    if(modes.length===0) return [];
+    modes.sort(function(a,b){return a-b;});
+    var out=[];
+    modes.forEach(function(m){
+      var selIdx=[];
+      ts.forEach(function(tv, idx){
+        var bestD=Infinity, bestM=null;
+        modes.forEach(function(mm){ var dd=Math.abs(tv-mm); if(dd<bestD){bestD=dd; bestM=mm;} });
+        if(bestM===m && bestD<=tTol) selIdx.push(idx);
+      });
+      if(selIdx.length===0) return;
+      var selT = selIdx.map(function(idx){return ts[idx];});
+      var selS = selIdx.map(function(idx){return ss[idx];});
+      var selR = selIdx.map(function(idx){return rays[idx];});
+      var meanT = selT.reduce(function(a,b){return a+b;},0)/selT.length;
+      var meanS = selS.reduce(function(a,b){return a+b;},0)/selS.length;
+      var arc = bestArc(selR, selS, nDirs, maxGap);
+      out.push([meanT, selT.length, meanS, arc[0], arc[1]]);
+    });
+    out.sort(function(a,b){return a[0]-b[0];});
+    return out;
   }
   function clusterByRadius(peaks, tTol){
     if(peaks.length===0) return [];
@@ -837,12 +942,22 @@ _KROK4_JS = r"""
     var ss = peaks.map(function(p){return p[1];});
     if(ts.length===1) return [[ts[0], 1, ss[0]]];
     var nbins = Math.max(4, Math.round(1.0/Math.max(tTol/3.0, 1e-3)));
+    // Edges built the SAME way as numpy's linspace(0,1,nbins+1) — i*(1/nbins), not i/nbins
+    // (multiply-by-reciprocal vs division round differently in the last bit). Since
+    // _cluster_by_radius passes an explicit edges ARRAY to np.histogram (not a bin
+    // count), numpy bins against these exact edge values, not a "t*nbins" shortcut —
+    // for t close to a boundary the two approaches can disagree by one bin (caught by
+    // cross-checking against Python on random data, 20.07).
+    var step = 1.0/nbins;
     var edges=[], centers=[], i;
-    for(i=0;i<=nbins;i++) edges.push(i/nbins);
+    for(i=0;i<nbins;i++) edges.push(i*step);
+    edges.push(1.0);
     for(i=0;i<nbins;i++) centers.push((edges[i]+edges[i+1])/2);
     var counts = new Array(nbins).fill(0);
     ts.forEach(function(tv){
-      var bi = Math.min(nbins-1, Math.max(0, Math.floor(Math.min(1,Math.max(0,tv))*nbins)));
+      var tc = Math.min(1, Math.max(0, tv));
+      var bi = nbins - 1;                       // default: last bin (closed on the right)
+      for(var k=0;k<nbins;k++){ if(tc < edges[k+1]){ bi = k; break; } }
       counts[bi]++;
     });
     var win = Math.max(1, Math.round(tTol*nbins));
@@ -879,17 +994,20 @@ _KROK4_JS = r"""
     return out;
   }
   function mergeClusters(dclust, cclust, tTol){
+    // Mirrors ring_extraction._merge_clusters — score blends overall support with the
+    // cluster's strongest contiguous arc (0.4 support*strength + 0.6 arc_len*arc_strength).
+    function score(c){ return c[1]*c[2]*0.4 + c[3]*c[4]*0.6; }
     var merged=[], used=new Array(cclust.length).fill(false);
     dclust.forEach(function(dc){
-      var dt=dc[0], score=dc[1]*dc[2], t=dt;
+      var dt=dc[0], s=score(dc), t=dt;
       var bestI=-1, bestD=tTol;
       cclust.forEach(function(c,i){
         if(!used[i] && Math.abs(c[0]-dt)<=bestD){ bestI=i; bestD=Math.abs(c[0]-dt); }
       });
-      if(bestI>=0){ var c=cclust[bestI]; used[bestI]=true; score+=c[1]*c[2]; t=0.5*(dt+c[0]); }
-      merged.push([t, score]);
+      if(bestI>=0){ var c=cclust[bestI]; used[bestI]=true; s+=score(c); t=0.5*(dt+c[0]); }
+      merged.push([t, s]);
     });
-    cclust.forEach(function(c,i){ if(!used[i]) merged.push([c[0], c[1]*c[2]]); });
+    cclust.forEach(function(c,i){ if(!used[i]) merged.push([c[0], score(c)]); });
     return merged;
   }
   function dpSelectT(cands, k, minGap){
@@ -920,7 +1038,19 @@ _KROK4_JS = r"""
   }
   function widget(d){
     var box=document.createElement('div');
-    var cv=document.createElement('canvas'); cv.width=d.w; cv.height=d.h; cv.style.maxWidth='100%'; cv.style.border='1px solid #ccc';
+    // TWO separate canvases side by side — left=pierścienie, right=oś+finalne kropki
+    // (20.07: user wants these visually distinct, not overlaid on one image).
+    var imgsRow=document.createElement('div'); imgsRow.style.cssText='display:flex;flex-wrap:wrap;gap:14px;';
+    function mkCol(caption){
+      var col=document.createElement('div'); col.style.cssText='text-align:center;';
+      var cv=document.createElement('canvas'); cv.width=d.w; cv.height=d.h; cv.style.maxWidth='100%'; cv.style.border='1px solid #ccc'; cv.style.display='block';
+      var cap=document.createElement('div'); cap.textContent=caption; cap.style.cssText='font-size:12px;color:#555;margin-top:2px;';
+      col.appendChild(cv); col.appendChild(cap);
+      imgsRow.appendChild(col);
+      return cv;
+    }
+    var cvRings = mkCol('pierścienie (wszystkie 48 kierunków)');
+    var cvAxis  = mkCol('finalne przyrosty na osi pomiaru');
     var img=new Image();
     var ctrls=document.createElement('div'); ctrls.style.cssText='font-size:13px;margin-top:8px;display:flex;flex-wrap:wrap;gap:18px;align-items:center;';
     function mk(label,min,max,step,val){
@@ -936,33 +1066,62 @@ _KROK4_JS = r"""
     var sGap  = mk('min. rozstaw (DP)', 0.01, 0.15, 0.01, 0.04);
     var sTol  = mk('tolerancja klastra', 0.02, 0.15, 0.01, 0.06);
     var readout=document.createElement('div'); readout.style.cssText='font-weight:bold;margin-top:6px;color:#222;';
-    box.appendChild(cv); box.appendChild(ctrls); box.appendChild(readout);
+    box.appendChild(imgsRow); box.appendChild(ctrls); box.appendChild(readout);
 
     function project(t){
       return d.contour_pts.map(function(cp){
         return [d.centroid[0]+t*(cp[0]-d.centroid[0]), d.centroid[1]+t*(cp[1]-d.centroid[1])];
       });
     }
+    function projectAxis(t){
+      return [d.centroid[0]+t*(d.far_edge[0]-d.centroid[0]), d.centroid[1]+t*(d.far_edge[1]-d.centroid[1])];
+    }
     function recompute(){
       var prom=parseFloat(sProm.value), gap=parseFloat(sGap.value), tol=parseFloat(sTol.value);
+      var nDirs = d.contour_pts.length;
       var densPk = rayPeaks(d.density_profiles, d.n_samples, prom, d.density_min_distance, d.inner_margin, d.edge_margin);
       var classPk = rayPeaks(d.classical_profiles, d.n_samples, prom, d.classical_min_distance, d.inner_margin, d.edge_margin);
-      var dclust = clusterByRadius(densPk, tol);
-      var cclust = clusterByRadius(classPk, tol);
+      var dclust = clusterByRadiusWithArcs(densPk, tol, nDirs, 2);
+      var cclust = clusterByRadiusWithArcs(classPk, tol, nDirs, 2);
       var merged = mergeClusters(dclust, cclust, tol);
       var chosen = dpSelectT(merged, d.predicted_age, gap);
-      var ctx = cv.getContext('2d');
-      ctx.clearRect(0,0,cv.width,cv.height);
-      if(img.complete) ctx.drawImage(img,0,0,cv.width,cv.height);
+
+      // Left canvas — rings only (all 48 directions): shows WHERE this radius sits
+      // all around the otolith.
+      var ctxR = cvRings.getContext('2d');
+      ctxR.clearRect(0,0,cvRings.width,cvRings.height);
+      if(img.complete) ctxR.drawImage(img,0,0,cvRings.width,cvRings.height);
       chosen.forEach(function(t){
         var pts = project(t);
-        ctx.strokeStyle='rgba(230,30,30,0.95)'; ctx.lineWidth=2.5;
-        ctx.beginPath();
-        pts.forEach(function(p,i){ if(i===0) ctx.moveTo(p[0],p[1]); else ctx.lineTo(p[0],p[1]); });
-        ctx.closePath(); ctx.stroke();
+        ctxR.strokeStyle='rgba(230,30,30,0.9)'; ctxR.lineWidth=2.2;
+        ctxR.beginPath();
+        pts.forEach(function(p,i){ if(i===0) ctxR.moveTo(p[0],p[1]); else ctxR.lineTo(p[0],p[1]); });
+        ctxR.closePath(); ctxR.stroke();
       });
-      readout.textContent = 'wykryto pierścieni: ' + chosen.length + ' (wiek modelu: ' + d.predicted_age + ')' +
-        (chosen.length !== d.predicted_age ? '  — nie zgadza się z wiekiem przy tych ustawieniach' : '  ✔ zgadza się z wiekiem');
+
+      // Right canvas — axis + finalne kropki only (same convention as the old static
+      // Krok 5, now live; no ring curves, no candidate dots — only the model's final
+      // picks, per user request 20.07).
+      var ctxA = cvAxis.getContext('2d');
+      ctxA.clearRect(0,0,cvAxis.width,cvAxis.height);
+      if(img.complete) ctxA.drawImage(img,0,0,cvAxis.width,cvAxis.height);
+      chosen.forEach(function(t){
+        var p = projectAxis(t);
+        ctxA.fillStyle='rgba(30,30,30,0.9)'; ctxA.beginPath(); ctxA.arc(p[0],p[1],7,0,2*Math.PI); ctxA.fill();
+        ctxA.fillStyle='rgba(230,30,30,1)'; ctxA.beginPath(); ctxA.arc(p[0],p[1],5.5,0,2*Math.PI); ctxA.fill();
+      });
+
+      // Count is FORCED to equal predicted_age by construction (DP always selects
+      // exactly that many positions) — a "✔ zgadza się z wiekiem" checkmark here would
+      // be tautological (near-always true, tells the user nothing). State the fixed
+      // relationship directly instead, so it's clear the sliders reposition, they never
+      // change the count (20.07 user report: "why move them if the result never changes").
+      var note = (chosen.length === d.predicted_age)
+        ? ('liczba jest ZAWSZE równa wiekowi modelu — suwaki zmieniają tylko, GDZIE leżą te '
+           + chosen.length + ' pozycje')
+        : ('UWAGA: przy tych ustawieniach znaleziono tylko ' + chosen.length + ' z '
+           + d.predicted_age + ' wymaganych pozycji (za mało kandydatów / za duży rozstaw)');
+      readout.textContent = 'przyrostów: ' + chosen.length + ' (wiek modelu: ' + d.predicted_age + ') — ' + note;
     }
     img.onload=recompute; img.src=d.img;
     return box;
@@ -1015,12 +1174,18 @@ def _section_krok4_interactive(krok4_data: dict | None) -> str:
         return ""
     import json as _json
     html = (
-        '<h3 style="margin:0.8em 0 0.2em;">Krok 4 (interaktywnie) — pokrętl suwakami</h3>'
-        '<p style="margin:0 0 0.4em;color:#555;">Te same 48 promieni, ale <b>na żywo</b>: '
-        'zmieniając próg prominencji (jak silny musi być pik), minimalny rozstaw DP (jak blisko '
-        'mogą leżeć dwa wybrane pierścienie) i tolerancję klastra (jak blisko musi być <code>t</code> '
-        'w różnych kierunkach, żeby uznać je za ten sam pierścień) — widać wprost, jak wrażliwa jest '
-        'liczba i rozstaw wykrytych przyrostów na te trzy wybory.</p>'
+        '<h3 style="margin:0.8em 0 0.2em;">Krok 4 (interaktywnie) — pierścienie i finalne przyrosty na osi</h3>'
+        '<p style="margin:0 0 0.4em;color:#555;">Te same 48 promieni, ale <b>na żywo</b>, w '
+        '<b>dwóch zdjęciach obok siebie</b>: po lewej wybrane pierścienie (czerwone okręgi, '
+        'rzutowane na wszystkie 48 kierunków), po prawej te same pierścienie rzutowane na '
+        '<b>oś pomiaru</b> jako czerwone kropki — to finalny wynik lokalizacji, bez kandydatów '
+        '(tylko to, co model faktycznie wybrał). Zmieniając próg prominencji (jak silny musi być '
+        'pik), minimalny rozstaw DP (jak blisko mogą leżeć dwa wybrane pierścienie) i tolerancję '
+        'klastra (jak blisko musi być <code>t</code> w różnych kierunkach, żeby uznać je za ten sam '
+        'pierścień) — oba obrazy aktualizują się razem, więc widać wprost, jak zmiana pierścieni '
+        'przekłada się na zmianę pozycji na osi. <b>Uwaga:</b> liczba wybranych przyrostów to zawsze '
+        '<b>wiek modelu</b> (głowica CORAL) — nawet gdy kandydatów o wysokim score jest więcej, DP '
+        'wybiera dokładnie tyle, ile wskazał wiek, a nie tyle, ile „wygląda na dobre”.</p>'
         '<div id="krok4-widget"></div>'
         '<script>const KROK4_DATA=' + _json.dumps(krok4_data) + ';</script>'
         '<script>' + _KROK4_JS + '</script>'
@@ -1110,26 +1275,28 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
 
     # --- Panel 4: score pierścieni + wybór DP (wyróżnione `wiek` wybranych) ---
     merged = d.get("merged") or []
-    chosen = set(round(t, 4) for t in (d.get("chosen_t") or []))
     dp_b64 = ""
     if merged:
         fig, ax = plt.subplots(figsize=(9, 2.8))
         src_color = {"consensus": "#7b1fa2", "density": "#f4b400", "classical": "#0a9d6e"}
+        scores = [s for (_t, s, _src) in merged]
+        max_score = max(scores) if scores else 1.0
         for (t, score, source) in merged:
-            picked = round(t, 4) in chosen
-            ax.bar(t, score, width=0.012,
-                   color=src_color.get(source, "#888"),
-                   edgecolor="#e01e1e" if picked else "none",
-                   linewidth=2.2 if picked else 0.0)
+            ax.bar(t, score, width=0.012, color=src_color.get(source, "#888"))
+        # ONE unambiguous marker for picked bars — a black ▼ floating above the bar.
+        # (20.07: previously a red bar border + a dashed red vertical line together,
+        # which fought each other and the border "disappeared" against some fill
+        # colours — this single high-contrast marker works regardless of bar colour.)
         for t in (d.get("chosen_t") or []):
-            ax.axvline(t, color="#e01e1e", ls="--", lw=1.0, alpha=0.6)
+            ax.plot([t], [max_score * 1.1], marker="v", color="black", markersize=9, clip_on=False)
         ax.set_xlim(0, 1)
+        ax.set_ylim(0, max_score * 1.25)
         ax.set_xlabel("t (promień)", fontsize=9)
         ax.set_ylabel("score pierścienia\n(support × siła; konsensus = suma)", fontsize=8)
         n_sel = len(d.get("chosen_t") or [])
         _cap = (f"wybrano {n_sel} z {age} (tyle odrębnych pierścieni-kandydatów)"
                 if n_sel < age else f"dokładnie {age}")
-        ax.set_title(f"Wybór DP: {_cap} (czerwona ramka), min. rozstaw {gap:g}", fontsize=10)
+        ax.set_title(f"Wybór DP: {_cap} (czarny znacznik ▼ nad słupkiem), min. rozstaw {gap:g}", fontsize=10)
         # legenda źródeł
         from matplotlib.patches import Patch
         ax.legend(handles=[Patch(color=c, label=l) for l, c in
@@ -1139,11 +1306,19 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         dp_b64 = _fig_to_b64(fig)
         plt.close(fig)
 
-    def _fig_block(title, desc, b64):
+    def _fig_block(title, desc, b64, width="480px"):
         if not b64:
             return ""
+        # Fixed, CENTERED display width (NOT the default 100%) — width:100% with no
+        # containing max-width stretched images to the full page on a wide monitor
+        # (blurry, oversized — user report, 20.07). Default 480px matches the OpenCV
+        # panels' native render resolution (no blur from upscaling); the two matplotlib
+        # charts (Krok 3 histogram, Krok 4 score bars — wider, text-heavy) pass a larger
+        # width explicitly so their labels/legend stay readable. "max-width:100%"
+        # (baked into _img_tag) keeps everything responsive on narrow screens.
         return (f'<h3 style="margin:0.8em 0 0.2em;">{title}</h3>'
-                f'<p style="margin:0 0 0.4em;color:#555;">{desc}</p>{_img_tag(b64)}')
+                f'<p style="margin:0 0 0.4em;color:#555;">{desc}</p>'
+                f'<div style="text-align:center;">{_img_tag(b64, width)}</div>')
 
     def _html_block(title, desc, body_html):
         if not body_html:
@@ -1189,7 +1364,7 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         "<b>koncentryczny</b> → pojawia się na tym samym <code>t</code> w wielu kierunkach. Słupki = "
         "histogram promieni wszystkich pików (to zliczenia w przedziałach <code>t</code>, nie 48 promieni). "
         "<b>Pomarańczowe pasy</b> = wykryte skupiska (mody) = pierścienie-kandydaci.",
-        vote_b64)
+        vote_b64, width="850px")
     html += _fig_block(
         "Krok 3b — pierścienie-kandydaci na otolicie",
         "Te same skupiska rzutowane na zdjęcie: każdy klaster promienia to <b>pierścień</b> "
@@ -1204,13 +1379,8 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         "rozłożone wzdłuż osi, a bez tego algorytm skupiłby kilka pików w jednym, najsilniejszym miejscu. "
         "To jeden z możliwych sposobów separacji — poniżej można pokrętlić suwakami i zobaczyć, jak "
         "zmienia się liczba i rozstaw wykrytych pierścieni.",
-        dp_b64)
+        dp_b64, width="850px")
     html += _section_krok4_interactive(payload.get("krok4_interactive"))
-    html += _fig_block(
-        "Krok 5 — rzut na oś: finalne przyrosty",
-        "Wybrane promienie rzutujemy na oś pomiaru (jądro→brzeg) — <b>czerwone</b> punkty. "
-        "To finalny wynik lokalizacji dla tego otolitu.",
-        payload.get("panel_final_b64", ""))
     html += '</section>'
     return html
 

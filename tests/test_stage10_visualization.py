@@ -261,7 +261,7 @@ def test_density_peaks_shape():
     peaks, cand = density_peaks(grid, axis_info, H, W)
     assert isinstance(peaks, list) and isinstance(cand, list)
     if peaks:
-        assert len(peaks[0]) == 4          # (t, strength, x, y)
+        assert len(peaks[0]) == 5          # (t, strength, x, y, ray_idx)
 
 
 def test_cluster_by_radius_no_collapse_on_dense_peaks():
@@ -318,12 +318,15 @@ def test_fuse_increments_dp_enforces_spacing():
     cx, cy = axis_info["centroid"]
     fx, fy = axis_info["far_edge"]
 
-    def pk(t):
-        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)))
+    def pk(t, ray=0):
+        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)), ray)
 
     # Klastry: t=0.20 (support 4, najmocniejszy), t=0.27 (support 3), t=0.80 (support 2).
     # 0.20 i 0.27 są > t_tol (osobne klastry), ale < dp_min_gap → nie mogą być wybrane oba.
-    density = [pk(0.20)] * 4 + [pk(0.27)] * 3 + [pk(0.80)] * 2
+    # ray_idx sekwencyjne (spójny łuk) w każdej grupie → arc_len==support, więc nowy
+    # score (0.4*support*siła + 0.6*arc_len*siła) redukuje się do starego support*siła.
+    density = ([pk(0.20, i) for i in range(4)] + [pk(0.27, i) for i in range(3)]
+               + [pk(0.80, i) for i in range(2)])
     out = fuse_increments(density, [], 2, axis_info, method="dp", dp_min_gap=0.12)
     ts = out["final_t"]
     assert len(ts) == 2
@@ -345,11 +348,13 @@ def test_merge_clusters_consensus_sums_scores():
     cx, cy = axis_info["centroid"]
     fx, fy = axis_info["far_edge"]
 
-    def pk(t):
-        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)))
+    def pk(t, ray=0):
+        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)), ray)
 
-    density = [pk(0.30)] * 3 + [pk(0.70)] * 2          # 0.30 (support3), 0.70 (support2, tylko density)
-    classical = [pk(0.31)] * 4                          # 0.31 ~ 0.30 → konsensus
+    # ray_idx sekwencyjne w każdej grupie (spójny łuk) → arc_len==support, więc nowy
+    # blended score redukuje się do starego support*siła (patrz test poniżej: score==7.0).
+    density = [pk(0.30, i) for i in range(3)] + [pk(0.70, i) for i in range(2)]
+    classical = [pk(0.31, i) for i in range(4)]         # 0.31 ~ 0.30 → konsensus
     merged = {round(t, 2): (score, src) for (t, score, src) in _merge_clusters(density, classical)}
     # pierścień ~0.30: konsensus, score = density(3×1) + klasyka(4×1) = 7
     key = min(merged, key=lambda k: abs(k - 0.30))
@@ -394,7 +399,8 @@ def test_dp_interactive_data_profiles_match_server_peaks():
     server's own profiles, the live widget would silently show wrong ring counts)."""
     import numpy as np
     from scipy.signal import find_peaks
-    from src.ring_extraction import dp_interactive_data, density_peaks, classical_increments
+    from src.ring_extraction import (dp_interactive_data, density_peaks, classical_increments,
+                                     _shift_peak_to_falling_edge)
 
     H, W = 140, 220
     _, axis_info, _, _, _ = _make_axis_payload(H, W)
@@ -421,10 +427,17 @@ def test_dp_interactive_data_profiles_match_server_peaks():
             continue
         arr = np.asarray(prof)
         idxs, _ = find_peaks(arr, distance=max(1, min_d), prominence=prom)
+        # Server-side peaks are reported at their falling edge (_shift_peak_to_falling_edge),
+        # not the raw peak — the JS widget must mirror this same shift on these profiles.
+        # The margin check runs on the RAW (pre-shift) position (20.07 fix) — a valid
+        # peak must not be dropped just because shifting it pushes it past the cutoff.
         for idx in idxs:
-            t = idx / max(1, n_samples - 1)
-            if interactive["inner_margin"] <= t <= 1.0 - interactive["edge_margin"]:
-                js_t.append(round(t, 6))
+            t_orig = idx / max(1, n_samples - 1)
+            if not (interactive["inner_margin"] <= t_orig <= 1.0 - interactive["edge_margin"]):
+                continue
+            edge_idx = _shift_peak_to_falling_edge(arr, int(idx))
+            t = edge_idx / max(1, n_samples - 1)
+            js_t.append(round(t, 6))
 
     server_peaks, _ = density_peaks(grid, axis_info, H, W, prominence=prom, min_distance=min_d)
     server_t = sorted(round(p[0], 6) for p in server_peaks)

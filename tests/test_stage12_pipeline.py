@@ -202,6 +202,169 @@ def test_embedded_only_dry_run(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
+# test_pick_walkthrough_iid (ring-visibility-aware example selection, 20.07)
+# ---------------------------------------------------------------------------
+
+def test_pick_walkthrough_iid_without_image_dir_falls_back_to_age():
+    from scripts.run_pipeline import _pick_walkthrough_iid
+    samples = [
+        {"image_id": "a.png", "predicted_age": 1},
+        {"image_id": "b.png", "predicted_age": 4},
+        {"image_id": "c.png", "predicted_age": 9},
+    ]
+    assert _pick_walkthrough_iid(samples) == "b.png"
+    assert _pick_walkthrough_iid(samples, image_dir=None) == "b.png"
+
+
+def test_pick_walkthrough_iid_rejects_badly_wrong_prediction():
+    """A sample closer to age 4 but where the model is WAY off (predicted=2, true=7)
+    must lose to a worse-age-distance sample the model actually got right — otherwise
+    the walkthrough shows the model confidently placing 2 rings on a stated-true-age-7
+    otolith, which is self-contradictory (20.07 user report)."""
+    from scripts.run_pipeline import _pick_walkthrough_iid
+    samples = [
+        {"image_id": "wrong_but_near4.png", "predicted_age": 2, "age": 7},
+        {"image_id": "right_but_far.png", "predicted_age": 6, "age": 6},
+    ]
+    assert _pick_walkthrough_iid(samples) == "right_but_far.png"
+
+
+def test_pick_walkthrough_iid_accuracy_tolerance_widens_gracefully():
+    """No exact (err=0) prediction exists → widen to err<=1, not straight to 'anything'."""
+    from scripts.run_pipeline import _pick_walkthrough_iid
+    samples = [
+        {"image_id": "off_by_one.png", "predicted_age": 4, "age": 5},
+        {"image_id": "off_by_five.png", "predicted_age": 4, "age": 9},
+    ]
+    assert _pick_walkthrough_iid(samples) == "off_by_one.png"
+
+
+def test_pick_walkthrough_iid_prefers_sharper_image(tmp_path):
+    """Given two images at the same (age-4) distance, the sharper one (higher
+    Laplacian-variance — a real texture, not a flat/blurry patch) must win."""
+    import cv2
+    from scripts.run_pipeline import _pick_walkthrough_iid
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+
+    blurry = np.full((80, 80, 3), 180, dtype=np.uint8)   # flat — near-zero Laplacian variance
+    PILImage.fromarray(blurry).save(img_dir / "blurry.png")
+
+    rng = np.random.default_rng(0)
+    sharp = rng.integers(0, 255, (80, 80, 3), dtype=np.uint8)   # high-frequency noise — sharp
+    PILImage.fromarray(sharp, "RGB").save(img_dir / "sharp.png")
+
+    samples = [
+        {"image_id": "blurry.png", "predicted_age": 4},
+        {"image_id": "sharp.png", "predicted_age": 4},
+    ]
+    assert _pick_walkthrough_iid(samples, img_dir) == "sharp.png"
+
+
+def _make_faded_disk(H=400, W=400, center=(200, 200), r_core=80, r_outer=140,
+                     bg=10, fg=220) -> np.ndarray:
+    """Bright disk fading to a dark background — segmentable by the radial method
+    (mirrors tests/test_otolith_axis.py's fixture of the same name)."""
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = np.hypot(xx - center[0], yy - center[1])
+    inten = np.full((H, W), float(bg), dtype=np.float32)
+    inten[d <= r_core] = fg
+    ramp = (d > r_core) & (d <= r_outer)
+    inten[ramp] = fg - (fg - bg) * (d[ramp] - r_core) / (r_outer - r_core)
+    img = np.clip(inten, 0, 255).astype(np.uint8)
+    return np.stack([img] * 3, axis=2)
+
+
+def _add_dark_rings(img: np.ndarray, center=(200, 200), radii=(30, 50, 70),
+                    width=4, dark=60) -> np.ndarray:
+    import cv2
+    out = img.copy()
+    for r in radii:
+        cv2.circle(out, center, r, (dark, dark, dark), width)
+    return out
+
+
+def test_pick_walkthrough_iid_prefers_visible_rings_over_flat_image(tmp_path):
+    """Given two segmentable otoliths at the same age distance and similar sharpness,
+    the one with clearly visible concentric bands (classical_increments finds strong,
+    well-supported clusters) must win over a flat one with no ring signal at all —
+    this is the actual pipeline detector, not a proxy like raw image sharpness."""
+    import cv2
+    from scripts.run_pipeline import _pick_walkthrough_iid
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+
+    flat = _make_faded_disk()
+    PILImage.fromarray(flat).save(img_dir / "flat.png")
+
+    banded = _add_dark_rings(_make_faded_disk())
+    PILImage.fromarray(banded).save(img_dir / "banded.png")
+
+    samples = [
+        {"image_id": "flat.png", "predicted_age": 4},
+        {"image_id": "banded.png", "predicted_age": 4},
+    ]
+    assert _pick_walkthrough_iid(samples, img_dir) == "banded.png"
+
+
+def test_pick_walkthrough_iid_widens_window_only_as_needed(tmp_path):
+    """No sample at age exactly 4 → widen just far enough (age 5, window 1), not all the
+    way to a sharper but far-off age (age 8, window 4) — few-ring young/old fish are a
+    worse teaching example than a slightly-off-4 one (user feedback, 20.07)."""
+    from scripts.run_pipeline import _pick_walkthrough_iid
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    rng = np.random.default_rng(2)
+    blurry_age5 = np.full((80, 80, 3), 180, dtype=np.uint8)
+    PILImage.fromarray(blurry_age5).save(img_dir / "age5.png")
+    sharp_age8 = rng.integers(0, 255, (80, 80, 3), dtype=np.uint8)
+    PILImage.fromarray(sharp_age8, "RGB").save(img_dir / "age8.png")
+
+    samples = [
+        {"image_id": "age5.png", "predicted_age": 5},
+        {"image_id": "age8.png", "predicted_age": 8},
+    ]
+    assert _pick_walkthrough_iid(samples, img_dir) == "age5.png"
+
+
+def test_pick_walkthrough_iid_restricts_to_age_window_first(tmp_path):
+    """A SHARPER image at a wildly different age must NOT be picked over a blurrier one
+    near age 4 — the age window is a pre-filter, sharpness only ranks within it."""
+    from scripts.run_pipeline import _pick_walkthrough_iid
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+
+    blurry_near_age = np.full((80, 80, 3), 180, dtype=np.uint8)
+    PILImage.fromarray(blurry_near_age).save(img_dir / "near_age.png")
+    rng = np.random.default_rng(1)
+    sharp_far_age = rng.integers(0, 255, (80, 80, 3), dtype=np.uint8)
+    PILImage.fromarray(sharp_far_age, "RGB").save(img_dir / "far_age.png")
+
+    samples = [
+        {"image_id": "near_age.png", "predicted_age": 4},
+        {"image_id": "far_age.png", "predicted_age": 15},   # far outside the |age-4|<=3 window
+    ]
+    assert _pick_walkthrough_iid(samples, img_dir) == "near_age.png"
+
+
+def test_pick_walkthrough_iid_missing_files_falls_back_gracefully(tmp_path):
+    """No image on disk for anyone → sharpness is -inf for all → falls back to age
+    distance / image_id tie-break without crashing."""
+    from scripts.run_pipeline import _pick_walkthrough_iid
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    samples = [
+        {"image_id": "missing_a.png", "predicted_age": 1},
+        {"image_id": "missing_b.png", "predicted_age": 4},
+    ]
+    assert _pick_walkthrough_iid(samples, img_dir) == "missing_b.png"
+
+
+# ---------------------------------------------------------------------------
 # test_reload_cards_from_disk
 # ---------------------------------------------------------------------------
 
@@ -380,12 +543,14 @@ def test_walkthrough_panel_b64_is_raw(tmp_path, monkeypatch):
     )
 
     assert wt is not None, "walkthrough payload was not built — otolith failed to segment"
-    for key in ("panel_patchgrid_b64", "panel_rays_b64", "panel_rings_b64", "panel_final_b64"):
+    for key in ("panel_patchgrid_b64", "panel_rays_b64", "panel_rings_b64"):
         b64 = wt[key]
         assert b64, f"{key} is empty"
         assert not b64.startswith("data:image"), (
             f"{key} is pre-prefixed with a data URI — will be double-prefixed by _img_tag()")
         assert base64.b64decode(b64)[:8] == b"\x89PNG\r\n\x1a\n", f"{key} is not a valid PNG"
+    # Krok 5 was merged into the Krok 4 interactive widget (20.07) — no standalone panel.
+    assert "panel_final_b64" not in wt
 
     # Krok 2 companion images (one per sample_profiles entry) — same raw-base64 contract.
     ray_imgs = wt["panel_ray_examples_b64"]
@@ -393,3 +558,8 @@ def test_walkthrough_panel_b64_is_raw(tmp_path, monkeypatch):
     for b64 in ray_imgs:
         assert b64 and not b64.startswith("data:image")
         assert base64.b64decode(b64)[:8] == b"\x89PNG\r\n\x1a\n"
+
+    # Krok 4 interactive: far_edge needed so JS can project chosen t onto the SINGLE
+    # measurement axis (merged Krok 4/5, 20.07) — not just the 48-direction ring.
+    interactive = wt["krok4_interactive"]
+    assert "far_edge" in interactive and len(interactive["far_edge"]) == 2

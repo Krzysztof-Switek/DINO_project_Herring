@@ -353,7 +353,8 @@ def _compute_axis_data_for_samples(
     min_dist = cfg.candidates.min_peak_distance
     prominence = cfg.candidates.prominence_threshold
     n_samples_axis = 50
-    walkthrough_iid = _pick_walkthrough_iid(samples)   # deterministyczny przykład (wiek ~4)
+    walkthrough_iid = _pick_walkthrough_iid(samples, image_dir,
+                                            seg_params=cfg.segmentation.as_params())
 
     missing_images = 0
     failed_axes = 0
@@ -547,8 +548,6 @@ def _compute_axis_data_for_samples(
                 _dring = [c[0] for c in (_wd.get("density_clusters") or [])]
                 _cring = [c[0] for c in (_wd.get("classical_clusters") or [])]
                 _p3 = render_candidate_rings(orig_rgb, axis_info, _dring, _cring)
-                _wcand = list(_wd["density_pts"]) + list(_wd["classical_pts"])
-                _p5 = render_localization_overlay(orig_rgb, axis_info, _wd["final_axis_pts"], _wcand)
                 # krok 2: JEDEN promień podświetlony na zdjęciu — obok jego profilu (20.07 pass 2).
                 _p2_list = [render_single_ray(orig_rgb, axis_info, pr["contour_pt"], pr.get("peak_t"))
                            for pr in (_wd.get("sample_profiles") or [])]
@@ -574,6 +573,8 @@ def _compute_axis_data_for_samples(
                 _interactive["w"], _interactive["h"] = _wdw, _wdh
                 _icx, _icy = _interactive["centroid"]
                 _interactive["centroid"] = [int(round(_icx * _wsc)), int(round(_icy * _wsc))]
+                _ifx, _ify = _interactive["far_edge"]
+                _interactive["far_edge"] = [int(round(_ifx * _wsc)), int(round(_ify * _wsc))]
                 _interactive["contour_pts"] = [[int(round(x * _wsc)), int(round(y * _wsc))]
                                                for (x, y) in _interactive["contour_pts"]]
 
@@ -584,7 +585,6 @@ def _compute_axis_data_for_samples(
                     "panel_patchgrid_b64": _wb64(_p0),
                     "panel_rays_b64": _wb64(_p1),
                     "panel_rings_b64": _wb64(_p3),
-                    "panel_final_b64": _wb64(_p5),
                     "panel_ray_examples_b64": [_wb64(_p2, (_wdw2, _wdh2)) for _p2 in _p2_list],
                     "krok4_interactive": _interactive,
                     "data": _wd,
@@ -628,17 +628,101 @@ def _compute_axis_data_for_samples(
     return grids, axis_data, walkthrough_payload
 
 
-def _pick_walkthrough_iid(samples: list[dict]) -> str:
+def _pick_walkthrough_iid(samples: list[dict], image_dir: "Path | None" = None,
+                          seg_params: "dict | None" = None) -> str:
     """Deterministycznie wybierz JEDEN otolit na sekcję „krok po kroku".
 
-    Preferuje wiek najbliższy 4 (widoczne pierścienie, nie skrajny), remisy rozstrzyga
-    alfabetycznie po image_id → ten sam przykład przy każdym uruchomieniu (seed niezależne).
+    NAJPIERW ogranicza się do trafnych predykcji (|wiek modelu − wiek prawdziwy| małe)
+    — inaczej sekcja jest samosprzeczna: potrafiła np. pokazywać model stawiający
+    „2" przyrosty na otolicie, którego prawdziwy wiek to 7 (20.07, zgłoszenie
+    użytkownika — karty best/worst mieszają dobre i złe predykcje, a dawny dobór
+    patrzył WYŁĄCZNIE na wiek modelu, nigdy na to, czy predykcja jest w ogóle dobra).
+    Wśród trafnych predykcji, w rozsądnym oknie wieku wokół 4 (widoczne pierścienie,
+    nie skrajny wiek), wybiera zdjęcie o najbardziej WYRAŹNYCH przyrostach — mierzone
+    tym samym klasycznym (jasność obrazu) wykrywaniem 48-promieniowym, którego używa
+    reszta pipeline'u (:func:`src.ring_extraction.classical_increments`), nie samą
+    ostrością zdjęcia (20.07: techniczne ostre zdjęcie może mieć słaby kontrast
+    prążków, a nieco miększe — bardzo wyraźne). Ostrość (wariancja Laplasjanu) zostaje
+    jako dogrywka przy remisie. Bez ``image_dir`` (lub gdy segmentacja/odczyt zawiedzie
+    dla wszystkich) spada do samego wieku — deterministyczne, remisy po image_id → ten
+    sam przykład przy każdym uruchomieniu (seed niezależne).
     """
     if not samples:
         return ""
+
+    def _age_err(s: dict) -> int:
+        true_age = s.get("age", s.get("predicted_age", 0))
+        return abs(int(s.get("predicted_age", 0)) - int(true_age))
+
+    accurate: list[dict] = []
+    for err_tol in (0, 1, 2):
+        accurate = [s for s in samples if _age_err(s) <= err_tol]
+        if accurate:
+            break
+    pool_source = accurate if accurate else list(samples)
+
+    if image_dir is None:
+        def _key_age_only(s):
+            return (abs(int(s.get("predicted_age", 0)) - 4), str(s.get("image_id", "")))
+        return str(min(pool_source, key=_key_age_only)["image_id"])
+
+    import cv2
+    import numpy as np
+    from PIL import Image as PILImage
+    from src.otolith_axis import detect_axis
+    from src.ring_extraction import classical_increments
+
+    # Widen the age window only as far as needed — age 4 exactly is the pedagogical
+    # sweet spot (enough rings to see the method work, not so many they crowd the
+    # otolith); a wider window can otherwise land on a very young fish (1-2 rings,
+    # confusingly few candidates chosen) purely because its photo was sharpest.
+    pool: list[dict] = []
+    for window in (0, 1, 2, 3):
+        pool = [s for s in pool_source if abs(int(s.get("predicted_age", 0)) - 4) <= window]
+        if pool:
+            break
+    if not pool:
+        pool = list(pool_source)
+
+    def _visibility_and_sharpness(iid: str, predicted_age: int) -> tuple[float, float]:
+        """(ring-visibility score, sharpness) for one image, computed from a single
+        image load. Visibility = sum(support * mean_strength) over the top
+        ``predicted_age`` classical 48-ray clusters (:func:`classical_increments`) —
+        same signal the rest of the pipeline uses to judge a ring "real" (not raw
+        sharpness, which can be technically crisp yet low-contrast on the bands)."""
+        path = Path(image_dir) / iid
+        if not path.exists():
+            return float("-inf"), float("-inf")
+        try:
+            img_pil = PILImage.open(path).convert("RGB")
+        except Exception:
+            return float("-inf"), float("-inf")
+        rgb = np.array(img_pil, dtype=np.uint8)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        try:
+            axis_info = detect_axis(rgb, seg_params=seg_params or {})
+            if axis_info is None:
+                return float("-inf"), sharpness
+            clusters = classical_increments(rgb, axis_info)["clusters"]
+        except Exception:
+            return float("-inf"), sharpness
+        if not clusters or predicted_age <= 0:
+            return 0.0, sharpness
+        top = sorted(clusters, key=lambda c: c[1] * c[2], reverse=True)[:predicted_age]
+        visibility = sum(support * strength for (_t, support, strength) in top)
+        return float(visibility), sharpness
+
+    scores = {str(s.get("image_id", "")):
+              _visibility_and_sharpness(str(s.get("image_id", "")), int(s.get("predicted_age", 0)))
+              for s in pool}
+
     def _key(s):
-        return (abs(int(s.get("predicted_age", 0)) - 4), str(s.get("image_id", "")))
-    return str(min(samples, key=_key)["image_id"])
+        iid = str(s.get("image_id", ""))
+        visibility, sharpness = scores[iid]
+        return (-visibility, -sharpness, abs(int(s.get("predicted_age", 0)) - 4), iid)
+
+    return str(min(pool, key=_key)["image_id"])
 
 
 def _reload_cards_from_disk(output_dir: Path) -> dict[str, list[Path]]:
