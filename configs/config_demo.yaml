@@ -8,7 +8,7 @@
 #       --skip-scan
 
 model:
-  backbone: dinov2_vits14
+  backbone: dinov2_vits14_reg
   use_metadata: false
   target_type: ordinal
   num_age_classes: 17
