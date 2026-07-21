@@ -453,13 +453,31 @@ def _project_to_axis(chosen_t, axis_info: dict) -> List[Tuple[int, int]]:
             for t in chosen_t]
 
 
-def _dp_select_t(cands, k: int, min_gap: float) -> List[float]:
-    """Pick exactly ``k`` radii from ``cands=[(t, score)]`` maximising total score with a
-    minimum spacing ``min_gap`` between chosen radii (DP peak selection, monotone in ``t``).
+def _dp_select_t(cands, k: int, min_gap: float, spread_weight: float = 1.5) -> List[float]:
+    """Pick exactly ``k`` radii from ``cands=[(t, score)]`` maximising total score (PLUS a
+    spread bonus) with a minimum spacing ``min_gap`` between chosen radii (DP peak selection,
+    monotone in ``t``).
 
     This is the ``method="dp"`` selector: unlike top-k (which can bunch several picks at
     almost the same radius), the spacing constraint spreads the ``k`` increments along the
     axis — the classic dynamic-programming ring/peak selection used in tree-ring counting.
+
+    ``spread_weight`` (20.07): a flat minimum-gap ALONE doesn't stop DP from bunching all
+    ``k`` picks in whichever single sub-region happens to have the highest raw score — real
+    otoliths often have one very strong, near-universally-supported band (e.g. close to the
+    nucleus) that would otherwise swallow every pick, even when decent candidates exist all
+    the way to the edge (20.07, user report: 3/3 picks landed in the inner third of the axis
+    despite good-scoring candidates out to t=0.98). Each DP transition adds
+    ``spread_weight * gap * mean_score`` (``mean_score`` = mean of all candidate scores, so the
+    bonus is on the same scale as the scores themselves regardless of their absolute units) —
+    rewarding WIDER gaps between consecutive picks, not just enforcing the ``min_gap`` floor.
+    ``spread_weight=0`` reproduces the exact previous (score-only) behaviour. Default 1.5 —
+    calibrated against the actual reported case (real classical+density scores, inner cluster
+    ~2-4x the outer candidates' score): weights below ~1.0 left the bunched selection
+    unchanged; 1.0-5.0 all reliably swap in the distant candidate. Still a first pass, not
+    exhaustively validated across many otoliths — worth revisiting once more real cards are
+    available.
+
     Falls back to the top-``k`` by score (spacing ignored) when spacing makes ``k`` picks
     infeasible, so it always returns as many as possible up to ``k``.
     """
@@ -470,6 +488,7 @@ def _dp_select_t(cands, k: int, min_gap: float) -> List[float]:
     ss = [float(c[1]) for c in cs]
     M = len(cs)
     k = min(k, M)
+    mean_score = sum(ss) / M
     NEG = float("-inf")
     dp = [[NEG] * M for _ in range(k + 1)]                    # dp[j][i]: best score, j picks, last at i
     par = [[-1] * M for _ in range(k + 1)]
@@ -479,9 +498,11 @@ def _dp_select_t(cands, k: int, min_gap: float) -> List[float]:
         for i in range(M):
             best, bp = NEG, -1
             for p in range(i):
-                if ts[i] - ts[p] >= min_gap and dp[j - 1][p] > best:
-                    best, bp = dp[j - 1][p], p
-            if best > NEG:
+                if ts[i] - ts[p] >= min_gap:
+                    cand_val = dp[j - 1][p] + spread_weight * (ts[i] - ts[p]) * mean_score
+                    if dp[j - 1][p] > NEG and cand_val > best:
+                        best, bp = cand_val, p
+            if bp != -1:
                 dp[j][i] = best + ss[i]
                 par[j][i] = bp
     end, best_val = -1, NEG
@@ -651,7 +672,7 @@ def _merge_clusters(density_pks, classical_pks, t_tol: float = 0.06, n_dirs: int
 def fuse_increments(
     density_pks, classical_pks, predicted_age: int, axis_info: dict,
     *, method: str = "consensus", t_tol: float = 0.06, dp_min_gap: float = 0.04,
-    n_dirs: int = 48,
+    n_dirs: int = 48, dp_spread_weight: float = 1.5,
 ) -> dict:
     """Choose the final ``predicted_age`` increments on the axis from peak sources.
 
@@ -665,8 +686,10 @@ def fuse_increments(
         (combined support), top-`age`; falls back to top density clusters if fewer than
         ``age`` agree.
       * ``"dp"``        — merge density+classical clusters (consensus rings scored higher),
-        then dynamic-programming select exactly `age` radii maximising total score with a
-        minimum spacing ``dp_min_gap`` (spreads increments along the axis, no bunching).
+        then dynamic-programming select exactly `age` radii maximising total score (plus a
+        spread bonus, ``dp_spread_weight`` — see :func:`_dp_select_t`) with a minimum
+        spacing ``dp_min_gap`` (spreads increments along the axis instead of bunching all
+        picks in whichever single sub-region scores highest).
     Returns ``{final_t, final_axis_pts, candidate_pts}`` (candidates = the source(s) used).
     """
     empty = {"final_t": [], "final_axis_pts": [], "candidate_pts": []}
@@ -682,7 +705,7 @@ def fuse_increments(
         cand = [(p[2], p[3]) for p in classical_pks]
     elif method == "dp":
         merged = _merge_clusters(density_pks, classical_pks, t_tol, n_dirs)
-        chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap)
+        chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap, dp_spread_weight)
         cand = [(p[2], p[3]) for p in density_pks] + [(p[2], p[3]) for p in classical_pks]
     else:  # consensus
         dclust = _cluster_by_radius(density_pks, t_tol)
@@ -761,7 +784,7 @@ def _example_ray_profiles(grid, axis_info: dict, image_h: int, image_w: int, *,
 
 def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int, image_w: int,
                         predicted_age: int, *, n_dirs: int = 48, n_samples: int = 64,
-                        t_tol: float = 0.06, dp_min_gap: float = 0.04,
+                        t_tol: float = 0.06, dp_min_gap: float = 0.04, dp_spread_weight: float = 1.5,
                         density_min_distance: int = 3, density_prominence: float = 0.1,
                         classical_smooth_sigma: float = 0.0, classical_min_distance: int = 1,
                         classical_prominence: float = 0.02, inner_margin: float = 0.05,
@@ -771,6 +794,12 @@ def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int,
     Feeds the step-by-step report section: candidates from 48 rays (density + classical),
     per-ray profiles, radius-clusters, merged candidate rings with scores, and the DP
     selection. Reuses the SAME helpers as the real fusion, so what it shows == what runs.
+    ``sample_profiles`` (the Krok-2 per-ray example charts) use the CLASSICAL (image-intensity)
+    signal, not density — density is the model's own learned map and can be weak or effectively
+    empty on a given otolith (esp. an undertrained/early-checkpoint density head), while classical
+    intensity is what a human eye — and, downstream, most of the fused score — actually responds
+    to (20.07, user report: a chart showing near-zero density looked like "no signal" even though
+    classical clearly found peaks at the same visible bands).
     """
     dpk, dpts = density_peaks(density_grid, axis_info, image_h, image_w,
                               n_dirs=n_dirs, n_samples=n_samples, min_distance=density_min_distance,
@@ -783,7 +812,7 @@ def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int,
     cpk, cpts = cinc["peaks"], cinc["candidate_pts"]
     merged = _merge_clusters(dpk, cpk, t_tol, n_dirs)
     k = max(0, int(predicted_age))
-    chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap)
+    chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap, dp_spread_weight)
     return {
         "predicted_age": k,
         "n_dirs": n_dirs,
@@ -798,8 +827,8 @@ def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int,
         "chosen_t": chosen,
         "final_axis_pts": _project_to_axis(chosen, axis_info),
         "sample_profiles": _example_ray_profiles(
-            density_grid, axis_info, image_h, image_w, n_dirs=n_dirs, n_samples=n_samples,
-            min_distance=density_min_distance, prominence=density_prominence,
+            gray_image, axis_info, image_h, image_w, n_dirs=n_dirs, n_samples=n_samples,
+            min_distance=classical_min_distance, prominence=classical_prominence,
             inner_margin=inner_margin, edge_margin=edge_margin, n_example=n_example_rays),
     }
 

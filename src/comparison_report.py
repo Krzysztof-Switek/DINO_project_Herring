@@ -1010,19 +1010,30 @@ _KROK4_JS = r"""
     cclust.forEach(function(c,i){ if(!used[i]) merged.push([c[0], score(c)]); });
     return merged;
   }
-  function dpSelectT(cands, k, minGap){
+  function dpSelectT(cands, k, minGap, spreadWeight){
+    // Mirrors ring_extraction._dp_select_t — spreadWeight (default 1.5, like Python) adds
+    // spreadWeight*gap*meanScore to each transition, rewarding wider gaps between consecutive
+    // picks instead of just enforcing the minGap floor (20.07: a flat min-gap alone let DP
+    // bunch all picks in whichever single sub-region scored highest).
+    if(spreadWeight===undefined) spreadWeight=1.5;
     if(k<=0 || cands.length===0) return [];
     var cs = cands.slice().sort(function(a,b){return a[0]-b[0];});
     var ts = cs.map(function(c){return c[0];}), ss = cs.map(function(c){return c[1];});
     var M = ts.length; k = Math.min(k, M);
+    var meanScore = ss.reduce(function(a,b){return a+b;},0)/M;
     var NEG = -Infinity, dp=[], par=[], i, j, p;
     for(j=0;j<=k;j++){ dp.push(new Array(M).fill(NEG)); par.push(new Array(M).fill(-1)); }
     for(i=0;i<M;i++) dp[1][i]=ss[i];
     for(j=2;j<=k;j++){
       for(i=0;i<M;i++){
         var best=NEG, bp=-1;
-        for(p=0;p<i;p++){ if(ts[i]-ts[p]>=minGap && dp[j-1][p]>best){ best=dp[j-1][p]; bp=p; } }
-        if(best>NEG){ dp[j][i]=best+ss[i]; par[j][i]=bp; }
+        for(p=0;p<i;p++){
+          if(ts[i]-ts[p]>=minGap){
+            var candVal = dp[j-1][p] + spreadWeight*(ts[i]-ts[p])*meanScore;
+            if(dp[j-1][p]>NEG && candVal>best){ best=candVal; bp=p; }
+          }
+        }
+        if(bp!==-1){ dp[j][i]=best+ss[i]; par[j][i]=bp; }
       }
     }
     var end=-1, bestVal=NEG;
@@ -1355,8 +1366,11 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         "Bierzemy sygnał wzdłuż jednego promienia (jądro→brzeg, <b>czerwona linia</b> na zdjęciu) "
         "i normalizujemy do [0,1] (żeby jasne i ciemne kierunki były porównywalne). <b>Pik</b> = "
         "lokalne maksimum wystające ponad otoczenie (czerwone kropki na zdjęciu i na wykresie) — "
-        "to kandydat na przyrost na tym promieniu; drobne falowanie poniżej progu to szum. Kilka "
-        "przykładowych promieni z 48, zdjęcie obok jego własnego wykresu:",
+        "to kandydat na przyrost na tym promieniu; drobne falowanie poniżej progu to szum. Wykres "
+        "pokazuje sygnał <b>klasyczny</b> (jasność obrazu) — nie mapę density modelu: to klasyka "
+        "najczęściej niesie realny sygnał o przyrostach, mapa density bywa słaba lub niewytrenowana "
+        "na danym otolicie i nie zawsze pokazuje to, co widać okiem. Kilka przykładowych promieni "
+        "z 48, zdjęcie obok jego własnego wykresu:",
         krok2_html)
     html += _fig_block(
         "Krok 3 — głosowanie po promieniu",
@@ -1375,8 +1389,9 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         "Krok 4 — score pierścieni i wybór finalny",
         "Score pierścienia = ile kierunków go widziało × siła; gdy density i klasyka zgadzają się "
         "co do promienia, score się <b>sumuje</b> (konsensus). Wybieramy <code>wiek</code> pierścieni "
-        "o najwyższym score, z <b>wymuszonym minimalnym rozstawem</b> — bo realne roczne przyrosty są "
-        "rozłożone wzdłuż osi, a bez tego algorytm skupiłby kilka pików w jednym, najsilniejszym miejscu. "
+        "o najwyższym score, z <b>minimalnym rozstawem</b> ORAZ premią za rozłożenie po całej osi — "
+        "bez tego drugiego elementu jeden bardzo silny, niemal wszechobecny region (np. blisko jądra) "
+        "potrafił zagarnąć wszystkie wybory, mimo solidnych kandydatur bliżej krawędzi (20.07). "
         "To jeden z możliwych sposobów separacji — poniżej można pokrętlić suwakami i zobaczyć, jak "
         "zmienia się liczba i rozstaw wykrytych pierścieni.",
         dp_b64, width="850px")

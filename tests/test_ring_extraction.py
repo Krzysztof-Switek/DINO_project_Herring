@@ -235,3 +235,31 @@ def test_merge_clusters_scores_contiguous_ring_higher():
     s_merged = _merge_clusters(scattered, [], t_tol=0.06, n_dirs=48)
     assert len(c_merged) == 1 and len(s_merged) == 1
     assert c_merged[0][1] > s_merged[0][1]                  # contiguous scores higher
+
+
+# ---------------------------------------------------------------------------
+# _dp_select_t spread_weight (discourage bunching, 20.07)
+# ---------------------------------------------------------------------------
+
+def test_dp_select_t_spread_weight_zero_reproduces_old_behaviour():
+    """spread_weight=0 must select purely by summed score (respecting min_gap) — the
+    exact pre-20.07 behaviour. Three tight, equally-strong candidates outscore any
+    combination that reaches for the more distant, slightly weaker fourth one."""
+    from src.ring_extraction import _dp_select_t
+    cands = [(0.10, 10.0), (0.15, 10.0), (0.20, 10.0), (0.80, 8.0)]
+    chosen = _dp_select_t(cands, k=3, min_gap=0.04, spread_weight=0.0)
+    assert chosen == [0.10, 0.15, 0.20]
+
+
+def test_dp_select_t_spread_weight_prefers_distant_candidate_over_bunching():
+    """With a positive spread_weight (incl. the production default), DP must be willing
+    to trade a little raw score for a much wider spread — picking the isolated, slightly
+    weaker candidate at t=0.80 instead of stacking all 3 picks in the same tight cluster
+    (20.07 user report: real otolith had good candidates out to t~0.98 that a pure
+    score-sum DP ignored entirely in favour of a strong inner cluster)."""
+    from src.ring_extraction import _dp_select_t
+    cands = [(0.10, 10.0), (0.15, 10.0), (0.20, 10.0), (0.80, 8.0)]
+    chosen_default = _dp_select_t(cands, k=3, min_gap=0.04)          # production default (1.5)
+    chosen_explicit = _dp_select_t(cands, k=3, min_gap=0.04, spread_weight=1.5)
+    assert chosen_default == chosen_explicit
+    assert 0.80 in chosen_default

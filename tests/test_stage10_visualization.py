@@ -391,6 +391,25 @@ def test_dp_walkthrough_data_keys_and_consistency():
     assert wd["chosen_t"] == ref
 
 
+def test_dp_walkthrough_data_sample_profiles_use_classical_not_density():
+    """Krok-2 example charts must reflect the CLASSICAL (image-brightness) signal, not the
+    model's density map — density can be weak/empty on a given otolith (esp. an undertrained
+    density head) even when classical intensity clearly shows the visible bands (20.07 user
+    report: a flat density chart looked like "no signal" while classical found real peaks)."""
+    import numpy as np
+    from src.ring_extraction import dp_walkthrough_data, _example_ray_profiles
+    H, W = 140, 220
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    flat_density = np.full((10, 16), 0.5, dtype=np.float32)      # no density signal at all
+    rng = np.random.default_rng(3)
+    gray = rng.random((H, W)).astype(np.float32)                  # real classical texture
+    age = 2
+    wd = dp_walkthrough_data(flat_density, gray, axis_info, H, W, age)
+    ref = _example_ray_profiles(gray, axis_info, H, W, min_distance=1, prominence=0.02)
+    assert [p["norm"] for p in wd["sample_profiles"]] == [p["norm"] for p in ref]
+    assert any(p["peak_t"] for p in wd["sample_profiles"]), "classical signal should yield peaks"
+
+
 def test_dp_interactive_data_profiles_match_server_peaks():
     """dp_interactive_data's raw per-ray profiles must reproduce EXACTLY the peaks that
     density_peaks/classical_increments (the real server pipeline) find at the same
