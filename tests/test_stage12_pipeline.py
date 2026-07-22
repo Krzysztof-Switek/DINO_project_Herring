@@ -631,3 +631,125 @@ def test_cards_leave_model_input_unmasked_when_mask_background_disabled(tmp_path
     photo — no behaviour change for runs/configs that never opted into masking."""
     bg_pixel, orig_bg = _bg_pixel_seen_by_model(tmp_path, monkeypatch, mask_background=False)
     assert bg_pixel == orig_bg
+
+
+# ---------------------------------------------------------------------------
+# Higher-resolution / cropped density for candidate detection (22.07)
+# ---------------------------------------------------------------------------
+
+def test_hires_cropped_density_uses_shifted_axis_info_and_bigger_grid(tmp_path, monkeypatch):
+    """With candidates.density_image_size set + density_crop_to_otolith=True, the density
+    forward pass driving select_increments() must: (1) use a grid shaped for
+    density_image_size (not data.image_size), (2) be called with axis_info shifted INTO
+    the crop's coordinate frame (centroid == full centroid - crop offset), (3) with
+    image_h/image_w equal to the CROP's dimensions, not the full photo's. This is the
+    exact mechanism a coordinate-frame bug would silently break — asserted directly via
+    a spy on select_increments, not inferred from a symptom."""
+    import cv2
+    from src.inference import load_model_from_checkpoint as _real_load
+    from src.otolith_axis import detect_axis, mask_bbox
+    import src.ring_extraction as _re_module
+    from scripts.run_pipeline import _compute_axis_data_for_samples
+
+    monkeypatch.setattr(
+        "src.inference.load_model_from_checkpoint",
+        lambda cfg, ckpt_path, backbone=None: _real_load(cfg, ckpt_path, backbone=_MockDinoBackbone()),
+    )
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True)
+    img = np.full((300, 220, 3), 255, dtype=np.uint8)
+    cv2.ellipse(img, (110, 150), (60, 100), angle=0, startAngle=0, endAngle=360,
+                color=(40, 40, 40), thickness=-1)
+    fname = "2022_BIAS_HER_Loc_Embedded_Sharp_FishIndex0_Single1_Left.png"
+    PILImage.fromarray(img, "RGB").save(img_dir / fname)
+    rows = [{"image_id": fname, "age": 4, "split": s} for s in ("train", "val", "test")]
+    labels_csv = tmp_path / "labels.csv"
+    pd.DataFrame(rows).to_csv(labels_csv, index=False)
+
+    cfg = _make_cfg(tmp_path, labels_csv, img_dir)
+    cfg.model.use_density_head = True
+    cfg.candidates.density_image_size = 112          # != data.image_size (56) -> triggers hi-res path
+    cfg.candidates.density_crop_to_otolith = True
+    cfg.candidates.density_crop_pad_frac = 0.05
+    ckpt = _save_mock_checkpoint(cfg, labels_csv, img_dir)
+
+    # Independently reproduce the expected crop (same image, same deterministic segmentation).
+    mask_arr = detect_axis(img, seg_params=cfg.segmentation.as_params())["mask"]
+    exp_x0, exp_y0, exp_cw, exp_ch = mask_bbox(mask_arr, cfg.candidates.density_crop_pad_frac)
+
+    real_select_increments = _re_module.select_increments
+    captured: dict = {}
+
+    def _spy(grid, axis_info, age, image_h, image_w, **kwargs):
+        captured["grid_shape"] = grid.shape
+        captured["centroid"] = axis_info["centroid"]
+        captured["dims"] = (image_h, image_w)
+        return real_select_increments(grid, axis_info, age, image_h, image_w, **kwargs)
+
+    monkeypatch.setattr("src.ring_extraction.select_increments", _spy)
+
+    samples = [{"image_id": fname, "age": 4, "predicted_age": 4}]
+    grids, axis_data, _wt = _compute_axis_data_for_samples(
+        samples, img_dir, cfg, ckpt, tmp_path / "cond",
+    )
+
+    assert "grid_shape" in captured, "select_increments (spied) was never called"
+    assert captured["grid_shape"] == (112 // 14, 112 // 14)          # density_image_size grid, not 56/14
+    assert captured["dims"] == (exp_ch, exp_cw)                      # crop dims, not full (300, 220)
+    full_centroid = detect_axis(img, seg_params=cfg.segmentation.as_params())["centroid"]
+    assert captured["centroid"] == (full_centroid[0] - exp_x0, full_centroid[1] - exp_y0)
+
+    # Output points must be shifted BACK to full-image coordinates for drawing.
+    iid = fname
+    for (x, y) in axis_data[iid]["candidate_pts"] + axis_data[iid]["final_axis_pts"]:
+        assert 0 <= x < 220 and 0 <= y < 300
+
+    # Panel-4 heatmap / grids[iid] stays at the ORIGINAL resolution (data.image_size),
+    # unaffected by the density-only hi-res path (56/14=4).
+    assert grids[iid].shape == (4, 4)
+
+
+def test_hires_density_off_by_default_matches_today(tmp_path, monkeypatch):
+    """density_image_size=None, density_crop_to_otolith=False (defaults) -> select_increments
+    is called with the ORIGINAL grid/axis_info/dims, zero behaviour change."""
+    import cv2
+    from src.inference import load_model_from_checkpoint as _real_load
+    import src.ring_extraction as _re_module
+    from scripts.run_pipeline import _compute_axis_data_for_samples
+
+    monkeypatch.setattr(
+        "src.inference.load_model_from_checkpoint",
+        lambda cfg, ckpt_path, backbone=None: _real_load(cfg, ckpt_path, backbone=_MockDinoBackbone()),
+    )
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True)
+    img = np.full((300, 220, 3), 255, dtype=np.uint8)
+    cv2.ellipse(img, (110, 150), (60, 100), angle=0, startAngle=0, endAngle=360,
+                color=(40, 40, 40), thickness=-1)
+    fname = "2022_BIAS_HER_Loc_Embedded_Sharp_FishIndex0_Single1_Left.png"
+    PILImage.fromarray(img, "RGB").save(img_dir / fname)
+    rows = [{"image_id": fname, "age": 4, "split": s} for s in ("train", "val", "test")]
+    labels_csv = tmp_path / "labels.csv"
+    pd.DataFrame(rows).to_csv(labels_csv, index=False)
+
+    cfg = _make_cfg(tmp_path, labels_csv, img_dir)
+    cfg.model.use_density_head = True
+    ckpt = _save_mock_checkpoint(cfg, labels_csv, img_dir)
+
+    real_select_increments = _re_module.select_increments
+    captured: dict = {}
+
+    def _spy(grid, axis_info, age, image_h, image_w, **kwargs):
+        captured["grid_shape"] = grid.shape
+        captured["dims"] = (image_h, image_w)
+        return real_select_increments(grid, axis_info, age, image_h, image_w, **kwargs)
+
+    monkeypatch.setattr("src.ring_extraction.select_increments", _spy)
+
+    samples = [{"image_id": fname, "age": 4, "predicted_age": 4}]
+    _compute_axis_data_for_samples(samples, img_dir, cfg, ckpt, tmp_path / "cond")
+
+    assert captured["grid_shape"] == (56 // 14, 56 // 14)   # data.image_size grid, unchanged
+    assert captured["dims"] == (300, 220)                    # full image dims, unchanged

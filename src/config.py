@@ -153,12 +153,41 @@ class InterpretationConfig(BaseModel):
 class CandidatesConfig(BaseModel):
     min_peak_distance: int = Field(5, ge=1)
     prominence_threshold: float = Field(0.1, ge=0.0)
+    # 22.07: fraction of the nucleus->contour radius excluded from candidates (was a
+    # repeated inline default of 0.05 across ~7 ring_extraction.py function signatures —
+    # now a single, explicitly-tunable source of truth threaded through every call site,
+    # so the drawn exclusion-zone visualization can never drift from the actual detection
+    # threshold). Raised from 0.05 after a literature review (ICES/BHARSG Baltic Herring
+    # Age Reading Workshop: the first-year zone "L1" is a variable-width ZONE, not a
+    # point, and mis-assigning the first ring is a documented, known problem for this
+    # species — not a threshold-tuning question this project's data alone can answer).
+    # 0.20 is an EXPLICITLY UNVERIFIED starting point extrapolated from related clupeids
+    # (sardine) and general growth biology (0.15-0.30 plausible range) — no publication
+    # measures this for Baltic herring specifically. See plans and summaries/22.07_TO_DO.MD.
+    inner_margin: float = Field(0.20, ge=0.0, le=0.9)
     # Experimental / diagnostic only. Classical image-based ring detection was
     # evaluated on the current photos (whole otoliths, reflected light) and does
     # NOT reliably recover annual rings — the ring signal is too weak/ambiguous
     # (see plans and summaries/7.07_TO_DO.md, "wynik negatywny"). Kept OFF; the
     # trained model is the ring signal. Revisit only with better imaging.
     detect_image_rings: bool = False
+    # 22.07: higher effective resolution for the DENSITY map ONLY (report/card
+    # generation, not training — CORAL keeps using data.image_size unchanged).
+    # None = use data.image_size (today's behaviour, zero-op). Must be divisible
+    # by data.patch_size when set (validated on OtolithConfig below) — DINOv2
+    # handles arbitrary input resolutions (verified empirically), no retraining
+    # needed.
+    density_image_size: Optional[int] = Field(None, ge=14)
+    # Crop to the segmentation mask's bounding box (padded) BEFORE resizing to
+    # density_image_size, so patches land on the otolith instead of masked-out
+    # background. Off by default (no behaviour change). Only affects the density
+    # forward pass — see run_pipeline.py::_compute_axis_data_for_samples.
+    density_crop_to_otolith: bool = False
+    # 0.02, not a rounder-looking 0.05: measured on 30 real cards that pad_frac=0.05 (of the
+    # box's OWN size) nearly cancels the crop on this dataset's already-tight photo framing
+    # (mean bbox area 96.5% of the full frame vs 82.5% at pad_frac=0.0) — 0.02 keeps most of
+    # the real ~17.5% available reduction while still buffering segmentation imprecision.
+    density_crop_pad_frac: float = Field(0.02, ge=0.0)
 
 
 class SegmentationConfig(BaseModel):
@@ -214,6 +243,16 @@ class OtolithConfig(BaseModel):
     candidates: CandidatesConfig = Field(default_factory=CandidatesConfig)
     segmentation: SegmentationConfig = Field(default_factory=SegmentationConfig)
     demo: DemoConfig = Field(default_factory=DemoConfig)
+
+    @model_validator(mode="after")
+    def density_image_size_divisible(self) -> "OtolithConfig":
+        size = self.candidates.density_image_size
+        if size is not None and size % self.data.patch_size != 0:
+            raise ValueError(
+                f"candidates.density_image_size ({size}) must be divisible by "
+                f"data.patch_size ({self.data.patch_size})"
+            )
+        return self
 
 
 def load_config(path: str | Path) -> OtolithConfig:

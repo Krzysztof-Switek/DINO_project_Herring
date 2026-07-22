@@ -332,9 +332,11 @@ def _compute_axis_data_for_samples(
         detect_axis,
         find_farthest_edge,
         load_mask,
+        mask_bbox,
         resolve_centroid,
         sample_profile_along_axis,
         save_mask,
+        shift_axis_info,
     )
 
     grids: dict = {}
@@ -351,9 +353,14 @@ def _compute_axis_data_for_samples(
     model.eval()
     device = next(model.parameters()).device
     transform = build_transforms(cfg.data.image_size, "test")
+    # (22.07) Separate, optionally-larger transform for the DENSITY candidate-detection
+    # signal only (see need_hires_density below) — cheap to build even when unused.
+    density_transform = build_transforms(
+        cfg.candidates.density_image_size or cfg.data.image_size, "test")
 
     min_dist = cfg.candidates.min_peak_distance
     prominence = cfg.candidates.prominence_threshold
+    inner_margin = cfg.candidates.inner_margin
     n_samples_axis = 50
     walkthrough_iid = _pick_walkthrough_iid(samples, image_dir,
                                             seg_params=cfg.segmentation.as_params())
@@ -461,6 +468,44 @@ def _compute_axis_data_for_samples(
             }
             continue
 
+        # (22.07) Higher-resolution / cropped density signal for CANDIDATE DETECTION only
+        # (select_increments / density_peaks below, and localization_quality.json) — the
+        # panel-4 heatmap and the legacy profile_1d/line_xy fallback right below keep using
+        # `grid` at cfg.data.image_size exactly as before (unchanged visual contract; the
+        # walkthrough section G below also keeps using `grid`, untouched). Zero-op (density_grid
+        # is `grid`, crop offset is 0) unless candidates.density_image_size differs from
+        # data.image_size or candidates.density_crop_to_otolith is set — matches today's
+        # behaviour exactly when neither is configured.
+        density_grid = grid
+        density_axis_info = axis_info
+        dH_img, dW_img = H_img, W_img
+        crop_x0 = crop_y0 = 0
+        need_hires_density = (
+            getattr(model, "use_density_head", False) and hasattr(model, "density_head")
+            and (cfg.candidates.density_crop_to_otolith
+                 or cfg.candidates.density_image_size not in (None, cfg.data.image_size))
+        )
+        if need_hires_density:
+            try:
+                density_source_rgb = orig_rgb
+                d_axis_info = axis_info
+                if cfg.candidates.density_crop_to_otolith and mask_arr is not None:
+                    crop_x0, crop_y0, cw, ch = mask_bbox(
+                        mask_arr, cfg.candidates.density_crop_pad_frac)
+                    density_source_rgb = orig_rgb[crop_y0:crop_y0 + ch, crop_x0:crop_x0 + cw]
+                    d_axis_info = shift_axis_info(axis_info, -crop_x0, -crop_y0)
+                    dH_img, dW_img = ch, cw
+                density_tensor = density_transform(
+                    PILImage.fromarray(density_source_rgb)).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    density_grid = model.get_density_probs(density_tensor).squeeze(0).cpu().numpy()
+                density_axis_info = d_axis_info
+            except Exception as e:
+                print(f"    [cards] density wysokorozdzielcza błąd dla {iid}: {e}")
+                density_grid, density_axis_info = grid, axis_info
+                dH_img, dW_img = H_img, W_img
+                crop_x0 = crop_y0 = 0
+
         profile_1d, line_xy = sample_profile_along_axis(
             grid, axis_info["centroid"], axis_info["far_edge"],
             H_img, W_img, n_samples=n_samples_axis,
@@ -471,9 +516,17 @@ def _compute_axis_data_for_samples(
         # candidates from every ray + the top-`age` consensus increments on the axis.
         from src.ring_extraction import select_increments
         increments = select_increments(
-            grid, axis_info, int(row.get("predicted_age", 0)), H_img, W_img,
-            min_distance=min_dist, prominence=prominence,
+            density_grid, density_axis_info, int(row.get("predicted_age", 0)), dH_img, dW_img,
+            min_distance=min_dist, prominence=prominence, inner_margin=inner_margin,
         )
+        if crop_x0 or crop_y0:
+            # Shift density-sourced points back from crop-relative to full-image pixel
+            # coordinates — see plan §"Dlaczego crop-to-bbox jest bezpieczny": t (normalised
+            # radius) is frame-invariant, only raw (x, y) drawing coordinates need this.
+            increments["final_axis_pts"] = [(x + crop_x0, y + crop_y0)
+                                            for (x, y) in increments["final_axis_pts"]]
+            increments["candidate_pts"] = [(x + crop_x0, y + crop_y0)
+                                           for (x, y) in increments["candidate_pts"]]
         # (21.07) extract_ring_curves/ring_curves no longer computed here — the card panel
         # that drew it was disabled (see src/visualization.py::draw_reasoning_card): a
         # separate, pre-E1 greedy ring extraction, inconsistent with the DP-fused result
@@ -528,16 +581,20 @@ def _compute_axis_data_for_samples(
             from src.visualization import render_localization_overlay
             import base64 as _b64m
             import io as _iom
-            _dpk, _ = density_peaks(grid, axis_info, H_img, W_img,
-                                    min_distance=min_dist, prominence=prominence)
-            _cpk = classical_increments(orig_rgb, axis_info)["peaks"]
+            _dpk, _ = density_peaks(density_grid, density_axis_info, dH_img, dW_img,
+                                    min_distance=min_dist, prominence=prominence,
+                                    inner_margin=inner_margin)
+            if crop_x0 or crop_y0:
+                _dpk = [(t, s, x + crop_x0, y + crop_y0, r) for (t, s, x, y, r) in _dpk]
+            _cpk = classical_increments(orig_rgb, axis_info, inner_margin=inner_margin)["peaks"]
             _age = int(row.get("predicted_age", 0))
             _sc = min(1.0, 360 / max(H_img, W_img))
             _dw, _dh = max(1, int(W_img * _sc)), max(1, int(H_img * _sc))
             for _m in ("density", "classical", "consensus", "dp"):
                 _fr = fuse_increments(_dpk, _cpk, _age, axis_info, method=_m)
                 _ov = render_localization_overlay(orig_rgb, axis_info,
-                                                  _fr["final_axis_pts"], _fr["candidate_pts"])
+                                                  _fr["final_axis_pts"], _fr["candidate_pts"],
+                                                  inner_margin=inner_margin)
                 _b = _iom.BytesIO()
                 PILImage.fromarray(_ov).resize((_dw, _dh)).save(_b, format="PNG")
                 localization_overlays[_m] = {
@@ -563,14 +620,17 @@ def _compute_axis_data_for_samples(
                 _wdw, _wdh = max(1, int(W_img * _wsc)), max(1, int(H_img * _wsc))
                 _wage = int(row.get("predicted_age", 0))
                 _wd = dp_walkthrough_data(grid, orig_rgb, axis_info, H_img, W_img, _wage,
-                                          density_min_distance=min_dist, density_prominence=prominence)
+                                          density_min_distance=min_dist, density_prominence=prominence,
+                                          inner_margin=inner_margin)
                 _p0 = render_patch_grid(orig_rgb, axis_info)          # krok 0: siatka patchy 37×37
                 _p1 = render_rays_and_candidates(orig_rgb, axis_info,
-                                                 _wd["density_pts"], _wd["classical_pts"])
+                                                 _wd["density_pts"], _wd["classical_pts"],
+                                                 inner_margin=inner_margin)
                 # krok 3 przestrzennie: pierścienie-kandydaci (klastry promieni) na otolicie
                 _dring = [c[0] for c in (_wd.get("density_clusters") or [])]
                 _cring = [c[0] for c in (_wd.get("classical_clusters") or [])]
-                _p3 = render_candidate_rings(orig_rgb, axis_info, _dring, _cring)
+                _p3 = render_candidate_rings(orig_rgb, axis_info, _dring, _cring,
+                                             inner_margin=inner_margin)
                 # krok 2: JEDEN promień podświetlony na zdjęciu — obok jego profilu (20.07 pass 2).
                 _p2_list = [render_single_ray(orig_rgb, axis_info, pr["contour_pt"], pr.get("peak_t"))
                            for pr in (_wd.get("sample_profiles") or [])]
@@ -599,9 +659,11 @@ def _compute_axis_data_for_samples(
 
                 # krok 4: dane dla ŻYWEGO widgetu suwaków (prominencja / min-rozstaw DP / t_tol) —
                 # surowe profile promieni; JS przelicza piki→klastry→DP przy KAŻDEJ zmianie suwaka.
-                _p6 = render_localization_overlay(orig_rgb, axis_info, None, None)   # czyste tło (kontur+oś)
+                _p6 = render_localization_overlay(orig_rgb, axis_info, None, None,
+                                                  inner_margin=inner_margin)   # czyste tło (kontur+oś)
                 _interactive = dp_interactive_data(grid, orig_rgb, axis_info, H_img, W_img, _wage,
-                                                   density_min_distance=min_dist)
+                                                   density_min_distance=min_dist,
+                                                   inner_margin=inner_margin)
                 _interactive["img"] = "data:image/png;base64," + _wb64(_p6, (_wdw3, _wdh3))
                 _interactive["w"], _interactive["h"] = _wdw3, _wdh3
                 _icx, _icy = _interactive["centroid"]
@@ -616,6 +678,7 @@ def _compute_axis_data_for_samples(
                     "true_age": int(row.get("age", 0)),
                     "pred_age": _wage,
                     "mask_background": bool(cfg.data.mask_background),
+                    "inner_margin": inner_margin,
                     "panel_patchgrid_b64": _wb64(_p0),
                     "panel_rays_b64": _wb64(_p1),
                     "panel_rings_b64": _wb64(_p3),
@@ -897,11 +960,13 @@ def _step_cards(
             best, image_dir, importance_grids, axis_data,
             cards_dir / "best", "best",
             mask_background=cfg_cond.data.mask_background,
+            inner_margin=cfg_cond.candidates.inner_margin,
         )
         worst_saved = save_reasoning_cards(
             worst, image_dir, importance_grids, axis_data,
             cards_dir / "worst", "worst",
             mask_background=cfg_cond.data.mask_background,
+            inner_margin=cfg_cond.candidates.inner_margin,
         )
         cards["best"].extend(best_saved)
         cards["worst"].extend(worst_saved)

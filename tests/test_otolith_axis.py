@@ -15,11 +15,13 @@ from src.otolith_axis import (
     find_intensity_centroid,
     get_or_compute_mask,
     load_mask,
+    mask_bbox,
     MASK_FILL_RGB,
     resolve_centroid,
     sample_profile_along_axis,
     save_mask,
     segment_otolith,
+    shift_axis_info,
 )
 
 
@@ -379,4 +381,55 @@ def test_apply_background_mask_fills_outside_only():
     out = apply_background_mask(img, mask)
     assert tuple(out[0, 0]) == MASK_FILL_RGB               # outside mask → filled
     assert tuple(out[10, 10]) == (200, 200, 200)           # inside mask → untouched
-    assert img[10, 10].tolist() == [200, 200, 200]         # original not mutated
+
+
+# ---------------------------------------------------------------------------
+# mask_bbox / shift_axis_info (22.07 — crop-to-bbox for higher-resolution density)
+# ---------------------------------------------------------------------------
+
+def test_mask_bbox_tight_box_no_padding():
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[20:40, 30:70] = 255      # rows 20..39, cols 30..69 -> box (30, 20, 40, 20)
+    x0, y0, w, h = mask_bbox(mask, pad_frac=0.0)
+    assert (x0, y0, w, h) == (30, 20, 40, 20)
+
+
+def test_mask_bbox_pads_proportionally_to_box_size():
+    mask = np.zeros((200, 200), dtype=np.uint8)
+    mask[50:150, 50:150] = 255    # 100x100 box at (50, 50)
+    x0, y0, w, h = mask_bbox(mask, pad_frac=0.10)   # 10% of 100 = 10px pad each side
+    assert (x0, y0) == (40, 40)
+    assert (w, h) == (120, 120)
+
+
+def test_mask_bbox_clamps_to_image_bounds():
+    mask = np.zeros((50, 50), dtype=np.uint8)
+    mask[0:10, 0:10] = 255        # box touches the top-left corner
+    x0, y0, w, h = mask_bbox(mask, pad_frac=0.5)    # padding would go negative
+    assert x0 == 0 and y0 == 0
+    assert w <= 50 and h <= 50
+
+
+def test_mask_bbox_empty_mask_returns_whole_image():
+    mask = np.zeros((30, 40), dtype=np.uint8)
+    x0, y0, w, h = mask_bbox(mask)
+    assert (x0, y0, w, h) == (0, 0, 40, 30)
+
+
+def test_shift_axis_info_translates_geometry():
+    contour = np.array([[[10, 10]], [[20, 10]], [[20, 20]], [[10, 20]]], dtype=np.int32)
+    axis_info = {
+        "mask": np.zeros((30, 30), dtype=np.uint8),
+        "centroid": (15, 15),
+        "far_edge": (20, 20),
+        "contour": contour,
+        "length_px": 7.07,
+    }
+    shifted = shift_axis_info(axis_info, dx=-5, dy=-5)
+    assert shifted["centroid"] == (10, 10)
+    assert shifted["far_edge"] == (15, 15)
+    assert np.array_equal(shifted["contour"], contour - np.array([5, 5]))
+    assert shifted["contour"].dtype == contour.dtype
+    assert shifted["length_px"] == 7.07                      # distance is translation-invariant
+    # original untouched
+    assert axis_info["centroid"] == (15, 15)

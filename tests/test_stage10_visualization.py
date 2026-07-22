@@ -521,3 +521,68 @@ def test_render_single_ray_none_axis_info_returns_copy():
     original = np.zeros((H, W, 3), dtype=np.uint8)
     out = render_single_ray(original, None, (10, 10))
     assert out.shape == original.shape
+
+
+# ---------------------------------------------------------------------------
+# draw_nucleus_exclusion_zone (22.07 — visualise the inner_margin candidate-exclusion zone)
+# ---------------------------------------------------------------------------
+
+def test_draw_nucleus_exclusion_zone_changes_pixels_near_centroid_only():
+    from src.visualization import draw_nucleus_exclusion_zone
+    H, W = 120, 200
+    panel = np.full((H, W, 3), 200, dtype=np.uint8)
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    before = panel.copy()
+    draw_nucleus_exclusion_zone(panel, axis_info, inner_margin=0.2)
+    cx, cy = axis_info["centroid"]
+    assert not np.array_equal(panel[cy, cx], before[cy, cx]), "centroid pixel must be tinted"
+    fx, fy = axis_info["far_edge"]
+    assert np.array_equal(panel[fy, fx], before[fy, fx]), "far-edge pixel must stay untouched"
+
+
+def test_draw_nucleus_exclusion_zone_noop_without_axis_info():
+    from src.visualization import draw_nucleus_exclusion_zone
+    panel = np.full((50, 50, 3), 200, dtype=np.uint8)
+    before = panel.copy()
+    draw_nucleus_exclusion_zone(panel, None)
+    assert np.array_equal(panel, before)
+
+
+def test_draw_nucleus_exclusion_zone_noop_when_margin_not_positive():
+    from src.visualization import draw_nucleus_exclusion_zone
+    H, W = 120, 200
+    panel = np.full((H, W, 3), 200, dtype=np.uint8)
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    before = panel.copy()
+    draw_nucleus_exclusion_zone(panel, axis_info, inner_margin=0.0)
+    assert np.array_equal(panel, before)
+
+
+def test_render_localization_overlay_draws_exclusion_zone():
+    from src.visualization import render_localization_overlay
+    H, W = 120, 200
+    original = np.full((H, W, 3), 200, dtype=np.uint8)
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    out = render_localization_overlay(original, axis_info, final_pts=[], candidate_pts=[])
+    cx, cy = axis_info["centroid"]
+    assert not np.array_equal(out[cy, cx], original[cy, cx])
+
+
+def test_render_rays_and_candidates_draws_exclusion_zone():
+    from src.visualization import render_rays_and_candidates
+    H, W = 120, 200
+    original = np.full((H, W, 3), 200, dtype=np.uint8)
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    out = render_rays_and_candidates(original, axis_info, density_pts=[], classical_pts=[])
+    cx, cy = axis_info["centroid"]
+    assert not np.array_equal(out[cy, cx], original[cy, cx])
+
+
+def test_render_candidate_rings_draws_exclusion_zone():
+    from src.visualization import render_candidate_rings
+    H, W = 120, 200
+    original = np.full((H, W, 3), 200, dtype=np.uint8)
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    out = render_candidate_rings(original, axis_info, density_ring_ts=[], classical_ring_ts=[])
+    cx, cy = axis_info["centroid"]
+    assert not np.array_equal(out[cy, cx], original[cy, cx])

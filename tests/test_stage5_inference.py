@@ -328,3 +328,24 @@ def test_load_checkpoint_warns_on_missing_keys(tmp_path):
 
     with pytest.warns(RuntimeWarning):
         load_model_from_checkpoint(cfg, ckpt_path, backbone=_MockDinoBackbone())
+
+
+def test_load_checkpoint_drops_shape_mismatched_keys_instead_of_crashing(tmp_path):
+    """22.07: a sub-module architecture change (e.g. a layer inserted inside `head`,
+    shifting every subsequent key's shape) must NOT hard-crash the load — the mismatched
+    keys are dropped (that sub-module randomly initialised, with a warning), exactly like
+    the existing missing-key case, not a RuntimeError from torch's strict loader."""
+    from src.inference import load_model_from_checkpoint
+    cfg = _make_cfg(tmp_path)
+    model = _make_model(cfg)
+    state = model.state_dict()
+    # Corrupt a head weight's shape in place (simulates an architecture change) —
+    # plain strict=False would still raise on this (shape mismatch, not a missing key).
+    head_key = next(k for k in state if k.startswith("head.") and state[k].dim() >= 1)
+    state[head_key] = state[head_key].unsqueeze(0)   # shape now wrong on every dim
+    ckpt_path = tmp_path / "shape_mismatch.pt"
+    torch.save({"model_state_dict": state, "epoch": 1}, ckpt_path)
+
+    with pytest.warns(RuntimeWarning, match="shape-mismatched"):
+        loaded = load_model_from_checkpoint(cfg, ckpt_path, backbone=_MockDinoBackbone())
+    assert loaded is not None   # did not raise

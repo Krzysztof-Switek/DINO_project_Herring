@@ -96,6 +96,22 @@ interpretation:
 candidates:
   min_peak_distance: 5            # min patch-distance between candidate increments
   prominence_threshold: 0.1
+  # 22.07: podniesione z 0.05 po przeglądzie literatury (ICES/BHARSG Baltic Herring Age
+  # Reading Workshop — pierwsza strefa roczna L1 to zmienna-szerokościowo STREFA, nie punkt;
+  # mylenie pierwszego pierścienia z fałszywym "checkiem" to udokumentowany problem u
+  # śledzia). 0.20 to JAWNIE NIEZWERYFIKOWANY dla śledzia bałtyckiego punkt startowy
+  # (0.15-0.30 z ekstrapolacji sardynki/biologii wzrostu, nie zmierzona wartość) — patrz
+  # plans and summaries/22.07_TO_DO.MD.
+  inner_margin: 0.20
+  # 22.07: wyższa efektywna rozdzielczość TYLKO dla density (wykrywanie kandydatów na
+  # kartach + localization_quality.json) — inference-time, nie trening; CORAL dalej liczy
+  # się na data.image_size (518), zero ryzyka dla wieku. Pierwsza próba, do skalibrowania.
+  density_image_size: 728         # 728/14=52 -> 52x52=2704 patchy (~2x dzisiejszych 1369)
+  density_crop_to_otolith: true   # crop do bbox maski PRZED skalowaniem — patche nie marnują
+                                  # się na tło (dziś tylko zamalowane, nadal zajmuje miejsce w siatce)
+  density_crop_pad_frac: 0.02     # zmierzone na 30 kartach (22.07): 0.05 zjadał niemal cały dostępny
+                                  # margines (bbox 96.5% ramki); 0.02 zostawia realne ~11% przycięcia
+                                  # przy wciąż bezpiecznym buforze na niedoskonałość segmentacji
 
 segmentation:                     # otolith outline detection (src/otolith_axis.py)
   method: radial                  # radial (smooth, reaches faint rim) | threshold (Otsu+hysteresis fallback)

@@ -407,6 +407,53 @@ def find_farthest_edge(
     return int(round(fx)), int(round(fy))
 
 
+def mask_bbox(mask: np.ndarray, pad_frac: float = 0.05) -> tuple[int, int, int, int]:
+    """Bounding box of the mask's non-zero pixels, padded and clamped to the image.
+
+    Padding is ``pad_frac`` of the box's own width/height on each side (not a fixed
+    pixel count), so a small otolith gets a small margin and a large one a large
+    margin — analogous to the existing ``inner_margin``/``edge_margin`` convention
+    in ``ring_extraction.py``: segmentation is never pixel-perfect, so a fixed
+    buffer beyond the raw mask edge avoids clipping genuine near-boundary signal
+    (register-token/edge artifacts aside — this is about not cutting the crop
+    exactly at the mask's own edge).
+
+    Returns ``(x0, y0, w, h)``. Degenerates to the whole image when the mask is
+    empty (caller can then skip cropping without special-casing).
+    """
+    H, W = mask.shape[:2]
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return 0, 0, W, H
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    pad_x = int(round((x1 - x0 + 1) * pad_frac))
+    pad_y = int(round((y1 - y0 + 1) * pad_frac))
+    nx0, ny0 = max(0, x0 - pad_x), max(0, y0 - pad_y)
+    nx1, ny1 = min(W, x1 + 1 + pad_x), min(H, y1 + 1 + pad_y)
+    return nx0, ny0, nx1 - nx0, ny1 - ny0
+
+
+def shift_axis_info(axis_info: dict, dx: int, dy: int) -> dict:
+    """Copy of ``axis_info`` with ``centroid``/``far_edge``/``contour`` translated
+    by ``(dx, dy)`` — e.g. to express full-image geometry in a cropped sub-image's
+    coordinate frame (``dx, dy = -x0, -y0`` of that crop's bounding box).
+
+    ``mask``/``length_px``/other keys are carried over unchanged (``length_px`` is
+    a distance, translation-invariant; ``mask`` is not meaningful post-crop and
+    callers of the cropped path don't consume it).
+    """
+    out = dict(axis_info)
+    cx, cy = axis_info["centroid"]
+    out["centroid"] = (cx + dx, cy + dy)
+    if axis_info.get("far_edge") is not None:
+        fx, fy = axis_info["far_edge"]
+        out["far_edge"] = (fx + dx, fy + dy)
+    if axis_info.get("contour") is not None:
+        out["contour"] = axis_info["contour"] + np.array([dx, dy], dtype=axis_info["contour"].dtype)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # High-level entry point
 # ---------------------------------------------------------------------------

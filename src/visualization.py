@@ -321,6 +321,42 @@ def _draw_hollow_points(panel: np.ndarray, points, color, radius: int) -> None:
         cv2.circle(panel, (int(x), int(y)), r, color, max(1, r // 3))
 
 
+_NUCLEUS_ZONE_COLOR = (220, 0, 0)   # red — same as _BAD_FRAME, consistent file palette
+
+
+def draw_nucleus_exclusion_zone(
+    panel: np.ndarray, axis_info: Optional[dict], inner_margin: float = 0.05,
+    n_dirs: int = 48, alpha: float = 0.32,
+) -> None:
+    """Semi-transparent red fill over the ``inner_margin`` zone around the nucleus (in place).
+
+    Same threshold ``_radial_peaks``/``_all_ray_peaks`` (``src/ring_extraction.py``) use to
+    reject candidates too close to the centroid (``t < inner_margin``) — projects the SAME
+    per-direction ratio the rest of the codebase uses (``centroid + t·(contour_pt −
+    centroid)``) across ``n_dirs`` directions and fills the resulting closed polygon, so the
+    drawn zone matches exactly what candidate detection excludes, not a generic circle. No-op
+    when geometry is unavailable (mirrors every other ``_draw_*``/``render_*`` helper's
+    graceful-degradation convention in this file).
+    """
+    if axis_info is None or inner_margin <= 0:
+        return
+    contour, centroid = axis_info.get("contour"), axis_info.get("centroid")
+    if contour is None or centroid is None:
+        return
+    cx, cy = centroid
+    cpts = contour.reshape(-1, 2)
+    if len(cpts) < 3:
+        return
+    idx = np.linspace(0, len(cpts) - 1, min(n_dirs, len(cpts)), dtype=int)
+    base = cpts[idx].astype(np.float64)
+    pts = np.stack([cx + inner_margin * (base[:, 0] - cx),
+                    cy + inner_margin * (base[:, 1] - cy)], axis=1
+                   ).astype(np.int32).reshape(-1, 1, 2)
+    overlay = panel.copy()
+    cv2.fillPoly(overlay, [pts], _NUCLEUS_ZONE_COLOR)
+    cv2.addWeighted(overlay, alpha, panel, 1.0 - alpha, 0, dst=panel)
+
+
 # ---------------------------------------------------------------------------
 # Reasoning card
 # ---------------------------------------------------------------------------
@@ -376,6 +412,7 @@ def draw_reasoning_card(
     ring_curves: Optional[list] = None,
     classical_pts: Optional[list] = None,
     image_name: str = "",
+    inner_margin: float = 0.05,
 ) -> np.ndarray:
     """Compose a 6-panel reasoning card (3 columns × 2 rows) — two rows = two heads.
 
@@ -501,6 +538,7 @@ def draw_reasoning_card(
     # Panel 5 — kandydaci
     if axis_info is not None:
         panel5 = original_rgb.copy()
+        draw_nucleus_exclusion_zone(panel5, axis_info, inner_margin=inner_margin)
         # Dorysuj 48 osi jądro→kontur (20.07) — POKAZUJE, skąd biorą się kandydaci: piki
         # sygnału wzdłuż każdego z 48 promieni (per-promień normalizacja + find_peaks).
         _contour = axis_info.get("contour")
@@ -521,6 +559,7 @@ def draw_reasoning_card(
     # Panel 6 — finalne przyrosty (N = wiek)
     if axis_info is not None:
         panel6 = original_rgb.copy()
+        draw_nucleus_exclusion_zone(panel6, axis_info, inner_margin=inner_margin)
         _draw_contour(panel6)
         cx, cy = axis_info["centroid"]
         fx, fy = axis_info["far_edge"]
@@ -536,11 +575,14 @@ def draw_reasoning_card(
         # Legenda znaczników (20.07) — żeby czerwone/zielone/krzyż były jednoznaczne.
         _legend_items = [(_FINAL_COLOR, True, "finalne (N=wiek)"),
                          (_CLASSICAL_COLOR, False, "klasyka (OpenCV)"),
-                         (_AXIS_COLOR, None, "os pomiaru")]
+                         (_AXIS_COLOR, None, "os pomiaru"),
+                         (_NUCLEUS_ZONE_COLOR, "zone", "strefa jadra")]
         _ly, _fs = max(10, H // 40), max(0.4, H / 900.0)
         for _col, _filled, _txt in _legend_items:
             if _filled is None:
                 cv2.line(panel6, (8, _ly - 4), (22, _ly - 4), _col, max(2, H // 300))
+            elif _filled == "zone":
+                cv2.rectangle(panel6, (8, _ly - 10), (22, _ly + 2), _col, -1)
             elif _filled:
                 cv2.circle(panel6, (15, _ly - 4), max(4, H // 150), _col, -1)
             else:
@@ -594,6 +636,7 @@ def render_localization_overlay(
     axis_info: Optional[dict],
     final_pts: Optional[list],
     candidate_pts: Optional[list] = None,
+    inner_margin: float = 0.05,
 ) -> np.ndarray:
     """RGB overlay for one localisation method: contour + axis + candidates + finals.
 
@@ -605,6 +648,7 @@ def render_localization_overlay(
     H = img.shape[0]
     lt = max(2, H // 300)
     if axis_info is not None:
+        draw_nucleus_exclusion_zone(img, axis_info, inner_margin=inner_margin)
         contour = axis_info.get("contour")
         if contour is not None:
             cv2.drawContours(img, [contour], -1, _CONTOUR_COLOR, lt)
@@ -628,6 +672,7 @@ def render_rays_and_candidates(
     density_pts: Optional[list],
     classical_pts: Optional[list],
     n_dirs: int = 48,
+    inner_margin: float = 0.05,
 ) -> np.ndarray:
     """Panel 1 of the DP walkthrough: otolith + ``n_dirs`` faint rays nucleus→contour,
     with density candidates (yellow) and classical candidates (green) at their pixels.
@@ -639,6 +684,7 @@ def render_rays_and_candidates(
     H = img.shape[0]
     lt = max(2, H // 300)
     if axis_info is not None:
+        draw_nucleus_exclusion_zone(img, axis_info, inner_margin=inner_margin, n_dirs=n_dirs)
         contour = axis_info.get("contour")
         centroid = axis_info.get("centroid")
         if contour is not None and centroid is not None:
@@ -715,7 +761,7 @@ def render_patch_grid(image: np.ndarray, axis_info: Optional[dict],
 def render_candidate_rings(image: np.ndarray, axis_info: Optional[dict],
                            density_ring_ts: Optional[list],
                            classical_ring_ts: Optional[list],
-                           n_dirs: int = 48) -> np.ndarray:
+                           n_dirs: int = 48, inner_margin: float = 0.05) -> np.ndarray:
     """Krok 3 walkthrough (przestrzennie): pierścienie-kandydaci narysowane NA otolicie.
     Każdy klaster promienia ``t`` (pomarańczowy pas z histogramu) rzutujemy na wszystkie 48
     kierunków (jądro→kontur na ułamku ``t``) i łączymy w zamkniętą krzywą — „tu, na tych
@@ -729,6 +775,7 @@ def render_candidate_rings(image: np.ndarray, axis_info: Optional[dict],
     centroid = axis_info.get("centroid")
     if contour is None or centroid is None:
         return img
+    draw_nucleus_exclusion_zone(img, axis_info, inner_margin=inner_margin, n_dirs=n_dirs)
     cx, cy = float(centroid[0]), float(centroid[1])
     cpts = contour.reshape(-1, 2)
     idx = np.linspace(0, len(cpts) - 1, min(n_dirs, len(cpts)), dtype=int)
@@ -762,6 +809,7 @@ def save_reasoning_cards(
     label: str,
     *,
     mask_background: bool = False,
+    inner_margin: float = 0.05,
 ) -> list[Path]:
     """Generate and save reasoning cards for a list of prediction samples.
 
@@ -779,6 +827,9 @@ def save_reasoning_cards(
                       OtolithDataset) before drawing — cards must show what the model
                       actually saw, or they visibly contradict the masked-training story
                       (21.07 user report). No-op when a sample's mask is unavailable.
+    inner_margin    : forwarded to draw_reasoning_card's nucleus-exclusion-zone overlay —
+                      must match the value actually used for candidate detection
+                      (cfg.candidates.inner_margin) or the drawn zone would be misleading.
 
     Returns
     -------
@@ -823,6 +874,7 @@ def save_reasoning_cards(
             ring_curves=axis.get("ring_curves"),
             classical_pts=axis.get("classical_pts"),
             image_name=str(image_id),
+            inner_margin=inner_margin,
         )
 
         stem = Path(image_id).stem

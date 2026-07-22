@@ -130,17 +130,31 @@ def load_model_from_checkpoint(
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
         ckpt = torch.load(checkpoint_path, map_location=device)
+    state_dict = dict(ckpt["model_state_dict"])
+    model_shapes = model.state_dict()
+    # Drop keys whose SHAPE no longer matches the current architecture — e.g. inserting a
+    # layer inside a sub-module (density_head's LayerNorm, 22.07) shifts every subsequent
+    # key's shape. Plain strict=False only tolerates missing/unexpected KEYS, not a shape
+    # mismatch on a key present in both, and would otherwise hard-crash instead of falling
+    # back to random init for just the changed sub-module (same spirit as the missing-key
+    # case below — that sub-module needs retraining, the rest of the checkpoint is fine).
+    shape_mismatched = [k for k in state_dict
+                        if k in model_shapes and state_dict[k].shape != model_shapes[k].shape]
+    for k in shape_mismatched:
+        del state_dict[k]
     # strict=False allows loading old checkpoints that don't have patch_head
     # (the new MIL head will then be randomly initialised — retraining needed).
-    result = model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    if result.missing_keys or result.unexpected_keys:
+    result = model.load_state_dict(state_dict, strict=False)
+    if result.missing_keys or result.unexpected_keys or shape_mismatched:
         import warnings
         warnings.warn(
             "Checkpoint loaded non-strictly: "
             f"{len(result.missing_keys)} missing key(s), "
-            f"{len(result.unexpected_keys)} unexpected key(s). "
+            f"{len(result.unexpected_keys)} unexpected key(s), "
+            f"{len(shape_mismatched)} shape-mismatched key(s) dropped. "
             "Affected layers are randomly initialised — retrain before trusting outputs. "
-            f"(missing={result.missing_keys[:5]}, unexpected={result.unexpected_keys[:5]})",
+            f"(missing={result.missing_keys[:5]}, unexpected={result.unexpected_keys[:5]}, "
+            f"shape_mismatched={shape_mismatched[:5]})",
             RuntimeWarning,
             stacklevel=2,
         )

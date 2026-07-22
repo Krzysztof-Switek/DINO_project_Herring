@@ -250,6 +250,69 @@ def test_mask_background_cache_reused_on_second_access(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# DensityFineTuneDataset (22.07 — fine-tune density_head at density_image_size/crop)
+# ---------------------------------------------------------------------------
+
+def test_density_finetune_dataset_requires_mask_background(ellipse_data, tmp_path):
+    from src.dataset import DensityFineTuneDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _make_cfg()
+    cfg.data.mask_background = False
+    with pytest.raises(ValueError, match="mask_background"):
+        DensityFineTuneDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+
+def test_density_finetune_dataset_uses_density_image_size(ellipse_data, tmp_path):
+    """Output image shape follows density_image_size, not cfg.data.image_size."""
+    from src.dataset import DensityFineTuneDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _make_cfg()
+    cfg.data.image_size = 56
+    cfg.data.mask_background = True
+    cfg.data.mask_cache_dir = str(tmp_path / "masks_cache")
+    ds = DensityFineTuneDataset(cfg, "train", density_image_size=112, crop_to_otolith=False,
+                                labels_csv=str(csv_path), image_dir=str(img_dir))
+    assert ds[0]["image"].shape == (3, 112, 112)
+
+
+def test_density_finetune_dataset_none_size_falls_back_to_data_image_size(ellipse_data, tmp_path):
+    from src.dataset import DensityFineTuneDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _make_cfg()
+    cfg.data.image_size = 56
+    cfg.data.mask_background = True
+    cfg.data.mask_cache_dir = str(tmp_path / "masks_cache")
+    ds = DensityFineTuneDataset(cfg, "train", density_image_size=None,
+                                labels_csv=str(csv_path), image_dir=str(img_dir))
+    assert ds[0]["image"].shape == (3, 56, 56)
+
+
+def test_density_finetune_dataset_crop_changes_output_vs_uncropped(ellipse_data, tmp_path):
+    """crop_to_otolith=True must actually change what's fed to the model (the crop
+    removes background the uncropped path would still include) — split='test' to
+    avoid train-time random flip/jitter making the two runs differ for unrelated reasons."""
+    import pandas as pd
+    csv_path, img_dir = ellipse_data
+    df = pd.read_csv(csv_path)
+    df["split"] = "test"
+    df.to_csv(csv_path, index=False)
+
+    from src.dataset import DensityFineTuneDataset
+    cfg = _make_cfg()
+    cfg.data.mask_background = True
+    cfg.data.mask_cache_dir = str(tmp_path / "masks_cache")
+
+    ds_uncropped = DensityFineTuneDataset(cfg, "test", density_image_size=112,
+                                          crop_to_otolith=False,
+                                          labels_csv=str(csv_path), image_dir=str(img_dir))
+    ds_cropped = DensityFineTuneDataset(cfg, "test", density_image_size=112,
+                                        crop_to_otolith=True,
+                                        labels_csv=str(csv_path), image_dir=str(img_dir))
+    assert not torch.allclose(ds_uncropped[0]["image"], ds_cropped[0]["image"])
+    assert ds_cropped[0]["image"].shape == (3, 112, 112)
+
+
+# ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
 

@@ -56,6 +56,18 @@ def test_invalid_splits_raise_error() -> None:
         DataConfig(train_split=0.8, val_split=0.3, test_split=0.3)
 
 
+def test_density_image_size_must_be_divisible_by_patch_size() -> None:
+    """22.07: candidates.density_image_size (separate, higher-res density-only forward
+    pass) must be divisible by data.patch_size, same rule as data.image_size."""
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(candidates={"density_image_size": 701}, data={"patch_size": 14})
+    # divisible value + None (off) both valid
+    OtolithConfig(candidates={"density_image_size": 728}, data={"patch_size": 14})
+    OtolithConfig(candidates={"density_image_size": None})
+
+
 def test_entrypoint_info_mode(tmp_path) -> None:
     from src.entrypoint import run
     code = run(["--config", str(CONFIG_PATH), "--mode", "info"])

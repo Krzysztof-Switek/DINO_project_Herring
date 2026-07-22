@@ -12,7 +12,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 from src.config import OtolithConfig
-from src.otolith_axis import apply_background_mask, get_or_compute_mask
+from src.otolith_axis import apply_background_mask, get_or_compute_mask, mask_bbox
 
 REQUIRED_COLUMNS = {"image_id", "age", "split"}
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
@@ -276,3 +276,58 @@ class OtolithDataset(Dataset):
     def metadata_dim(self) -> int:
         """Number of metadata features returned per sample."""
         return len(self.metadata_cols) if self.use_metadata else 0
+
+
+# ---------------------------------------------------------------------------
+# Density-head fine-tuning dataset (22.07)
+# ---------------------------------------------------------------------------
+
+class DensityFineTuneDataset(OtolithDataset):
+    """Like ``OtolithDataset``, but resizes to ``density_image_size`` (not
+    ``cfg.data.image_size``) and optionally crops to the segmentation mask's bounding
+    box FIRST — mirrors the inference-time density signal built in
+    ``scripts/run_pipeline.py::_compute_axis_data_for_samples`` (Zmiana A+B, 22.07), so
+    ``density_head`` can be fine-tuned on exactly the patch-grid distribution it will see
+    at report-generation time (a measured train/inference resolution mismatch — see
+    ``plans and summaries/22.07_TO_DO.MD``).
+
+    Requires ``cfg.data.mask_background=True`` — reuses the same mask cache/segmentation
+    as the main dataset (``OtolithDataset._mask_background``), just applied inline here
+    since cropping needs the raw mask array, not only the masked image.
+    """
+
+    def __init__(
+        self,
+        cfg: OtolithConfig,
+        split: str = "train",
+        density_image_size: Optional[int] = None,
+        crop_to_otolith: bool = False,
+        pad_frac: float = 0.05,
+        **kwargs,
+    ) -> None:
+        self.crop_to_otolith = crop_to_otolith
+        self.pad_frac = pad_frac
+        size = density_image_size or cfg.data.image_size
+        transform = kwargs.pop("transform", None) or build_transforms(size, split)
+        super().__init__(cfg, split=split, transform=transform, **kwargs)
+        if not self.mask_background:
+            raise ValueError("DensityFineTuneDataset requires cfg.data.mask_background=True")
+
+    def _load_image(self, image_id: str) -> torch.Tensor:
+        path = self.img_dir / image_id
+        if not path.exists():
+            for ext in IMAGE_EXTENSIONS:
+                candidate = self.img_dir / (image_id + ext)
+                if candidate.exists():
+                    path = candidate
+                    break
+        image = Image.open(path).convert("RGB")
+        rgb = np.array(image, dtype=np.uint8)
+        cache_path = self.mask_cache_dir / f"{Path(image_id).stem}_mask.png"
+        mask = get_or_compute_mask(rgb, cache_path, seg_params=self.cfg.segmentation.as_params())
+        if mask is not None:
+            rgb = apply_background_mask(rgb, mask)
+            if self.crop_to_otolith:
+                x0, y0, w, h = mask_bbox(mask, self.pad_frac)
+                rgb = rgb[y0:y0 + h, x0:x0 + w]
+        return self.transform(Image.fromarray(rgb))

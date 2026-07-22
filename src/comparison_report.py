@@ -682,15 +682,28 @@ density (rząd 2, środek)</b> — łatwo je porównać.</p>
   <li><b>Kandydaci</b> — <b>żółte kropki</b> = piki sygnału wzdłuż <b>48 promieni</b> z jądra
       (rysowane cienkie promienie). Piki liczone są po <b>normalizacji każdego promienia
       osobno</b>, więc kandydaci ujawniają strukturę wnętrza, której mapa density (wartości
-      absolutne) może nie pokazywać. Niebieski krzyżyk = jądro, żółta oś pomiaru.</li>
+      absolutne) może nie pokazywać. Niebieski krzyżyk = jądro, żółta oś pomiaru.
+      <b>Półprzeźroczysta czerwona strefa</b> wokół jądra = obszar (<code>inner_margin</code>),
+      z którego kandydaci NIGDY nie są wybierane — kropki nigdy tam nie wchodzą.</li>
   <li><b>Mapa density</b> — <b>prawdopodobieństwo przyrostu na patch</b> (siatka 37×37;
       odsprzęgnięta głowica density, uczona słabo — samą liczbą wieku). Nowa kolorystyka:
       gorące punkty się wybijają, reszta pokazuje otolit.</li>
   <li><b>Finalne (N = wiek)</b> — <b>czerwone kropki</b> = wybrane przyrosty rzutowane na oś
       pomiaru (liczba = wiek; po naprawie grupowania z 20.07 liczba zgadza się z wiekiem).
       <b>Zielone puste okręgi</b> = piki klasyczne (OpenCV) — kontrola „model vs technik".
-      Panel ma <b>legendę</b> znaczników.</li>
+      Ta sama <b>czerwona strefa jądra</b> co w panelu kandydatów. Panel ma <b>legendę</b> znaczników.</li>
 </ol>
+<p style="font-size:90%;color:#444;">
+  <b>Skąd bierze się rozmiar czerwonej strefy jądra.</b> Granica strefy (<code>inner_margin</code>,
+  ułamek promienia jądro→kontur) NIE jest dopasowana do tego, co akurat wygląda sensownie w danych tego
+  projektu — oparto ją na przeglądzie literatury rybackiej (protokół ICES/BHARSG — Baltic Herring Age
+  Reading Workshop): pierwsza strefa roczna otolitu śledzia (L1) to udokumentowana strefa o ZMIENNEJ
+  szerokości, nie punkt, a mylenie pierwszego prawdziwego pierścienia z fałszywym „checkiem" blisko jądra
+  to znany, powtarzający się problem także dla doświadczonych czytających. Aktualna wartość jest jawnie
+  oznaczona jako niezweryfikowany dla śledzia bałtyckiego punkt startowy (ekstrapolacja z pokrewnych
+  gatunków i ogólnej biologii wzrostu, nie zmierzona liczba) — patrz
+  <code>plans and summaries/22.07_TO_DO.MD</code>.
+</p>
 <p style="font-size:90%;color:#444;">
   <b>Wiek (werdykt) vs pozycje przyrostów.</b> Werdykt wiekowy pochodzi z głowicy
   <b>liczącej</b> (CORAL, rząd 1), a kropki/finalne z głowicy <b>lokalizującej</b> (density,
@@ -1236,6 +1249,8 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
     d = payload["data"]
     age = int(payload.get("pred_age", 0))
     gap = float(d.get("dp_min_gap", 0.04))
+    inner_margin = float(payload.get("inner_margin", 0.05))
+    _ZONE_HEX = "#dc0000"   # same red as visualization.py's _NUCLEUS_ZONE_COLOR (220, 0, 0)
 
     # --- Panel 2: JEDEN promień na zdjęciu + jego profil (znormalizowany), obok siebie ---
     # 20.07 pass 2: dawniej same wykresy w oderwaniu od obrazu ("którego to promienia?"). Teraz
@@ -1250,6 +1265,7 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         for j, pr in enumerate(profiles):
             fig, ax = plt.subplots(figsize=(3.4, 2.6))
             t = _np.asarray(pr["t"]); norm = _np.asarray(pr["norm"])
+            ax.axvspan(0, inner_margin, color=_ZONE_HEX, alpha=0.15, zorder=0)
             ax.fill_between(t, 0, norm, color="#2a78d6", alpha=0.18)
             ax.plot(t, norm, color="#2a78d6", lw=1.7)
             for pt in pr.get("peak_t", []):
@@ -1277,6 +1293,7 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
     if dpk or cpk:
         from matplotlib.patches import Patch
         fig, ax = plt.subplots(figsize=(9, 2.6))
+        ax.axvspan(0, inner_margin, color=_ZONE_HEX, alpha=0.15, zorder=0)
         dt = [p[0] for p in dpk]
         ct = [p[0] for p in cpk]
         # Density = solid fill; klasyka = hatched OUTLINE only (no fill) — overlapping bins stay
@@ -1299,6 +1316,8 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         handles, labels = ax.get_legend_handles_labels()
         handles.append(Patch(facecolor="#c58a00", alpha=0.3, edgecolor="#c58a00", linestyle="--",
                              label="klaster (pierścień-kandydat, z density)"))
+        handles.append(Patch(facecolor=_ZONE_HEX, alpha=0.15,
+                             label=f"strefa jądra, inner_margin={inner_margin:.2f}"))
         ax.legend(handles=handles, fontsize=8)
         fig.tight_layout()
         vote_b64 = _fig_to_b64(fig)
@@ -1392,7 +1411,9 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
                 'mapy density modelu, <b>zielone</b> = z klasyki (jasność obrazu). Cyjan = '
                 'kontur, żółta linia = oś pomiaru. Piki liczymy po <b>normalizacji każdego '
                 'promienia osobno</b> — dlatego kandydaci mogą ujawnić strukturę wnętrza, '
-                'której mapa density (wartości absolutne) nie pokazuje.'
+                'której mapa density (wartości absolutne) nie pokazuje. <b>Półprzeźroczysta '
+                'czerwona strefa</b> wokół jądra = <code>inner_margin</code> — stąd kandydaci '
+                'nigdy nie są wybierane (skąd bierze się rozmiar tej strefy — patrz sekcja E).'
                 f'<br>{_img_tag(p1_b64, "400px")}</div>')
         html += _html_block("Krok 1 — jak model dzieli obraz i skąd biorą się kandydaci",
                             "", _side_by_side)
@@ -1418,7 +1439,8 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         "Krok 3b — pierścienie-kandydaci na otolicie",
         "Te same skupiska rzutowane na zdjęcie: każdy klaster promienia to <b>pierścień</b> "
         "(ułamek <code>t</code> drogi jądro→kontur we wszystkich 48 kierunkach). <b>Żółte</b> = "
-        "z density, <b>zielone</b> = z klasyki. Od razu widać, gdzie pojawiają się pierścienie-kandydaci.",
+        "z density, <b>zielone</b> = z klasyki. Od razu widać, gdzie pojawiają się pierścienie-kandydaci. "
+        "<b>Czerwona strefa</b> wokół jądra = <code>inner_margin</code>, jak w Kroku 1.",
         payload.get("panel_rings_b64", ""), width="340px")
     html += _fig_block(
         "Krok 4 — score pierścieni i wybór finalny",
