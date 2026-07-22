@@ -23,9 +23,12 @@ model:
   use_density_head: true          # false = stare zachowanie (tylko MIL do lokalizacji)
   density_count_weight: 1.0       # waga straty density w sumie
   density_conc_weight: 1.0        # człon koncentracji (rozbija rozmyte rozwiązanie)
-  density_tv_weight: 0.0          # N+2a (16.07): TV WYŁĄCZONE. Bieg 15.07_rx (TV=0.1) miał density martwe 22/26 epok
-                                  # — TV zdusiła aktywację na starcie. TV=0 izoluje wpływ backbone _reg na lokalizację
-                                  # (porównywalne z 13.07, też TV=0). Liczone na patches.detach() (wiek bezpieczny).
+  density_tv_weight: 0.03         # N+3 (22.07): pierwsza próba ponownego włączenia TV, teraz MAŁE. Poprzedni pomiar
+                                  # "TV dusi density" (15.07_rx, TV=0.1) był SPRZED maskowania tła; 20.07_reg
+                                  # (maskowanie, TV=0) obudziło density już @epoka 10 (nie 23) — maskowanie mogło
+                                  # samo rozwiązać problem, który TV kiedyś pogarszał. Sprawdzić w logu tego biegu,
+                                  # czy wczesne budzenie się utrzymuje; jeśli się cofnie → wrócić do 0.0.
+                                  # Liczone na patches.detach() (wiek bezpieczny).
 
 data:
   image_dir: Z:/Photo/Otolithes/HER/Processed
@@ -55,6 +58,10 @@ training:
   weight_decay: 1.0e-4
   scheduler: cosine               # cosine | step | none
   freeze_backbone_epochs: 5       # freeze DINOv2 for first N epochs
+  density_lr_mult: 2.0            # N+3 (22.07): pierwsza próba — density_head na stop-gradiencie budzi się
+                                  # późno i dostawał dotąd ten sam LR co CORAL/MIL (które już działają dobrze);
+                                  # 2.0 = szybsza nauka WYŁĄCZNIE tej głowicy, zero wpływu na backbone/wiek.
+                                  # Wartość do skalibrowania po tym biegu, nie ostateczna.
   early_stopping_patience: 8      # N+1 (15.07 Tor B0): 15→8. Bieg 13.07 dobił do e52, a plateau było ~e26/e37
                                   # (patience liczy od EMA-best); 8 → stop ~e45, bez niedouczenia (EMA chroni przed szumem val_mae)
   early_stopping_metric: val_mae  # val_mae (zalecane) | val_loss

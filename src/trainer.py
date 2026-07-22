@@ -77,19 +77,32 @@ class Trainer:
         Fine-tuning a pretrained ViT works best when the backbone is updated more
         gently than the freshly-initialised heads (discriminative learning rate).
         ``backbone_lr_mult == 1.0`` reproduces the old uniform-LR behaviour.
+
+        The density head (Kierunek B, stop-gradient) additionally gets its OWN LR
+        group (``density_lr_mult``) — it wakes up later than CORAL/MIL and, being
+        stop-gradient, a faster LR here can never destabilise the shared backbone
+        or the age head. No-op (2 groups, old behaviour) when the model has no
+        density head.
         """
         lr = self.cfg.training.lr
         wd = self.cfg.training.weight_decay
         backbone_lr = lr * self.cfg.training.backbone_lr_mult
 
         backbone_ids = {id(p) for p in self.model.backbone.parameters()}
+        density_ids = ({id(p) for p in self.model.density_head.parameters()}
+                       if hasattr(self.model, "density_head") else set())
         backbone_params = [p for p in self.model.parameters() if id(p) in backbone_ids]
-        head_params = [p for p in self.model.parameters() if id(p) not in backbone_ids]
+        density_params = [p for p in self.model.parameters() if id(p) in density_ids]
+        head_params = [p for p in self.model.parameters()
+                       if id(p) not in backbone_ids and id(p) not in density_ids]
 
         groups = [
             {"params": head_params, "lr": lr},
             {"params": backbone_params, "lr": backbone_lr},
         ]
+        if density_params:
+            density_lr = lr * self.cfg.training.density_lr_mult
+            groups.append({"params": density_params, "lr": density_lr})
         return torch.optim.AdamW(groups, lr=lr, weight_decay=wd)
 
     def _build_scheduler(self) -> Optional[object]:

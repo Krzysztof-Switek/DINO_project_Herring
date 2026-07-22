@@ -244,7 +244,14 @@ class OtolithModel(nn.Module):
         # reshapes the backbone. Independent of head_type — can ride on top of coral/both.
         self.use_density_head = bool(getattr(cfg.model, "use_density_head", False))
         if self.use_density_head:
+            # LayerNorm first: `_reg` backbones flatten the patch-token norm
+            # distribution (that's how they suppress the register-token artifact),
+            # which may rob density of a useful ranking signal derived from raw
+            # norm scale. Normalising the input removes that scale-dependence
+            # regardless — cheap, and safe since this head is stop-gradient (see
+            # forward()): it can only ever affect density_head's own weights.
             self.density_head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
                 nn.Linear(embed_dim, cfg.model.mil_hidden_dim),
                 nn.GELU(),
                 nn.Dropout(p=cfg.model.dropout),

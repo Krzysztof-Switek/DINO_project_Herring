@@ -468,6 +468,17 @@ def test_density_count_loss_positive_scalar_with_grad():
     assert loss.requires_grad
 
 
+def test_density_head_starts_with_layer_norm():
+    """22.07: density_head's first layer must be LayerNorm(embed_dim) — normalises
+    patch-token scale before the head's own Linear (regression guard for the
+    architecture change, since density_head is accessed generically elsewhere via
+    .parameters()/.state_dict(), which wouldn't catch a missing/reordered layer)."""
+    model = _make_density_model()
+    first = model.density_head[0]
+    assert isinstance(first, torch.nn.LayerNorm)
+    assert first.normalized_shape == (model.density_head[1].in_features,)
+
+
 def test_density_head_stop_gradient_blocks_backbone():
     """CRITICAL: density loss must NOT update the backbone (age head stays safe)."""
     from src.model import density_count_loss

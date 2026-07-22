@@ -531,6 +531,27 @@ def test_optimizer_has_discriminative_lr(tmp_path):
     assert lrs[0] < lrs[1]   # backbone_lr (lr * backbone_lr_mult) < head_lr
 
 
+def test_optimizer_gives_density_head_its_own_lr_group(tmp_path):
+    """22.07: with use_density_head=True, density_head params get a 3rd param group
+    at lr * density_lr_mult — distinct from both backbone_lr and the CORAL/MIL head
+    lr. Without a density head, behaviour is unchanged (2 groups, other test)."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path, epochs=1)
+    cfg.model.use_density_head = True
+    cfg.training.density_lr_mult = 2.0
+    model = _make_model(cfg)
+    trainer = Trainer(cfg, model, _make_loader(), _make_loader())
+    groups = trainer.optimizer.param_groups
+    assert len(groups) == 3
+    lrs = sorted(g["lr"] for g in groups)
+    expected = sorted([
+        cfg.training.lr,
+        cfg.training.lr * cfg.training.backbone_lr_mult,
+        cfg.training.lr * cfg.training.density_lr_mult,
+    ])
+    assert lrs == pytest.approx(expected)
+
+
 def test_fit_ema_selection_runs_and_saves_best(tmp_path):
     """early_stopping_ema>0 path (13.07): fit completes and writes best.pt via smoothed metric."""
     trainer = _make_trainer(tmp_path, epochs=3)

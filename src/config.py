@@ -89,6 +89,10 @@ class TrainingConfig(BaseModel):
     # Discriminative LR: pretrained backbone is fine-tuned at lr * this factor,
     # the freshly-initialised heads at the full lr. 1.0 => uniform LR (old behaviour).
     backbone_lr_mult: float = Field(0.1, ge=0.0, le=1.0)
+    # Separate LR multiplier for the density head (Kierunek B), applied on top of
+    # the base `lr` — independent of backbone_lr_mult. 1.0 => same LR as the other
+    # heads (old behaviour). No-op when the model has no density head.
+    density_lr_mult: float = Field(1.0, ge=0.0)
     early_stopping_patience: int = Field(10, ge=0)
     early_stopping_metric: Literal["val_mae", "val_loss"] = "val_mae"
     early_stopping_min_delta: float = Field(0.001, ge=0.0)
