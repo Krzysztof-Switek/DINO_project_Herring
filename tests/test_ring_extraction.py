@@ -55,6 +55,50 @@ def test_extract_ring_curves_flat_is_empty():
     assert extract_ring_curves(flat, axis_info, H, W) == []
 
 
+# ---------------------------------------------------------------------------
+# polar_averaged_increments (E3, 21.07 — angularly-averaged alternative candidate source)
+# ---------------------------------------------------------------------------
+
+def test_polar_averaged_increments_finds_bands():
+    """On a symmetric elliptical otolith, the angularly-averaged profile must recover
+    both concentric bands near their true t (same synthetic used for extract_rings)."""
+    from src.ring_extraction import polar_averaged_increments
+    prob, axis_info, H, W = _synthetic(bands=(0.4, 0.75))
+    out = polar_averaged_increments(prob, axis_info, H, W, n_dirs=36,
+                                    min_distance=1, prominence=0.1)
+    assert len(out["peak_t"]) >= 2
+    assert any(abs(t - 0.4) < 0.08 for t in out["peak_t"])
+    assert any(abs(t - 0.75) < 0.08 for t in out["peak_t"])
+    assert len(out["profile"]) > 0
+    assert all(len(c) == 3 for c in out["clusters"])   # (mean_t, n_dirs, mean_strength)
+
+
+def test_polar_averaged_increments_excludes_edge_band():
+    """Same edge_margin convention as every other candidate source: a band at t≈0.97
+    must be dropped."""
+    from src.ring_extraction import polar_averaged_increments
+    prob, axis_info, H, W = _synthetic(bands=(0.5, 0.97))
+    out = polar_averaged_increments(prob, axis_info, H, W, n_dirs=36,
+                                    min_distance=1, prominence=0.1, edge_margin=0.08)
+    assert all(t <= 0.92 for t in out["peak_t"])
+    assert any(abs(t - 0.5) < 0.08 for t in out["peak_t"])
+
+
+def test_polar_averaged_increments_flat_is_empty():
+    from src.ring_extraction import polar_averaged_increments
+    prob, axis_info, H, W = _synthetic()
+    flat = np.full_like(prob, 0.5)
+    out = polar_averaged_increments(flat, axis_info, H, W)
+    assert out["peak_t"] == [] and out["clusters"] == []
+
+
+def test_polar_averaged_increments_no_axis_is_graceful():
+    from src.ring_extraction import polar_averaged_increments
+    prob, _axis_info, H, W = _synthetic()
+    out = polar_averaged_increments(prob, None, H, W)
+    assert out == {"profile": [], "peak_t": [], "clusters": []}
+
+
 def test_draw_ring_curves_modifies_panel():
     from src.ring_extraction import extract_ring_curves, draw_ring_curves
     prob, axis_info, H, W = _synthetic(bands=(0.4, 0.75))

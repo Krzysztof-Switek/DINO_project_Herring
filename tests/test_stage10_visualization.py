@@ -236,6 +236,40 @@ def test_draw_reasoning_card_p0_enrichments():
     assert card.ndim == 3 and card.shape[1] == 3 * W and card.shape[0] > 2 * H
 
 
+# ---------------------------------------------------------------------------
+# _robust_grid_range (E4, 21.07: mask-eroded percentile range for heat panels)
+# ---------------------------------------------------------------------------
+
+def test_robust_grid_range_ignores_boundary_outlier_with_mask():
+    """A single extreme value hugging the mask boundary must NOT set the colour-scale
+    ceiling when a mask is given — exactly the register-token/edge-artifact pattern
+    found on a real card (21.07_run_analiza.md §5b: one patch 6x any other)."""
+    from src.visualization import _robust_grid_range
+    Hp, Wp = 20, 20
+    arr = np.full((Hp, Wp), 1.0, dtype=np.float32)      # mild interior background
+    arr[10, 10] = 5.0                                    # a real, moderate interior signal
+    arr[0, 0] = 500.0                                     # extreme outlier at the corner (boundary)
+    mask = np.zeros((Hp, Wp), dtype=np.uint8)
+    mask[2:18, 2:18] = 255                                # interior region — excludes the corner
+
+    lo_masked, hi_masked = _robust_grid_range(arr, mask, erosion_iters=1)
+    lo_full, hi_full = _robust_grid_range(arr, None)
+
+    assert hi_full >= 100, "sanity: without a mask the outlier dominates the range"
+    assert hi_masked < 10, "with a mask, the eroded-interior range must ignore the corner outlier"
+
+
+def test_robust_grid_range_matches_plain_percentile_without_mask():
+    """No mask given → identical to the old, unmasked full-grid percentile behaviour
+    (regression: this function must not change anything when mask=None)."""
+    from src.visualization import _robust_grid_range
+    rng = np.random.default_rng(0)
+    arr = rng.random((15, 15)).astype(np.float32)
+    lo, hi = _robust_grid_range(arr, None)
+    assert lo == pytest.approx(float(np.percentile(arr, 2.0)))
+    assert hi == pytest.approx(float(np.percentile(arr, 98.0)))
+
+
 def test_classical_increments_multi_ray_on_gray():
     """classical_increments (E1): piki intensywności na tych samych 48 promieniach; graceful bez osi."""
     import numpy as np

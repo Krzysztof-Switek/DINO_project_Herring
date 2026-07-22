@@ -604,6 +604,58 @@ def classical_increments(
             "clusters": _cluster_by_radius(peaks, t_tol)}
 
 
+def polar_averaged_increments(
+    gray_image, axis_info: dict, image_h: int, image_w: int,
+    *, n_dirs: int = 48, n_samples: int = 64, smooth_sigma: float = 0.0,
+    min_distance: int = 1, prominence: float = 0.02,
+    inner_margin: float = 0.05, edge_margin: float = 0.08,
+) -> dict:
+    """E3 (``16.07_lokalizacja_przyrostów.md`` Tier 1): a SINGLE angularly-averaged
+    radial profile — the polar-transform idea (pierścienie → poziome linie w obrazie
+    polarnym) — as an alternative classical candidate source, to compare against the
+    default per-ray ``classical_increments`` (many independent per-ray peaks).
+
+    Deliberately NOT a literal ``cv2.warpPolar`` at a fixed physical radius: that warps
+    well for roughly circular shapes, but averaging raw pixels at a fixed physical
+    radius across all angles would mix real otolith signal (long-radius directions)
+    with background (short-radius directions) for a strongly non-circular, scalloped,
+    "tailed" contour like ours — exactly the otolith shape seen throughout this
+    project's cards. Instead this averages the SAME per-ray profiles
+    ``classical_increments``/``_all_ray_peaks`` already sample, each already normalised
+    to ITS OWN [0,1] jądro→kontur range — equivalent to a polar warp where every row
+    (ray) is stretched to the same length before averaging, so only real interior
+    otolith pixels ever contribute at a given normalised radius ``t``, regardless of
+    that ray's physical length.
+
+    Returns dict: ``profile`` (n_samples,) averaged+renormalised signal, ``peak_t``
+    (peak positions, t=0..1, falling-edge shifted like every other candidate source),
+    ``clusters`` — kept as a single ``(mean_t, n_dirs, mean_strength)`` per peak (there
+    is only ONE profile, so "support" isn't meaningful the way it is for per-ray
+    clustering; n_dirs is reported as a reminder how many rays informed the average).
+    """
+    profiles, _line_xys, _contour_pts = _all_ray_profiles(
+        gray_image, axis_info, image_h, image_w,
+        n_dirs=n_dirs, n_samples=n_samples, smooth_sigma=smooth_sigma)
+    valid = [p for p in profiles if p is not None]
+    if not valid:
+        return {"profile": [], "peak_t": [], "clusters": []}
+    avg = np.mean(np.stack(valid), axis=0)
+    rng = float(avg.max() - avg.min())
+    norm = (avg - avg.min()) / rng if rng > 1e-6 else np.zeros_like(avg)
+
+    peak_t: List[float] = []
+    if rng > 1e-6:
+        idxs, _ = find_peaks(norm, distance=max(1, int(min_distance)), prominence=float(prominence))
+        for idx in idxs:
+            t_orig = idx / max(1, n_samples - 1)
+            if t_orig < inner_margin or t_orig > 1.0 - edge_margin:
+                continue
+            edge_idx = _shift_peak_to_falling_edge(norm, int(idx))
+            peak_t.append(float(edge_idx / max(1, n_samples - 1)))
+    clusters = [(t, len(valid), float(norm[int(round(t * (n_samples - 1)))])) for t in peak_t]
+    return {"profile": norm.tolist(), "peak_t": peak_t, "clusters": clusters}
+
+
 def density_peaks(
     prob_grid, axis_info: dict, image_h: int, image_w: int,
     *, n_dirs: int = 48, n_samples: int = 64, min_distance: int = 3,

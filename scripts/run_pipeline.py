@@ -317,6 +317,7 @@ def _compute_axis_data_for_samples(
         grids:     ``{image_id → (H_p, W_p) ndarray}``
         axis_data: ``{image_id → {mask, axis_info, peak_indices, line_xy, profile_1d}}``
     """
+    import cv2
     import numpy as np
     import torch
     from PIL import Image as PILImage
@@ -327,6 +328,7 @@ def _compute_axis_data_for_samples(
     from src.interpretation import (compute_patch_importance, compute_coral_gradcam,
                                      compute_cls_attention, compute_cls_attention_patched)
     from src.otolith_axis import (
+        apply_background_mask,
         detect_axis,
         find_farthest_edge,
         load_mask,
@@ -367,7 +369,58 @@ def _compute_axis_data_for_samples(
             continue
         try:
             img_pil = PILImage.open(img_path).convert("RGB")
-            tensor = transform(img_pil).unsqueeze(0).to(device)
+        except Exception as e:
+            print(f"    [cards] błąd dla {iid}: {e}")
+            continue
+
+        # --- Resolve axis/mask FIRST: cached mask → re-derive centroid/far_edge; else
+        # segment. Moved ahead of the model forward pass (was after it) so the mask is
+        # available to build the model's MASKED input below — training feeds the model a
+        # masked image when cfg.data.mask_background is on (src/dataset.py), and cards must
+        # match, or density/attention/attn_bg_frac silently measure a different input
+        # distribution than the model actually trained/runs on (20.07 gap). ---
+        orig_rgb = np.array(img_pil, dtype=np.uint8)
+        H_img, W_img = orig_rgb.shape[:2]
+        stem = Path(iid).stem
+        mask_path = mask_dir / f"{stem}_mask.png"
+
+        axis_info = None
+        mask_arr = load_mask(mask_path)
+        if mask_arr is not None:
+            cent = resolve_centroid(orig_rgb, mask_arr, cfg.segmentation.nucleus_method)
+            far = find_farthest_edge(mask_arr, cent) if cent else None
+            if cent and far:
+                contours, _ = cv2.findContours(mask_arr, cv2.RETR_EXTERNAL,
+                                                cv2.CHAIN_APPROX_NONE)
+                if contours:
+                    contour = max(contours, key=cv2.contourArea)
+                    axis_info = {
+                        "mask":      mask_arr,
+                        "centroid":  cent,
+                        "far_edge":  far,
+                        "contour":   contour,
+                        "length_px": float(np.hypot(far[0] - cent[0],
+                                                     far[1] - cent[1])),
+                    }
+        if axis_info is None:
+            axis_info = detect_axis(orig_rgb, seg_params=cfg.segmentation.as_params(),
+                                    nucleus_method=cfg.segmentation.nucleus_method)
+            if axis_info is not None:
+                mask_arr = axis_info["mask"]
+                save_mask(mask_arr, mask_path)
+
+        # Mask the background when the model was trained on masked input (graceful
+        # fallback to the unmasked image if segmentation failed — same fallback
+        # OtolithDataset uses). 21.07: this now overwrites `orig_rgb` itself — every
+        # panel/overlay/photo shown in the report must match what the model actually
+        # received, or the report visibly contradicts its own "masked training" story
+        # (user report). Ray-sampled classical signal is unaffected either way (rays
+        # never leave the mask interior), so this is a purely additive, safe change.
+        if cfg.data.mask_background and mask_arr is not None:
+            orig_rgb = apply_background_mask(orig_rgb, mask_arr)
+
+        try:
+            tensor = transform(PILImage.fromarray(orig_rgb)).unsqueeze(0).to(device)
             with torch.no_grad():
                 # Localisation signal: prefer the DECOUPLED density map (Kierunek B) when
                 # the model has one, else the MIL / L2 importance map.
@@ -396,38 +449,6 @@ def _compute_axis_data_for_samples(
             print(f"    [cards] błąd dla {iid}: {e}")
             continue
 
-        # --- Resolve axis: cached mask → re-derive centroid/far_edge; else segment ---
-        orig_rgb = np.array(img_pil, dtype=np.uint8)
-        H_img, W_img = orig_rgb.shape[:2]
-        stem = Path(iid).stem
-        mask_path = mask_dir / f"{stem}_mask.png"
-
-        import cv2
-        axis_info = None
-        mask_arr = load_mask(mask_path)
-        if mask_arr is not None:
-            cent = resolve_centroid(orig_rgb, mask_arr, cfg.segmentation.nucleus_method)
-            far = find_farthest_edge(mask_arr, cent) if cent else None
-            if cent and far:
-                contours, _ = cv2.findContours(mask_arr, cv2.RETR_EXTERNAL,
-                                                cv2.CHAIN_APPROX_NONE)
-                if contours:
-                    contour = max(contours, key=cv2.contourArea)
-                    axis_info = {
-                        "mask":      mask_arr,
-                        "centroid":  cent,
-                        "far_edge":  far,
-                        "contour":   contour,
-                        "length_px": float(np.hypot(far[0] - cent[0],
-                                                     far[1] - cent[1])),
-                    }
-        if axis_info is None:
-            axis_info = detect_axis(orig_rgb, seg_params=cfg.segmentation.as_params(),
-                                    nucleus_method=cfg.segmentation.nucleus_method)
-            if axis_info is not None:
-                mask_arr = axis_info["mask"]
-                save_mask(mask_arr, mask_path)
-
         if axis_info is None:
             failed_axes += 1
             # CORAL panels (Grad-CAM, uwaga CLS, werdykt) NIE potrzebują osi — pokaż je
@@ -448,13 +469,15 @@ def _compute_axis_data_for_samples(
 
         # Multi-axis increment localisation with count = predicted_age (11.07 Punkt 7):
         # candidates from every ray + the top-`age` consensus increments on the axis.
-        from src.ring_extraction import select_increments, extract_ring_curves
+        from src.ring_extraction import select_increments
         increments = select_increments(
             grid, axis_info, int(row.get("predicted_age", 0)), H_img, W_img,
             min_distance=min_dist, prominence=prominence,
         )
-        # Ring CURVES from the probability map (drawn on the MIL/density card panel).
-        ring_curves = extract_ring_curves(grid, axis_info, H_img, W_img)
+        # (21.07) extract_ring_curves/ring_curves no longer computed here — the card panel
+        # that drew it was disabled (see src/visualization.py::draw_reasoning_card): a
+        # separate, pre-E1 greedy ring extraction, inconsistent with the DP-fused result
+        # shown elsewhere and only ever populated on a subset of cards (user report).
 
         # OpenCV reference (Kierunek A): downscaled image + axis + CLASSICAL intensity
         # profile along the axis (sampled from the original grayscale, not the model),
@@ -561,27 +584,38 @@ def _compute_axis_data_for_samples(
                     PILImage.fromarray(arr).resize(size).save(_bb, format="PNG")
                     return _b64w.b64encode(_bb.getvalue()).decode("ascii")
 
-                _wsc2 = min(1.0, 300 / max(H_img, W_img))
+                # Krok 2 (jeden promień + wykres) wyświetlany o 50% większy w raporcie (21.07,
+                # user report: "za małe") — renderować w nieco wyższej rozdzielczości niż
+                # docelowy rozmiar wyświetlania, żeby powiększenie nie rozmazało obrazu.
+                _wsc2 = min(1.0, 360 / max(H_img, W_img))
                 _wdw2, _wdh2 = max(1, int(W_img * _wsc2)), max(1, int(H_img * _wsc2))
+
+                # Krok 4 (interaktywny widget, dwa canvasy) w większej rozdzielczości niż
+                # statyczne panele Kroku 0/1/3b (21.07: "krok 5 za małe") — osobna skala,
+                # bo canvas renderuje się 1:1 (brak CSS-owego przeskalowania w dół jak przy
+                # <img>), więc rozmiar pikselowy = rozmiar wyświetlany.
+                _wsc3 = min(1.0, 560 / max(H_img, W_img))
+                _wdw3, _wdh3 = max(1, int(W_img * _wsc3)), max(1, int(H_img * _wsc3))
 
                 # krok 4: dane dla ŻYWEGO widgetu suwaków (prominencja / min-rozstaw DP / t_tol) —
                 # surowe profile promieni; JS przelicza piki→klastry→DP przy KAŻDEJ zmianie suwaka.
                 _p6 = render_localization_overlay(orig_rgb, axis_info, None, None)   # czyste tło (kontur+oś)
                 _interactive = dp_interactive_data(grid, orig_rgb, axis_info, H_img, W_img, _wage,
                                                    density_min_distance=min_dist)
-                _interactive["img"] = "data:image/png;base64," + _wb64(_p6)
-                _interactive["w"], _interactive["h"] = _wdw, _wdh
+                _interactive["img"] = "data:image/png;base64," + _wb64(_p6, (_wdw3, _wdh3))
+                _interactive["w"], _interactive["h"] = _wdw3, _wdh3
                 _icx, _icy = _interactive["centroid"]
-                _interactive["centroid"] = [int(round(_icx * _wsc)), int(round(_icy * _wsc))]
+                _interactive["centroid"] = [int(round(_icx * _wsc3)), int(round(_icy * _wsc3))]
                 _ifx, _ify = _interactive["far_edge"]
-                _interactive["far_edge"] = [int(round(_ifx * _wsc)), int(round(_ify * _wsc))]
-                _interactive["contour_pts"] = [[int(round(x * _wsc)), int(round(y * _wsc))]
+                _interactive["far_edge"] = [int(round(_ifx * _wsc3)), int(round(_ify * _wsc3))]
+                _interactive["contour_pts"] = [[int(round(x * _wsc3)), int(round(y * _wsc3))]
                                                for (x, y) in _interactive["contour_pts"]]
 
                 walkthrough_payload = {
                     "image_id": iid,
                     "true_age": int(row.get("age", 0)),
                     "pred_age": _wage,
+                    "mask_background": bool(cfg.data.mask_background),
                     "panel_patchgrid_b64": _wb64(_p0),
                     "panel_rays_b64": _wb64(_p1),
                     "panel_rings_b64": _wb64(_p3),
@@ -606,7 +640,6 @@ def _compute_axis_data_for_samples(
             "coral_gradcam":  coral_gc_grid,
             "cls_attention":  cls_attn_grid,
             "cls_is_fallback": cls_is_fallback,
-            "ring_curves":    ring_curves,
             "classical_pts":  classical_pts,
             "localization_overlays": localization_overlays,
         }
@@ -863,10 +896,12 @@ def _step_cards(
         best_saved = save_reasoning_cards(
             best, image_dir, importance_grids, axis_data,
             cards_dir / "best", "best",
+            mask_background=cfg_cond.data.mask_background,
         )
         worst_saved = save_reasoning_cards(
             worst, image_dir, importance_grids, axis_data,
             cards_dir / "worst", "worst",
+            mask_background=cfg_cond.data.mask_background,
         )
         cards["best"].extend(best_saved)
         cards["worst"].extend(worst_saved)

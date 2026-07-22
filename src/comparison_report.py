@@ -395,9 +395,18 @@ def _confusion_matrix_b64(y_true, y_pred, label: str) -> str:
     row_sums = cm.sum(axis=1, keepdims=True)
     cm_norm = cm / np.maximum(row_sums, 1)
 
-    side = max(3.6, n * 0.42)
+    # Diagonal (correct) cells get a DIFFERENT colour family (green) than off-diagonal
+    # (blue) — otherwise "correct" is only findable by mentally tracing the diagonal
+    # position, easy to miss at a glance (21.07 user report).
+    blues, greens = plt.get_cmap("Blues"), plt.get_cmap("Greens")
+    rgb = np.zeros((n, n, 3))
+    for i in range(n):
+        for j in range(n):
+            rgb[i, j] = (greens if i == j else blues)(cm_norm[i, j])[:3]
+
+    side = max(5.5, n * 0.55)
     fig, ax = plt.subplots(figsize=(side, side))
-    ax.imshow(cm_norm, cmap="Blues", vmin=0.0, vmax=1.0)
+    ax.imshow(rgb)
     ax.set_xticks(range(n)); ax.set_xticklabels(ages, fontsize=6)
     ax.set_yticks(range(n)); ax.set_yticklabels(ages, fontsize=6)
     ax.set_xlabel("Wiek przewidziany")
@@ -580,12 +589,17 @@ def _plots_per_condition(results: dict, condition_labels: dict) -> str:
                  'zwykle tam, gdzie n małe (rzadkie, starsze ryby).</p>')
 
     if confusion_figs:
+        # Width scales with how many matrices share the row — a single-condition report
+        # (the common case) gets one BIG matrix instead of being capped at 32% ("za
+        # mała", 21.07 user report); 2+ conditions still fit side by side.
+        _col_max = "700px" if len(confusion_figs) == 1 else f"{max(30, 95 // len(confusion_figs))}%"
         html += "<div style='display:flex;gap:8px;flex-wrap:wrap;'>"
         for b64 in confusion_figs:
-            html += f'<div style="max-width:32%">{_img_tag(b64, "100%")}</div>'
+            html += f'<div style="max-width:{_col_max}">{_img_tag(b64, "100%")}</div>'
         html += "</div>"
         html += ('<p class="cap">Macierz pomyłek: wiersz = wiek rzeczywisty, kolumna = '
-                 'przewidziany; kolor = udział wiersza, liczba = #obrazów. Idealnie wszystko '
+                 'przewidziany; kolor = udział wiersza (<b>zielone</b> = trafne na przekątnej, '
+                 '<b>niebieskie</b> = pomyłki), liczba = #obrazów. Idealnie wszystko zielone '
                  'na przekątnej.</p>')
 
     return html
@@ -690,7 +704,13 @@ density (rząd 2, środek)</b> — łatwo je porównać.</p>
         for p in paths:
             b64 = _load_png_b64(p)
             if b64:
-                html += _img_tag(b64, "95%") + "<br>"
+                # Cards are 3 cols x 2 rows, each cell at the ORIGINAL photo's aspect
+                # ratio — so a card row's displayed height = (card_width/3) * (H/W).
+                # Krok 1 (section G) shows that same photo at 400px width, so to match
+                # a card'S ROW height to Krok 1's displayed photo height exactly:
+                # card_width = 3 * 400 = 1200px (21.07 user report: 650px was too small,
+                # 95%/~1330px made one row taller than the screen).
+                html += _img_tag(b64, "1200px") + "<br>"
     html += "</section>"
     return html
 
@@ -1247,8 +1267,8 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
             ray_b64 = ray_imgs[j] if j < len(ray_imgs) else ""
             krok2_html += '<div style="display:inline-block;vertical-align:top;margin:4px 10px 4px 0;">'
             if ray_b64:
-                krok2_html += _img_tag(ray_b64, "230px") + "<br>"
-            krok2_html += _img_tag(chart_b64, "230px") + "</div>"
+                krok2_html += _img_tag(ray_b64, "345px") + "<br>"
+            krok2_html += _img_tag(chart_b64, "345px") + "</div>"
 
     # --- Panel 3: głosowanie po promieniu (piki density vs klasyka, x=t) ---
     dpk = d.get("density_peaks") or []
@@ -1347,20 +1367,35 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         f'na <b>48 promieniach</b> (density modelu + klasyka obrazu) wybieramy '
         f'finalne przyrosty (czerwone).{note}</p>'
     )
-    html += _fig_block(
-        "Krok 0 — jak model dzieli obraz (siatka patchy 37×37)",
-        "DINOv2 tnie wejście na <b>nienakładające się kwadraty 14×14 px → siatka 37×37</b>. "
-        "Głowica density daje <b>jedną liczbę na kwadracik</b> (nie na piksel) — stąd kanciasta "
-        "rozdzielczość mapy. To pokazuje, jak grubo model widzi przyrosty.",
-        payload.get("panel_patchgrid_b64", ""))
-    html += _fig_block(
-        "Krok 1 — kandydaci ze wszystkich 48 kierunków",
-        "Z jądra (niebieski krzyżyk) rzucamy 48 promieni do konturu. Wzdłuż każdego szukamy pików: "
-        "<b>żółte</b> = z mapy density modelu, <b>zielone</b> = z klasyki (jasność obrazu). "
-        "Cyjan = kontur, żółta linia = oś pomiaru. Piki liczymy po <b>normalizacji każdego promienia "
-        "osobno</b> — dlatego kandydaci mogą ujawnić strukturę wnętrza, której mapa density (wartości "
-        "absolutne) nie pokazuje.",
-        payload.get("panel_rays_b64", ""))
+    _masked_note = (
+        " Tło jest wygaszone (jednolite wypełnienie) — dokładnie to, co widzi model: "
+        "wejście jest maskowane przed treningiem (<code>mask_background</code>)."
+        if payload.get("mask_background") else "")
+    p0_b64, p1_b64 = payload.get("panel_patchgrid_b64", ""), payload.get("panel_rays_b64", "")
+    if p0_b64 or p1_b64:
+        # inline-block (not flex) — the same proven pattern Krok 2's image+chart pairs
+        # already use below; flex placed these two columns one under the other for the
+        # user instead of side-by-side (21.07 report).
+        _col_style = 'display:inline-block;vertical-align:top;width:400px;margin:4px 16px 12px 0;'
+        _side_by_side = ""
+        if p0_b64:
+            _side_by_side += (
+                f'<div style="{_col_style}"><b>Siatka patchy (37×37)</b> — DINOv2 tnie wejście na '
+                '<b>nienakładające się kwadraty 14×14 px</b>. Głowica density daje <b>jedną '
+                'liczbę na kwadracik</b> (nie na piksel) — stąd kanciasta rozdzielczość mapy. '
+                'To pokazuje, jak grubo model widzi przyrosty.'
+                f'{_masked_note}<br>{_img_tag(p0_b64, "400px")}</div>')
+        if p1_b64:
+            _side_by_side += (
+                f'<div style="{_col_style}"><b>Kandydaci ze wszystkich 48 kierunków</b> — z jądra (niebieski krzyżyk) '
+                'rzucamy 48 promieni do konturu. Wzdłuż każdego szukamy pików: <b>żółte</b> = z '
+                'mapy density modelu, <b>zielone</b> = z klasyki (jasność obrazu). Cyjan = '
+                'kontur, żółta linia = oś pomiaru. Piki liczymy po <b>normalizacji każdego '
+                'promienia osobno</b> — dlatego kandydaci mogą ujawnić strukturę wnętrza, '
+                'której mapa density (wartości absolutne) nie pokazuje.'
+                f'<br>{_img_tag(p1_b64, "400px")}</div>')
+        html += _html_block("Krok 1 — jak model dzieli obraz i skąd biorą się kandydaci",
+                            "", _side_by_side)
     html += _html_block(
         "Krok 2 — jeden promień: obraz i jego profil",
         "Bierzemy sygnał wzdłuż jednego promienia (jądro→brzeg, <b>czerwona linia</b> na zdjęciu) "
@@ -1384,7 +1419,7 @@ def _section_localization_walkthrough(payload: dict | None) -> str:
         "Te same skupiska rzutowane na zdjęcie: każdy klaster promienia to <b>pierścień</b> "
         "(ułamek <code>t</code> drogi jądro→kontur we wszystkich 48 kierunkach). <b>Żółte</b> = "
         "z density, <b>zielone</b> = z klasyki. Od razu widać, gdzie pojawiają się pierścienie-kandydaci.",
-        payload.get("panel_rings_b64", ""))
+        payload.get("panel_rings_b64", ""), width="340px")
     html += _fig_block(
         "Krok 4 — score pierścieni i wybór finalny",
         "Score pierścienia = ile kierunków go widziało × siła; gdy density i klasyka zgadzają się "

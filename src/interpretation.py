@@ -290,7 +290,14 @@ def importance_to_heatmap_2d(
 # Saving helpers
 # ---------------------------------------------------------------------------
 
-DEFAULT_COLORMAP = cv2.COLORMAP_INFERNO
+# INFERNO's low end is near-black — indistinguishable from the dark bands/shadows already
+# present in otolith photos, so a low-signal region and "no signal, showing raw dark photo"
+# looked identical (21.07 user report). JET's low end is a vivid, saturated blue that never
+# occurs naturally in these grayish/tan/dark-blue-grey photos — any colour tint at all means
+# real signal, not photo content. (Known JET downsides — perceptual non-uniformity, false
+# banding — matter less here: this is a "where does attention/density fall" diagnostic
+# overlay, not a precision measurement readout.)
+DEFAULT_COLORMAP = cv2.COLORMAP_JET
 
 
 def apply_colormap_with_mask(

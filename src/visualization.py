@@ -27,7 +27,6 @@ from src.interpretation import (
     apply_colormap_with_mask,
     importance_to_heatmap_2d,
 )
-from src.ring_extraction import draw_ring_curves
 
 # Colors (RGB)
 _AXIS_COLOR     = (255, 220, 0)     # yellow — measurement axis
@@ -326,6 +325,37 @@ def _draw_hollow_points(panel: np.ndarray, points, color, radius: int) -> None:
 # Reasoning card
 # ---------------------------------------------------------------------------
 
+def _robust_grid_range(arr: np.ndarray, mask: Optional[np.ndarray] = None,
+                       erosion_iters: int = 2) -> tuple[float, float]:
+    """2nd/98th percentile of ``arr``, restricted to an ERODED mask interior when a
+    mask is given (E4, 21.07).
+
+    A single extreme patch hugging the mask boundary — the classic register-token /
+    preparation-edge artifact signature (verified on a real card:
+    ``plans and summaries/21.07_run_analiza.md`` §5b, one patch 6x stronger than any
+    other) — otherwise sets the colour scale for the WHOLE map, washing out real
+    interior variation. Eroding the mask by a couple of grid cells before computing the
+    percentile range excludes that outer rim from the range calculation; it does NOT
+    change what is drawn/masked (alpha still uses the full, un-eroded mask) or touch
+    candidate/peak detection (``_all_ray_peaks``) at all — display-only.
+    """
+    interior = arr
+    if mask is not None:
+        Hp, Wp = arr.shape[:2]
+        mask_small = cv2.resize(np.asarray(mask, dtype=np.uint8), (Wp, Hp),
+                                interpolation=cv2.INTER_NEAREST)
+        eroded = cv2.erode(mask_small, np.ones((3, 3), np.uint8), iterations=erosion_iters)
+        if int(eroded.sum()) >= 10:
+            interior = arr[eroded > 0]
+    lo, hi = float(np.percentile(interior, 2.0)), float(np.percentile(interior, 98.0))
+    if hi <= lo:
+        # Degenerate (near-flat) interior — fall back to that SAME interior's true
+        # min/max, not the full (possibly outlier-containing) arr, or a flat interior
+        # would silently let the excluded boundary outlier back in as the ceiling.
+        lo, hi = float(interior.min()), float(interior.max())
+    return lo, hi
+
+
 def draw_reasoning_card(
     original_rgb: np.ndarray,
     importance_grid: np.ndarray,
@@ -389,9 +419,7 @@ def draw_reasoning_card(
         if grid is None:
             return _placeholder_panel(H, W, "niedostepne")
         arr = np.asarray(grid, dtype=np.float32)
-        lo, hi = float(np.percentile(arr, 2.0)), float(np.percentile(arr, 98.0))
-        if hi <= lo:
-            lo, hi = float(arr.min()), float(arr.max())
+        lo, hi = _robust_grid_range(arr, mask)
         norm = np.clip((arr - lo) / (hi - lo + 1e-9), 0.0, 1.0)
         hm = cv2.resize(norm, (W, H), interpolation=cv2.INTER_LINEAR).clip(0.0, 1.0)
         bgr = cv2.applyColorMap((hm * 255).astype(np.uint8), DEFAULT_COLORMAP)
@@ -464,10 +492,12 @@ def draw_reasoning_card(
     cv2.rectangle(panel3, (0, 0), (W - 1, H - 1), frame_color, max(3, line_thickness * 2))
 
     # ===== Rząd 2 — GŁOWICA LOKALIZACJI (density) =====
-    has_rings = bool(ring_curves) and len(ring_curves) >= 2   # 1 „pierścień" = zwykle artefakt konturu
     panel4 = _heat_panel(importance_grid, robust=True)   # mapa density (odporna na dominujący outlier)
-    if has_rings:                            # krzywe pierścieni tylko gdy jest ich sensowny zestaw
-        draw_ring_curves(panel4, ring_curves, thickness=max(2, H // 300))
+    # (21.07) `ring_curves` (extract_ring_curves) NIE jest już tu rysowane — to starsza,
+    # niezależna ekstrakcja pierścieni wprost z mapy density (greedy chaining po `t`,
+    # sprzed naprawy E1), więc na gęstych/szumnych mapach dawała "połamane" krzywe i
+    # pojawiała się tylko na CZĘŚCI kart — myląco niespójne z właściwym wynikiem fuzji
+    # DP pokazanym w panelu 6 (user report). Parametr zostaje dla zgodności wywołania.
     # Panel 5 — kandydaci
     if axis_info is not None:
         panel5 = original_rgb.copy()
@@ -531,8 +561,7 @@ def draw_reasoning_card(
         cls_title = f"WIEK (CORAL) - uwaga CLS (tlo {attn_bg_frac * 100:.0f}%)"
     else:
         cls_title = "WIEK (CORAL) - uwaga CLS"
-    mil_title = ("PRZYROSTY (density) - mapa + pierscienie" if has_rings
-                 else "PRZYROSTY (density) - mapa")
+    mil_title = "PRZYROSTY (density) - mapa"
     final_title = (f"PRZYROSTY (density) - finalne (N={n_final}) vs klasyka" if classical_pts
                    else f"PRZYROSTY (density) - finalne (N={n_final})")
     row1_titles = [
@@ -731,6 +760,8 @@ def save_reasoning_cards(
     axis_data: dict,
     output_dir: Path,
     label: str,
+    *,
+    mask_background: bool = False,
 ) -> list[Path]:
     """Generate and save reasoning cards for a list of prediction samples.
 
@@ -744,6 +775,10 @@ def save_reasoning_cards(
                       (any of these may be None when segmentation/axis failed)
     output_dir      : directory to write PNG cards
     label           : 'best' or 'worst' — used in filename
+    mask_background : when True, blank the background (same fill as training/
+                      OtolithDataset) before drawing — cards must show what the model
+                      actually saw, or they visibly contradict the masked-training story
+                      (21.07 user report). No-op when a sample's mask is unavailable.
 
     Returns
     -------
@@ -765,6 +800,10 @@ def save_reasoning_cards(
             continue
 
         axis = axis_data.get(image_id, {})
+        card_mask = axis.get("mask")
+        if mask_background and card_mask is not None:
+            from src.otolith_axis import apply_background_mask
+            original = apply_background_mask(original, card_mask)
         card = draw_reasoning_card(
             original_rgb=original,
             importance_grid=grid,
@@ -788,7 +827,20 @@ def save_reasoning_cards(
 
         stem = Path(image_id).stem
         out_path = output_dir / f"{label}_{stem}_card.png"
-        PILImage.fromarray(card, mode="RGB").save(out_path)
+        # Cards render each of the 6 panels at the ORIGINAL photo's native resolution
+        # (H, W = original_rgb.shape[:2]) — for a typical otolith photo that composites
+        # to a multi-megabyte PNG (seen: 2.4-5.4 MB/card), even though the report only
+        # ever displays it at a few hundred px wide. Downscale the saved file to ~2x that
+        # display width (still sharp on a retina/zoomed screen) — cuts report size and
+        # load time substantially without a visible quality loss (21.07 user report).
+        card_img = PILImage.fromarray(card, mode="RGB")
+        _target_w = 1300
+        if card_img.width > _target_w:
+            _scale = _target_w / card_img.width
+            card_img = card_img.resize(
+                (_target_w, max(1, int(round(card_img.height * _scale)))),
+                PILImage.LANCZOS)
+        card_img.save(out_path)
         saved.append(out_path)
 
     return saved

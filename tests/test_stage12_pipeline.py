@@ -563,3 +563,71 @@ def test_walkthrough_panel_b64_is_raw(tmp_path, monkeypatch):
     # measurement axis (merged Krok 4/5, 20.07) — not just the 48-direction ring.
     interactive = wt["krok4_interactive"]
     assert "far_edge" in interactive and len(interactive["far_edge"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Cards feed the model a MASKED input when cfg.data.mask_background (regression, 21.07)
+# ---------------------------------------------------------------------------
+
+def _bg_pixel_seen_by_model(tmp_path, monkeypatch, mask_background: bool):
+    """Build a segmentable otolith on a distinctive background, run
+    _compute_axis_data_for_samples, and return the background-region pixel (0,0) of the
+    image actually handed to build_transforms()'s transform — i.e. what the model sees."""
+    import cv2
+    from src.dataset import build_transforms
+    from src.inference import load_model_from_checkpoint as _real_load
+    from scripts.run_pipeline import _compute_axis_data_for_samples
+
+    monkeypatch.setattr(
+        "src.inference.load_model_from_checkpoint",
+        lambda cfg, ckpt_path, backbone=None: _real_load(cfg, ckpt_path, backbone=_MockDinoBackbone()),
+    )
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True)
+    bg_color = (200, 200, 200)
+    img = np.full((300, 220, 3), bg_color, dtype=np.uint8)
+    cv2.ellipse(img, (110, 150), (60, 100), angle=0, startAngle=0, endAngle=360,
+                color=(40, 40, 40), thickness=-1)
+
+    fname = "2022_BIAS_HER_Loc_Embedded_Sharp_FishIndex0_Single1_Left.png"
+    PILImage.fromarray(img, "RGB").save(img_dir / fname)
+    rows = [{"image_id": fname, "age": 4, "split": s} for s in ("train", "val", "test")]
+    labels_csv = tmp_path / "labels.csv"
+    pd.DataFrame(rows).to_csv(labels_csv, index=False)
+
+    cfg = _make_cfg(tmp_path, labels_csv, img_dir)
+    cfg.data.mask_background = mask_background
+    ckpt = _save_mock_checkpoint(cfg, labels_csv, img_dir)
+
+    captured = {}
+    real_transform = build_transforms(cfg.data.image_size, "test")
+
+    def _spy_transform(image):
+        captured["bg_pixel"] = tuple(int(v) for v in np.array(image)[0, 0])
+        return real_transform(image)
+
+    monkeypatch.setattr("src.dataset.build_transforms", lambda *a, **kw: _spy_transform)
+
+    samples = [{"image_id": fname, "age": 4, "predicted_age": 4}]
+    _compute_axis_data_for_samples(samples, img_dir, cfg, ckpt, tmp_path / "cond")
+    assert "bg_pixel" in captured, "transform() was never called — model forward pass skipped"
+    return captured["bg_pixel"], bg_color
+
+
+def test_cards_mask_model_input_when_mask_background_enabled(tmp_path, monkeypatch):
+    """With mask_background=True, the image fed to the model's forward pass must have its
+    background replaced with MASK_FILL_RGB — matching what OtolithDataset feeds at training
+    time (src/dataset.py). Before this fix, run_pipeline.py always ran the model on the RAW
+    unmasked photo, so density/attention/attn_bg_frac on cards silently measured a different
+    input distribution than the model actually trained/infers on (20.07 gap, fixed 21.07)."""
+    from src.otolith_axis import MASK_FILL_RGB
+    bg_pixel, _orig_bg = _bg_pixel_seen_by_model(tmp_path, monkeypatch, mask_background=True)
+    assert bg_pixel == tuple(MASK_FILL_RGB)
+
+
+def test_cards_leave_model_input_unmasked_when_mask_background_disabled(tmp_path, monkeypatch):
+    """With mask_background=False (default), cards must keep feeding the model the RAW
+    photo — no behaviour change for runs/configs that never opted into masking."""
+    bg_pixel, orig_bg = _bg_pixel_seen_by_model(tmp_path, monkeypatch, mask_background=False)
+    assert bg_pixel == orig_bg
