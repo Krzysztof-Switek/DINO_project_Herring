@@ -1,0 +1,53 @@
+# 23.07: wariant config_demo.yaml na 966px — szybki (1 epoka, kilkanaście obrazów)
+# sanity-check PRZED odpaleniem pełnego wielogodzinnego treningu na configs/config_hires966.yaml
+# (main_hires966.py, MODE="demo"). Łapie OOM/błędy kształtu od razu, nie po kilku godzinach.
+model:
+  backbone: dinov2_vits14_reg
+  use_metadata: false
+  target_type: ordinal
+  num_age_classes: 17
+  dropout: 0.1
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  image_size: 966                 # jedyna różnica vs config_demo.yaml (518→966)
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols: []
+
+training:
+  epochs: 1                # jedna epoka — tylko sprawdzamy czy pipeline działa na tej rozdzielczości
+  batch_size: 8
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: none
+  freeze_backbone_epochs: 0
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+
+inference:
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 3
+    top_k_worst: 3
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+
+candidates:
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+
+demo:
+  enabled: true
+  max_train_samples: 12
+  max_val_samples: 4
+  max_test_samples: 4

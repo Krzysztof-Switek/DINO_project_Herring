@@ -1,0 +1,151 @@
+# 23.07: pełny trening (CORAL + MIL + density) na podniesionej rozdzielczości 966px,
+# zamiast domyślnych 518px z config.yaml. Świadomie pominięty pośredni krok 728px —
+# decyzja: skoro i tak nie znamy kosztu żadnego z nich z góry, szkoda czasu na dojście
+# do 966 przez 728 (dwa pełne biegi zamiast jednego). config.yaml (default, używany przez
+# wszystkie stare checkpointy 20.07_reg/22.07_reg oraz lokalną regenerację kart/raportów)
+# zostaje NIETKNIĘTY. Ten plik to pełna, samodzielna kopia config.yaml z JEDNĄ zmienioną
+# wartością (data.image_size) — jedna zmienna naraz.
+#
+# Dotychczas density_image_size=728/crop-to-bbox działały TYLKO post-hoc (inference-time,
+# scripts/run_pipeline.py::_compute_axis_data_for_samples) — density_head widział w
+# treningu siatkę 37x37 (518px), a w kartach/raporcie 52x52 (728px, czasem przycięte).
+# Zmierzony efekt (23.07_run_analiza.md): to niedopasowanie NIE zamknęło się samo przez
+# ogólny trening (LayerNorm/LR/TV) — surowy sygnał density był GORSZY przy większej
+# rozdzielczości niż na starcie. Ten config usuwa niedopasowanie u źródła: CORAL, MIL i
+# density trenują na TEJ SAMEJ siatce 69x69 od epoki 1, bez oddzielnego fine-tune'u.
+#
+# Sufit sensowności (outputs/DINO_proces.md §4.21, zmierzone na 300 realnych zdjęć z Z:):
+# mediana natywnego dłuższego boku = 1230px, 966px to ~78% tej wartości — wciąż poniżej
+# progu, gdzie WIĘKSZOŚĆ zdjęć przestaje zyskiwać realny detal (to dopiero ~1232px).
+#
+# candidates.density_image_size zostaje 966 (teraz = data.image_size — post-hoc krok w
+# _compute_axis_data_for_samples stanie się faktycznym zero-opem dla rozdzielczości,
+# patrz need_hires_density w run_pipeline.py). candidates.density_crop_to_otolith zostaje
+# true — post-hoc crop-to-bbox to osobna, druga zmienna (zmierzony efekt: znikomy, bbox to
+# już ~96,5% ramki), świadomie NIE wyłączana tutaj, żeby nie mnożyć zmiennych w tym pliku.
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # N+1 (15.07 Tor C): wariant Z REJESTRAMI — tłumi patche o ekstremalnej
+                                  # normie (register tokens, Darcet 2023), które w 13.07 zapalały density na
+                                  # glare/krawędziach zamiast na pierścieniach. Ten sam wymiar 384 → głowice bez zmian.
+                                  # Warianty: dinov2_vits14 | *_vitb14 | *_vitl14 | *_reg
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  # MIL weakly-supervised localisation (per-patch increment scoring)
+  head_type: both                 # coral | mil | both
+  mil_count_weight: 1.0           # weight of the MIL top-k concentration loss in the combined loss
+  mil_sparsity_weight: 1.0        # weight of the background (off-region) term; higher = cleaner map
+  mil_hidden_dim: 64              # patch head hidden layer width
+  coral_loss_weight: 0.5          # weight of CORAL loss when head_type='both'
+  # Kierunek B: odsprzęgnięta (stop-gradient) głowica density-map z count-consistency.
+  # NIE dotyka backbone/CORAL/MIL (wiek bezpieczny). Mapa density = sygnał lokalizacji na kartach.
+  use_density_head: true          # false = stare zachowanie (tylko MIL do lokalizacji)
+  density_count_weight: 1.0       # waga straty density w sumie
+  density_conc_weight: 1.0        # człon koncentracji (rozbija rozmyte rozwiązanie)
+  density_tv_weight: 0.03         # N+3 (22.07): pierwsza próba ponownego włączenia TV, teraz MAŁE. Poprzedni pomiar
+                                  # "TV dusi density" (15.07_rx, TV=0.1) był SPRZED maskowania tła; 20.07_reg
+                                  # (maskowanie, TV=0) obudziło density już @epoka 10 (nie 23) — maskowanie mogło
+                                  # samo rozwiązać problem, który TV kiedyś pogarszał. Sprawdzić w logu tego biegu,
+                                  # czy wczesne budzenie się utrzymuje; jeśli się cofnie → wrócić do 0.0.
+                                  # Liczone na patches.detach() (wiek bezpieczny).
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed   # nadpisywane przez --image-dir / main_hires966.py per maszyna
+  labels_csv: data/labels.csv
+  image_size: 966                 # 23.07: 518→966 (14*69=966, podzielne). JEDYNA różnica vs config.yaml.
+                                  # CORAL/MIL/density teraz WSZYSTKIE trenują na siatce 69x69 (4761 patchy,
+                                  # ~3,5x dzisiejszych 1369) od epoki 1 — zob. komentarz na górze pliku.
+  patch_size: 14                  # DINOv2 default
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  # Input masking (20.07 pre-training item): feed the model ONLY the segmented
+  # otolith — CLS-attention diagnostic showed ~12-17% of attention landing on
+  # background/edge. Masks computed once (otolith_axis.get_or_compute_mask) and
+  # cached under data/masks_cache/ (mask_cache_dir: null → that default).
+  mask_background: true
+  mask_cache_dir: null
+
+training:
+  epochs: 50                      # sufit; early_stopping zdecyduje kiedy faktycznie zakończyć (poprzednie dobre biegi ~e37)
+  batch_size: 16                  # 23.07: NIEZMIENIONE mimo ~3,5x patchy — celowo, żeby nie mieszać drugiej
+                                  # zmiennej z rozdzielczością. Jeśli serwer OOM-uje: zmniejszyć do 8 (albo 4) i odnotować.
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine               # cosine | step | none
+  freeze_backbone_epochs: 5       # freeze DINOv2 for first N epochs
+  density_lr_mult: 2.0            # N+3 (22.07): pierwsza próba — density_head na stop-gradiencie budzi się
+                                  # późno i dostawał dotąd ten sam LR co CORAL/MIL (które już działają dobrze);
+                                  # 2.0 = szybsza nauka WYŁĄCZNIE tej głowicy, zero wpływu na backbone/wiek.
+                                  # Wartość do skalibrowania po tym biegu, nie ostateczna.
+  early_stopping_patience: 8      # N+1 (15.07 Tor B0): 15→8. Bieg 13.07 dobił do e52, a plateau było ~e26/e37
+                                  # (patience liczy od EMA-best); 8 → stop ~e45, bez niedouczenia (EMA chroni przed szumem val_mae)
+  early_stopping_metric: val_mae  # val_mae (zalecane) | val_loss
+  early_stopping_min_delta: 0.005 # minimalna poprawa żeby zresetować licznik (>szum EMA → koniec mikro-resetów)
+  early_stopping_ema: 0.3         # wygładzanie EMA metryki wyboru best.pt (0 = surowa; 0.3 = odporne na loterię)
+  min_epochs: 12                  # N+2a (16.07): early stopping NIE zadziała przed tą epoką (podłoga)
+  min_density_active: 1.0         # N+2a: best.pt/patience aktywne dopiero gdy density żyje (density_active≥1.0)
+                                  # — bieg 15.07_rx zamroził best.pt @e17, gdy density_active=0. To gwarantuje
+                                  # checkpoint z wytrenowaną lokalizacją (fallback: gdy density nigdy nie ożywa → jak dawniej)
+  device: auto                    # auto | cpu | cuda | mps
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true            # trzymaj tylko best.pt w katalogu runu; kasuj checkpointy epok (każdy ~265 MB)
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 5
+    top_k_worst: 5
+    annotate_all: false   # true = kropki + galeria (sekcja G raportu) dla WSZYSTKICH
+                          # obrazów testowych (wolniej, większy HTML); false = tylko top-k
+
+interpretation:
+  method: auto                    # auto | patch_token_importance | mil_patch_probs
+  heatmap_alpha: 0.5
+  disable_fused_attention: true   # true = wymuś wanilkową uwagę DINOv2 → prawdziwa uwaga CLS na kartach
+                                  # (wolniej); false = szybciej, panel CLS używa oznaczonego proxy L2 gdy brak
+
+candidates:
+  min_peak_distance: 5            # min patch-distance between candidate increments
+  prominence_threshold: 0.1
+  # 22.07: podniesione z 0.05 po przeglądzie literatury (ICES/BHARSG Baltic Herring Age
+  # Reading Workshop — pierwsza strefa roczna L1 to zmienna-szerokościowo STREFA, nie punkt;
+  # mylenie pierwszego pierścienia z fałszywym "checkiem" to udokumentowany problem u
+  # śledzia). 0.20 to JAWNIE NIEZWERYFIKOWANY dla śledzia bałtyckiego punkt startowy
+  # (0.15-0.30 z ekstrapolacji sardynki/biologii wzrostu, nie zmierzona wartość) — patrz
+  # plans and summaries/22.07_TO_DO.MD.
+  inner_margin: 0.20
+  # 23.07: teraz RÓWNE data.image_size (966=966) — post-hoc hires krok w
+  # _compute_axis_data_for_samples (need_hires_density) staje się zero-opem dla samej
+  # rozdzielczości; crop-to-bbox (poniżej) zostaje jako jedyna pozostała post-hoc różnica.
+  density_image_size: 966         # 966/14=69 -> 69x69=4761 patchy — TERAZ już zgodne z treningiem, nie tylko inferencją
+  density_crop_to_otolith: true   # crop do bbox maski PRZED skalowaniem — patche nie marnują
+                                  # się na tło (dziś tylko zamalowane, nadal zajmuje miejsce w siatce)
+  density_crop_pad_frac: 0.02     # zmierzone na 30 kartach (22.07): 0.05 zjadał niemal cały dostępny
+                                  # margines (bbox 96.5% ramki); 0.02 zostawia realne ~11% przycięcia
+                                  # przy wciąż bezpiecznym buforze na niedoskonałość segmentacji
+
+segmentation:                     # otolith outline detection (src/otolith_axis.py)
+  method: radial                  # radial (smooth, reaches faint rim) | threshold (Otsu+hysteresis fallback)
+  frac: 0.18                      # per-ray reach = fraction of that ray's body brightness (↓ = capture more faint margin)
+  background_k: 3.0               # background floor = bg_mean + k·bg_std
+  n_angles: 720                   # rays cast from the nucleus
+  smooth_sigma: 4.0               # periodic r(θ) smoothing — low = follow the scalloped teeth, high = smooth envelope
+  gap_tolerance: 8                # px a ray may dip below threshold before the boundary commits
