@@ -20,7 +20,7 @@ from pathlib import Path
 # KONFIGURACJA — zmień tylko tutaj
 # ============================================================
 
-MODE = "demo"   # "demo" → 1 epoka, szybki sanity-check na 966px | "full" → pełny trening
+MODE = "full"   # "demo" → 1 epoka, szybki sanity-check na 966px | "full" → pełny trening
 
 LOCATION = "server"   # "server" → serwer (Linux)  |  "local" → Twój komp (Windows, Z:)
                       # ↑ przełącznik ścieżki do zdjęć — zmień gdy zmieniasz maszynę
