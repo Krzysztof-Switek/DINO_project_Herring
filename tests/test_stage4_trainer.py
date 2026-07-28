@@ -45,22 +45,29 @@ class _MockDinoBackbone(nn.Module):
 # ---------------------------------------------------------------------------
 
 class _SyntheticDataset(Dataset):
-    def __init__(self, n: int = 8, num_age_classes: int = 10, image_size: int = 56):
+    def __init__(self, n: int = 8, num_age_classes: int = 10, image_size: int = 56,
+                with_polar: bool = False):
         self.n = n
         self.num_age_classes = num_age_classes
         self.image_size = image_size
+        self.with_polar = with_polar
 
     def __len__(self) -> int:
         return self.n
 
     def __getitem__(self, idx: int) -> Dict:
         age = (idx % (self.num_age_classes - 1)) + 1
-        return {
+        item: Dict = {
             "image": torch.randn(3, self.image_size, self.image_size),
             "age_ordinal": encode_age_ordinal(age, self.num_age_classes),
             "age": torch.tensor(age, dtype=torch.long),
             "image_id": f"img_{idx:03d}.png",
         }
+        if self.with_polar:
+            h_p = w_p = self.image_size // 14
+            item["polar_grid"] = torch.rand(h_p, w_p)
+            item["polar_valid"] = torch.ones(h_p, w_p, dtype=torch.bool)
+        return item
 
 
 # ---------------------------------------------------------------------------
@@ -84,8 +91,8 @@ def _make_cfg(tmp_path: Path, epochs: int = 2, freeze_epochs: int = 0,
     return cfg
 
 
-def _make_loader(n: int = 8, batch_size: int = 4) -> DataLoader:
-    ds = _SyntheticDataset(n=n, num_age_classes=10, image_size=56)
+def _make_loader(n: int = 8, batch_size: int = 4, with_polar: bool = False) -> DataLoader:
+    ds = _SyntheticDataset(n=n, num_age_classes=10, image_size=56, with_polar=with_polar)
     return DataLoader(ds, batch_size=batch_size, shuffle=False)
 
 
@@ -550,6 +557,41 @@ def test_optimizer_gives_density_head_its_own_lr_group(tmp_path):
         cfg.training.lr * cfg.training.density_lr_mult,
     ])
     assert lrs == pytest.approx(expected)
+
+
+def test_loss_parts_includes_density_concentricity_when_enabled(tmp_path):
+    """E9: with density_concentricity_weight>0 and a batch carrying polar_grid/
+    polar_valid, _loss_parts must add a 'density_concentricity' component and fold
+    it into 'total' — and train_one_epoch/validate must run end-to-end without
+    the caller having to do anything special (loader-provided keys flow through)."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path, epochs=1)
+    cfg.model.use_density_head = True
+    cfg.model.density_concentricity_weight = 0.5
+    cfg.model.density_concentricity_bins = 4
+    model = _make_model(cfg)
+    train_loader = _make_loader(n=8, with_polar=True)
+    val_loader = _make_loader(n=4, with_polar=True)
+    trainer = Trainer(cfg, model, train_loader, val_loader)
+
+    # train_one_epoch/validate must not raise, and validate()'s diagnostics must
+    # surface the new component.
+    trainer.train_one_epoch()
+    trainer.validate()
+    assert "density_conc_loss" in trainer.last_val_metrics
+
+
+def test_loss_parts_omits_density_concentricity_when_weight_zero(tmp_path):
+    """Default weight (0.0): even with polar_grid present in the batch, the
+    concentricity term must not appear — matches every other density_* weight's
+    "0 = off" convention in this codebase."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path, epochs=1)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+    trainer = Trainer(cfg, model, _make_loader(with_polar=True), _make_loader(with_polar=True))
+    trainer.validate()
+    assert "density_conc_loss" not in trainer.last_val_metrics
 
 
 def test_fit_ema_selection_runs_and_saves_best(tmp_path):

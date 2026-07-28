@@ -12,7 +12,8 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 
 from src.config import OtolithConfig
-from src.otolith_axis import apply_background_mask, get_or_compute_mask, mask_bbox
+from src.otolith_axis import (apply_background_mask, compute_polar_grid, get_or_compute_mask,
+                              mask_bbox, resolve_centroid)
 
 REQUIRED_COLUMNS = {"image_id", "age", "split"}
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
@@ -59,16 +60,23 @@ def decode_age_ordinal(logits: torch.Tensor) -> torch.Tensor:
 # Transforms
 # ---------------------------------------------------------------------------
 
-def build_transforms(image_size: int, split: str) -> transforms.Compose:
+def build_transforms(image_size: int, split: str, include_flips: bool = True) -> transforms.Compose:
+    """``include_flips=False`` drops RandomHorizontalFlip/RandomVerticalFlip from the
+    train pipeline — used when a caller needs to apply an IDENTICAL random flip
+    decision to a second, non-image tensor (e.g. the E9 polar-coordinate grid,
+    ``OtolithDataset._load_image_with_polar``) that this Compose has no hook to
+    synchronise with, since torchvision's random transforms make their own private
+    random choice with no way to inspect or replay it."""
     if split == "train":
-        return transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
+        ops = [transforms.Resize((image_size, image_size))]
+        if include_flips:
+            ops += [transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip()]
+        ops += [
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
             transforms.ToTensor(),
             transforms.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
-        ])
+        ]
+        return transforms.Compose(ops)
     return transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
@@ -152,7 +160,19 @@ class OtolithDataset(Dataset):
 
         self.df = full_df[full_df["split"] == split].reset_index(drop=True)
         self.df = self._maybe_demo_subsample(self.df, split)
-        self.transform = transform or build_transforms(cfg.data.image_size, split)
+
+        # E9: the polar-coordinate grid (needed only when the concentricity loss is
+        # actually on) requires an EXPLICIT, shared flip decision between the image
+        # and the geometry grid — build_transforms' built-in random flips can't be
+        # synchronised with a second tensor, so they're disabled here and redone
+        # manually in _load_image_with_polar(). Off by default (density_concentricity_
+        # weight=0.0): zero behaviour change for every existing config.
+        self._need_polar = (
+            bool(getattr(cfg.model, "use_density_head", False))
+            and getattr(cfg.model, "density_concentricity_weight", 0.0) > 0.0
+        )
+        self.transform = transform or build_transforms(
+            cfg.data.image_size, split, include_flips=not self._need_polar)
 
     # ------------------------------------------------------------------
     # Demo mode — limit dataset right at the source
@@ -205,7 +225,11 @@ class OtolithDataset(Dataset):
         image_id = str(row["image_id"])
         age = int(row["age"])
 
-        image_tensor = self._load_image(image_id)
+        if self._need_polar:
+            image_tensor, polar_grid, polar_valid = self._load_image_with_polar(image_id)
+        else:
+            image_tensor = self._load_image(image_id)
+            polar_grid = polar_valid = None
         age_ordinal = encode_age_ordinal(age, self.num_age_classes)
 
         sample: Dict = {
@@ -214,6 +238,9 @@ class OtolithDataset(Dataset):
             "age": torch.tensor(age, dtype=torch.long),
             "image_id": image_id,
         }
+        if polar_grid is not None:
+            sample["polar_grid"] = polar_grid
+            sample["polar_valid"] = polar_valid
 
         if self.use_metadata and self.metadata_cols:
             sample["metadata"] = self._encode_metadata(row)
@@ -236,6 +263,70 @@ class OtolithDataset(Dataset):
         if self.mask_background:
             image = self._mask_background(image, image_id)
         return self.transform(image)
+
+    def _load_image_with_polar(self, image_id: str) -> tuple:
+        """Like ``_load_image``, but also returns the (H_p, W_p) polar-coordinate
+        grid (E9 concentricity loss) computed from the SAME cached mask used for
+        background-masking — with an EXPLICIT, shared random flip decision applied
+        identically to the image and the polar grid (see ``build_transforms``'s
+        ``include_flips`` docstring for why this can't just reuse the normal
+        Compose-embedded random flips on the train split).
+
+        Returns (image_tensor, polar_t_grid, polar_valid_grid); the latter two are
+        all-zero / all-False when segmentation fails, matching the rest of this
+        module's "never crash on a bad photo" fallback philosophy.
+        """
+        path = self.img_dir / image_id
+        if not path.exists():
+            for ext in IMAGE_EXTENSIONS:
+                candidate = self.img_dir / (image_id + ext)
+                if candidate.exists():
+                    path = candidate
+                    break
+        image = Image.open(path).convert("RGB")
+        rgb = np.array(image, dtype=np.uint8)
+
+        mask = None
+        centroid = None
+        if self.mask_background:
+            cache_path = self.mask_cache_dir / f"{Path(image_id).stem}_mask.png"
+            mask = get_or_compute_mask(rgb, cache_path, seg_params=self.cfg.segmentation.as_params())
+            if mask is not None:
+                centroid = resolve_centroid(rgb, mask, self.cfg.segmentation.nucleus_method)
+
+        h_patches = w_patches = self.cfg.data.image_size // self.cfg.data.patch_size
+        if mask is not None and centroid is not None:
+            t_grid, valid_grid = compute_polar_grid(mask, centroid, h_patches, w_patches)
+            rgb = apply_background_mask(rgb, mask)
+        else:
+            t_grid = np.zeros((h_patches, w_patches), dtype=np.float32)
+            valid_grid = np.zeros((h_patches, w_patches), dtype=bool)
+
+        pil_img = Image.fromarray(rgb)
+        if self.split == "train":
+            do_hflip, do_vflip = self._decide_flip()
+            if do_hflip:
+                pil_img = pil_img.transpose(Image.FLIP_LEFT_RIGHT)
+                t_grid = np.ascontiguousarray(t_grid[:, ::-1])
+                valid_grid = np.ascontiguousarray(valid_grid[:, ::-1])
+            if do_vflip:
+                pil_img = pil_img.transpose(Image.FLIP_TOP_BOTTOM)
+                t_grid = np.ascontiguousarray(t_grid[::-1, :])
+                valid_grid = np.ascontiguousarray(valid_grid[::-1, :])
+
+        image_tensor = self.transform(pil_img)
+        return (
+            image_tensor,
+            torch.from_numpy(t_grid.copy()),
+            torch.from_numpy(valid_grid.copy()),
+        )
+
+    def _decide_flip(self) -> tuple:
+        """Explicit horizontal/vertical flip decision — split out to its own method
+        (instead of inlining ``torch.rand`` calls) purely so tests can force a
+        specific flip combination via monkeypatching, without touching the global
+        RNG that ``ColorJitter``/other transforms also rely on."""
+        return (torch.rand(()).item() < 0.5, torch.rand(()).item() < 0.5)
 
     def _mask_background(self, image: Image.Image, image_id: str) -> Image.Image:
         """Blank out everything outside the segmented otolith (MASK_FILL_RGB).

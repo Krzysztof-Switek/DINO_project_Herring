@@ -10,7 +10,8 @@ from torch.utils.data import DataLoader
 
 from src.config import OtolithConfig
 from src.dataset import decode_age_ordinal
-from src.model import OtolithModel, density_count_loss, mil_count_loss, ordinal_loss
+from src.model import (OtolithModel, density_concentricity_loss, density_count_loss,
+                       mil_count_loss, ordinal_loss)
 from src.utils import resolve_device  # re-exported for backwards compat
 
 
@@ -49,6 +50,9 @@ class Trainer:
         self.density_w      = getattr(cfg.model, "density_count_weight", 1.0)
         self.density_conc_w = getattr(cfg.model, "density_conc_weight", 1.0)
         self.density_tv_w   = getattr(cfg.model, "density_tv_weight", 0.0)
+        # E9: concentricity prior weight/bin-count — 0.0 weight = off (default).
+        self.density_concentricity_w = getattr(cfg.model, "density_concentricity_weight", 0.0)
+        self.density_concentricity_bins = getattr(cfg.model, "density_concentricity_bins", 12)
         self.last_val_metrics: dict = {}   # Section-B diagnostics from validate()
 
         self.optimizer = self._build_optimizer()
@@ -121,8 +125,9 @@ class Trainer:
     # Train / validate
     # ------------------------------------------------------------------
 
-    def _loss_parts(self, out: dict, targets: torch.Tensor,
-                    ages: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _loss_parts(self, out: dict, targets: torch.Tensor, ages: torch.Tensor,
+                    polar_grid: Optional[torch.Tensor] = None,
+                    polar_valid: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
         """Weighted CORAL / MIL components + their sum, keyed by name.
 
         Returned so the trainer can log the head losses separately (report
@@ -141,15 +146,23 @@ class Trainer:
             parts["density"] = self.density_w * density_count_loss(
                 out["density"], ages, self.density_conc_w, self.density_tv_w
             )
+            if self.density_concentricity_w > 0.0 and polar_grid is not None:
+                B, N = out["density"].shape
+                parts["density_concentricity"] = self.density_concentricity_w * \
+                    density_concentricity_loss(
+                        out["density"], polar_grid.reshape(B, N), polar_valid.reshape(B, N),
+                        n_radial_bins=self.density_concentricity_bins,
+                    )
         if not parts:
             raise RuntimeError("Model produced no recognised head outputs")
         parts["total"] = torch.stack(list(parts.values())).sum()
         return parts
 
-    def _combined_loss(self, out: dict, targets: torch.Tensor,
-                       ages: torch.Tensor) -> torch.Tensor:
+    def _combined_loss(self, out: dict, targets: torch.Tensor, ages: torch.Tensor,
+                       polar_grid: Optional[torch.Tensor] = None,
+                       polar_valid: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Combined CORAL + MIL loss (the scalar we optimise)."""
-        return self._loss_parts(out, targets, ages)["total"]
+        return self._loss_parts(out, targets, ages, polar_grid, polar_valid)["total"]
 
     @staticmethod
     def _predict_age(out: dict) -> torch.Tensor:
@@ -176,10 +189,15 @@ class Trainer:
             metadata = batch.get("metadata")
             if metadata is not None:
                 metadata = metadata.to(self.device)
+            polar_grid = batch.get("polar_grid")
+            polar_valid = batch.get("polar_valid")
+            if polar_grid is not None:
+                polar_grid = polar_grid.to(self.device)
+                polar_valid = polar_valid.to(self.device)
 
             self.optimizer.zero_grad()
             out = self.model(images, metadata=metadata)
-            loss = self._combined_loss(out, targets, ages)
+            loss = self._combined_loss(out, targets, ages, polar_grid, polar_valid)
             loss.backward()
             self.optimizer.step()
 
@@ -209,7 +227,8 @@ class Trainer:
         age_sum    = 0.0
         density_sum = 0.0
         density_active_sum = 0.0
-        has_coral = has_mil = has_density = False
+        density_conc_sum = 0.0
+        has_coral = has_mil = has_density = has_density_conc = False
         n = 0
         with torch.no_grad():
             for batch in self.val_loader:
@@ -220,9 +239,14 @@ class Trainer:
                 metadata = batch.get("metadata")
                 if metadata is not None:
                     metadata = metadata.to(self.device)
+                polar_grid = batch.get("polar_grid")
+                polar_valid = batch.get("polar_valid")
+                if polar_grid is not None:
+                    polar_grid = polar_grid.to(self.device)
+                    polar_valid = polar_valid.to(self.device)
 
                 out = self.model(images, metadata=metadata)
-                parts = self._loss_parts(out, targets, ages)
+                parts = self._loss_parts(out, targets, ages, polar_grid, polar_valid)
                 pred_ages = self._predict_age(out)
 
                 bs = images.size(0)
@@ -236,6 +260,9 @@ class Trainer:
                 if "density" in parts:
                     density_sum += parts["density"].item() * bs; has_density = True
                     density_active_sum += (out["density"] > 0.5).sum(dim=1).float().sum().item()
+                if "density_concentricity" in parts:
+                    density_conc_sum += parts["density_concentricity"].item() * bs
+                    has_density_conc = True
                 age_sum += ages.float().sum().item()
                 n += bs
 
@@ -250,6 +277,8 @@ class Trainer:
             self.last_val_metrics["density_loss"] = density_sum / denom
             self.last_val_metrics["density_active"] = density_active_sum / denom
             self.last_val_metrics["mean_age"] = age_sum / denom
+        if has_density_conc:
+            self.last_val_metrics["density_conc_loss"] = density_conc_sum / denom
         return total_loss / denom, total_mae / denom
 
     # ------------------------------------------------------------------
@@ -437,7 +466,7 @@ class Trainer:
         # Section-B diagnostics (only present with the relevant heads active).
         if extra:
             for key in ("coral_loss", "mil_loss", "mil_active",
-                        "density_loss", "density_active", "mean_age"):
+                        "density_loss", "density_active", "density_conc_loss", "mean_age"):
                 if key in extra and extra[key] == extra[key]:   # skip NaN
                     line += f"  {key}={extra[key]:.4f}"
         self._log(line)

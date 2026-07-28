@@ -361,6 +361,8 @@ def _compute_axis_data_for_samples(
     min_dist = cfg.candidates.min_peak_distance
     prominence = cfg.candidates.prominence_threshold
     inner_margin = cfg.candidates.inner_margin
+    width_decay_weight = cfg.candidates.width_decay_weight
+    width_ceiling_weight = cfg.candidates.width_ceiling_weight
     n_samples_axis = 50
     walkthrough_iid = _pick_walkthrough_iid(samples, image_dir,
                                             seg_params=cfg.segmentation.as_params())
@@ -518,6 +520,7 @@ def _compute_axis_data_for_samples(
         increments = select_increments(
             density_grid, density_axis_info, int(row.get("predicted_age", 0)), dH_img, dW_img,
             min_distance=min_dist, prominence=prominence, inner_margin=inner_margin,
+            width_decay_weight=width_decay_weight, width_ceiling_weight=width_ceiling_weight,
         )
         if crop_x0 or crop_y0:
             # Shift density-sourced points back from crop-relative to full-image pixel
@@ -591,7 +594,9 @@ def _compute_axis_data_for_samples(
             _sc = min(1.0, 360 / max(H_img, W_img))
             _dw, _dh = max(1, int(W_img * _sc)), max(1, int(H_img * _sc))
             for _m in ("density", "classical", "consensus", "dp"):
-                _fr = fuse_increments(_dpk, _cpk, _age, axis_info, method=_m)
+                _fr = fuse_increments(_dpk, _cpk, _age, axis_info, method=_m,
+                                      width_decay_weight=width_decay_weight,
+                                      width_ceiling_weight=width_ceiling_weight)
                 _ov = render_localization_overlay(orig_rgb, axis_info,
                                                   _fr["final_axis_pts"], _fr["candidate_pts"],
                                                   inner_margin=inner_margin)
@@ -621,7 +626,9 @@ def _compute_axis_data_for_samples(
                 _wage = int(row.get("predicted_age", 0))
                 _wd = dp_walkthrough_data(grid, orig_rgb, axis_info, H_img, W_img, _wage,
                                           density_min_distance=min_dist, density_prominence=prominence,
-                                          inner_margin=inner_margin)
+                                          inner_margin=inner_margin,
+                                          width_decay_weight=width_decay_weight,
+                                          width_ceiling_weight=width_ceiling_weight)
                 _p0 = render_patch_grid(orig_rgb, axis_info)          # krok 0: siatka patchy 37×37
                 _p1 = render_rays_and_candidates(orig_rgb, axis_info,
                                                  _wd["density_pts"], _wd["classical_pts"],

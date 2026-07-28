@@ -528,3 +528,60 @@ def test_density_tv_prior_penalises_scattered_more_than_coherent():
     tv_c = float(density_count_loss(coherent, ages, conc_weight=1.0, tv_weight=1.0) - base_c)
     tv_s = float(density_count_loss(scattered, ages, conc_weight=1.0, tv_weight=1.0) - base_s)
     assert tv_s > tv_c, f"scattered TV penalty ({tv_s:.4f}) must exceed coherent blob ({tv_c:.4f})"
+
+
+# ---------------------------------------------------------------------------
+# E9: density_concentricity_loss
+# ---------------------------------------------------------------------------
+
+def test_density_concentricity_loss_penalises_scattered_more_than_concentric():
+    """The whole point of E9: density(r,θ)≈density(r) — a map that is CONSTANT
+    within a radial bin (same value at every angle) must score a lower (here: zero)
+    penalty than one with the same values scattered across angles within the bin."""
+    from src.model import density_concentricity_loss
+
+    # 4 radial bins, 4 patches per bin (bin = row, angle = column).
+    polar_t = torch.tensor([[0.1] * 4 + [0.4] * 4 + [0.7] * 4 + [0.9] * 4])
+    polar_valid = torch.ones(1, 16, dtype=torch.bool)
+
+    concentric = torch.tensor([[0.9] * 4 + [0.2] * 4 + [0.5] * 4 + [0.1] * 4])
+    scattered = torch.tensor([[0.9, 0.1, 0.9, 0.1, 0.2, 0.9, 0.2, 0.1,
+                               0.5, 0.1, 0.9, 0.2, 0.1, 0.9, 0.1, 0.9]])
+
+    l_concentric = density_concentricity_loss(concentric, polar_t, polar_valid, n_radial_bins=4)
+    l_scattered = density_concentricity_loss(scattered, polar_t, polar_valid, n_radial_bins=4)
+    assert float(l_concentric) == pytest.approx(0.0, abs=1e-6)
+    assert float(l_scattered) > float(l_concentric)
+
+
+def test_density_concentricity_loss_zero_when_no_valid_patches():
+    """Segmentation-failure fallback: an all-invalid mask must not crash and must
+    contribute zero loss (matches the rest of the codebase's graceful-degradation
+    philosophy for failed segmentation)."""
+    from src.model import density_concentricity_loss
+
+    density = torch.rand(2, 16)
+    polar_t = torch.rand(2, 16)
+    polar_valid = torch.zeros(2, 16, dtype=torch.bool)
+    loss = density_concentricity_loss(density, polar_t, polar_valid, n_radial_bins=4)
+    assert float(loss) == 0.0
+
+
+def test_density_concentricity_loss_stop_gradient_safe():
+    """CRITICAL: like density_count_loss, this must never update the backbone —
+    it is computed on the same STOP-GRADIENT density tensor."""
+    from src.model import density_concentricity_loss
+
+    model = _make_density_model()
+    out = model(torch.randn(2, 3, 56, 56))
+    polar_t = torch.rand(2, 16)
+    polar_valid = torch.ones(2, 16, dtype=torch.bool)
+    loss = density_concentricity_loss(out["density"], polar_t, polar_valid, n_radial_bins=4)
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in model.backbone.parameters())
+    dh_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in model.density_head.parameters())
+    assert not bb_grad, "concentricity loss leaked gradient into the backbone"
+    assert dh_grad, "density head received no gradient"

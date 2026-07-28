@@ -38,6 +38,19 @@ class ModelConfig(BaseModel):
     # to be blob-like rather than salt-and-pepper (a safe proxy for the along-axis
     # peak prior, which would need the reading axis at train time). 0 = off (default).
     density_tv_weight:     float = Field(0.0, ge=0.0)
+    # E9 (28.07): concentricity prior — a NEW, independent loss term (density(r,θ)≈
+    # density(r): low variance PER ANGLE at fixed radius, since annual increments are
+    # concentric around the nucleus). Needs the polar-coordinate grid computed by
+    # OtolithDataset (src/dataset.py) from otolith_axis.compute_polar_grid — 0.0 =
+    # off (default); the dataset skips computing that grid entirely when this is 0,
+    # so existing configs pay zero extra cost.
+    density_concentricity_weight: float = Field(0.0, ge=0.0)
+    # Number of radial bins for the concentricity prior — FIXED independent of the
+    # patch-grid resolution (37x37 vs 69x69), to reduce (not eliminate) the risk that
+    # the same weight behaves differently across data.image_size configs (density_head
+    # is already known to not transfer cleanly across patch-grid densities — see
+    # plans and summaries/22.07_TO_DO.MD).
+    density_concentricity_bins: int = Field(12, ge=2)
 
 
 class DataConfig(BaseModel):
@@ -188,6 +201,18 @@ class CandidatesConfig(BaseModel):
     # (mean bbox area 96.5% of the full frame vs 82.5% at pad_frac=0.0) — 0.02 keeps most of
     # the real ~17.5% available reduction while still buffering segmentation imprecision.
     density_crop_pad_frac: float = Field(0.02, ge=0.0)
+    # 23.07: biological growth prior for the DP ring selector (src/ring_extraction.py::
+    # _dp_select_t) — the first annual increment (true nucleus, t=0, to the first chosen
+    # ring) is the widest, and later increments generally narrow as growth slows (a rule
+    # of thumb, not an absolute law). Both are SOFT penalties (scaled by candidate score),
+    # not hard constraints, so a strongly-enough-scored candidate can still violate them.
+    # width_ceiling_weight (never exceed the first increment's width) is weighted higher
+    # than width_decay_weight (local non-increasing preference) because the user described
+    # the former more firmly ("cannot be larger") than the latter ("rule of thumb").
+    # EXPLICITLY UNVERIFIED starting point (same status as inner_margin's 0.20) — not yet
+    # calibrated against real cards. See plans and summaries/22.07_TO_DO.MD.
+    width_decay_weight: float = Field(1.0, ge=0.0)
+    width_ceiling_weight: float = Field(3.0, ge=0.0)
 
 
 class SegmentationConfig(BaseModel):

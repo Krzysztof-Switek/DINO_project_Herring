@@ -250,6 +250,86 @@ def test_mask_background_cache_reused_on_second_access(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# E9: polar_grid (concentricity-prior geometry)
+# ---------------------------------------------------------------------------
+
+def _e9_cfg(tmp_path):
+    cfg = _make_cfg()
+    cfg.data.image_size = 196          # 14*14, divisible by patch_size
+    cfg.data.mask_background = True
+    cfg.data.mask_cache_dir = str(tmp_path / "masks_cache")
+    cfg.model.use_density_head = True
+    cfg.model.density_concentricity_weight = 0.5
+    return cfg
+
+
+def test_polar_grid_absent_by_default(ellipse_data, tmp_path):
+    """density_concentricity_weight=0.0 (default) → zero behaviour change: no
+    polar_grid/polar_valid key at all, no extra segmentation-derived geometry."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _make_cfg()
+    cfg.data.image_size = 196
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert "polar_grid" not in item
+    assert "polar_valid" not in item
+
+
+def test_polar_grid_absent_without_density_head(ellipse_data, tmp_path):
+    """density_concentricity_weight>0 alone is not enough — use_density_head must
+    also be on (the concentricity term modifies the density head's own loss)."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _e9_cfg(tmp_path)
+    cfg.model.use_density_head = False
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    assert "polar_grid" not in ds[0]
+
+
+def test_polar_grid_present_and_shaped_when_enabled(ellipse_data, tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _e9_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    h_p = w_p = cfg.data.image_size // cfg.data.patch_size
+    assert item["polar_grid"].shape == (h_p, w_p)
+    assert item["polar_valid"].shape == (h_p, w_p)
+    assert item["polar_valid"].dtype == torch.bool
+    assert item["polar_valid"].any(), "segmentable ellipse should mark some patches valid"
+
+
+def test_polar_grid_flip_synced_with_image(ellipse_data, tmp_path, monkeypatch):
+    """The random flip applied to the image on the train split must be applied
+    IDENTICALLY to the polar grid — otherwise the E9 loss would see density
+    predictions and geometry that disagree about where the otolith rotated to."""
+    import numpy as np
+    import torchvision.transforms as T
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data   # split="train" in this fixture's csv
+
+    # ColorJitter samples its own random factors on every __call__, independent of
+    # the flip decision under test — neutralise it so the only difference between
+    # the two ds[0] calls below is the flip, not also unrelated jitter noise.
+    monkeypatch.setattr(T.ColorJitter, "forward", lambda self, img: img)
+
+    ds = OtolithDataset(_e9_cfg(tmp_path), "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    monkeypatch.setattr(ds, "_decide_flip", lambda: (False, False))
+    baseline = ds[0]
+
+    monkeypatch.setattr(ds, "_decide_flip", lambda: (True, False))
+    hflipped = ds[0]
+
+    assert torch.allclose(hflipped["image"], torch.flip(baseline["image"], dims=[2]), atol=1e-5)
+    expected_polar = np.fliplr(baseline["polar_grid"].numpy())
+    assert np.allclose(hflipped["polar_grid"].numpy(), expected_polar, atol=1e-4)
+    expected_valid = np.fliplr(baseline["polar_valid"].numpy())
+    assert np.array_equal(hflipped["polar_valid"].numpy(), expected_valid)
+
+
+# ---------------------------------------------------------------------------
 # DensityFineTuneDataset (22.07 — fine-tune density_head at density_image_size/crop)
 # ---------------------------------------------------------------------------
 

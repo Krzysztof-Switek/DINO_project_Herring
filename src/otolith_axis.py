@@ -551,6 +551,87 @@ def sample_profile_along_axis(
 
 
 # ---------------------------------------------------------------------------
+# Polar-coordinate grid (E9 concentricity prior)
+# ---------------------------------------------------------------------------
+
+def compute_polar_grid(
+    mask: np.ndarray,
+    centroid: tuple[int, int],
+    h_patches: int,
+    w_patches: int,
+    n_angle_bins: int = 360,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-patch, per-ray-normalised polar coordinates for the E9 concentricity prior.
+
+    For every cell of an ``(h_patches, w_patches)`` grid overlaid on the image that
+    ``mask``/``centroid`` were computed from, returns the normalised radius
+    ``t = r / R(theta)`` — 0 at the nucleus, ~1 at the otolith's OWN edge in that
+    direction. Per-ray normalisation (not raw pixel radius) matters because the
+    herring otolith contour is non-circular/"tailed": a fixed pixel radius would mix
+    real otolith tissue (long-radius directions) with background (short-radius
+    directions) — the same reasoning already used for ray sampling in
+    ``ring_extraction.py``/``sample_profile_along_axis``.
+
+    Args:
+        mask         : (H, W) uint8/bool binary otolith mask, in the ORIGINAL image's
+                       pixel coordinate frame (e.g. as returned by
+                       ``get_or_compute_mask``) — NOT the resized model-input frame.
+        centroid     : (cx, cy) nucleus, same coordinate frame as ``mask``.
+        h_patches, w_patches : target patch-grid shape (``cfg.data.image_size //
+                       cfg.data.patch_size`` on both axes).
+        n_angle_bins : angular resolution used to estimate R(theta) by ray-casting
+                       along the mask — independent of ``h_patches``/``w_patches``,
+                       so the per-cell geometry is stable across resolutions even
+                       though the loss consuming it (see ``model.density_
+                       concentricity_loss``) bins by a SEPARATE, fixed radial count.
+
+    Returns:
+        t_grid     : (h_patches, w_patches) float32, per-ray-normalised radius.
+        valid_grid : (h_patches, w_patches) bool — True where the patch centre lies
+                     inside ``mask`` (background/edge-of-frame patches are False).
+    """
+    mask_bin = np.asarray(mask) > 0
+    H, W = mask_bin.shape[:2]
+    cx, cy = float(centroid[0]), float(centroid[1])
+
+    # R(theta): ray-cast from the centroid along n_angle_bins directions, find the
+    # farthest point still inside the mask (mirrors the ray-casting already used by
+    # _segment_radial, but walking the binary mask instead of re-thresholding pixels).
+    angles = np.linspace(-np.pi, np.pi, n_angle_bins, endpoint=False)
+    r_max = float(np.hypot(max(cx, W - cx), max(cy, H - cy))) + 1.0
+    radii = np.arange(1.0, max(r_max, 2.0))
+    R_theta = np.zeros(n_angle_bins, dtype=np.float32)
+    for i, a in enumerate(angles):
+        xs = np.clip((cx + radii * np.cos(a)).astype(np.int64), 0, W - 1)
+        ys = np.clip((cy + radii * np.sin(a)).astype(np.int64), 0, H - 1)
+        inside = np.nonzero(mask_bin[ys, xs])[0]
+        R_theta[i] = float(radii[inside.max()]) if inside.size else 0.0
+
+    # Patch-grid cell centres, expressed in the SAME pixel frame as `mask` — a plain
+    # fractional-position mapping, the same grid<->pixel convention already used by
+    # sample_profile_along_axis() elsewhere in this module.
+    py = (np.arange(h_patches, dtype=np.float32) + 0.5) * (H / h_patches)
+    px = (np.arange(w_patches, dtype=np.float32) + 0.5) * (W / w_patches)
+    grid_x, grid_y = np.meshgrid(px, py)                       # (h_patches, w_patches)
+
+    dx = grid_x - cx
+    dy = grid_y - cy
+    r = np.hypot(dx, dy)
+    theta = np.arctan2(dy, dx)
+    bin_idx = np.clip(
+        ((theta + np.pi) / (2.0 * np.pi) * n_angle_bins).astype(np.int64),
+        0, n_angle_bins - 1,
+    )
+    R_at = R_theta[bin_idx]
+
+    t_grid = np.where(R_at > 1e-6, r / np.maximum(R_at, 1e-6), 0.0).astype(np.float32)
+    valid_grid = cv2.resize(
+        mask_bin.astype(np.float32), (w_patches, h_patches), interpolation=cv2.INTER_AREA,
+    ) > 0.5
+    return t_grid, valid_grid
+
+
+# ---------------------------------------------------------------------------
 # Mask cache I/O
 # ---------------------------------------------------------------------------
 

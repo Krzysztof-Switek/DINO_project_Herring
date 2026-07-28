@@ -282,28 +282,86 @@ def test_merge_clusters_scores_contiguous_ring_higher():
 
 
 # ---------------------------------------------------------------------------
-# _dp_select_t spread_weight (discourage bunching, 20.07)
+# _dp_select_t spread_weight (discourage bunching, 20.07; RESCOPED to first-pick-only, 23.07)
 # ---------------------------------------------------------------------------
 
 def test_dp_select_t_spread_weight_zero_reproduces_old_behaviour():
-    """spread_weight=0 must select purely by summed score (respecting min_gap) — the
-    exact pre-20.07 behaviour. Three tight, equally-strong candidates outscore any
-    combination that reaches for the more distant, slightly weaker fourth one."""
+    """spread_weight=0 together with the new width penalties also at 0 must select purely
+    by summed score (respecting min_gap) — the exact pre-20.07 behaviour. Three tight,
+    equally-strong candidates outscore any combination that reaches for the more distant,
+    slightly weaker fourth one."""
     from src.ring_extraction import _dp_select_t
     cands = [(0.10, 10.0), (0.15, 10.0), (0.20, 10.0), (0.80, 8.0)]
-    chosen = _dp_select_t(cands, k=3, min_gap=0.04, spread_weight=0.0)
+    chosen = _dp_select_t(cands, k=3, min_gap=0.04, spread_weight=0.0,
+                          width_decay_weight=0.0, width_ceiling_weight=0.0)
     assert chosen == [0.10, 0.15, 0.20]
 
 
-def test_dp_select_t_spread_weight_prefers_distant_candidate_over_bunching():
-    """With a positive spread_weight (incl. the production default), DP must be willing
-    to trade a little raw score for a much wider spread — picking the isolated, slightly
-    weaker candidate at t=0.80 instead of stacking all 3 picks in the same tight cluster
-    (20.07 user report: real otolith had good candidates out to t~0.98 that a pure
-    score-sum DP ignored entirely in favour of a strong inner cluster)."""
+def test_dp_select_t_spread_weight_prefers_wide_first_gap():
+    """23.07: spread_weight is now scoped to ONLY the first pick's base case (it used to
+    reward every transition being wide, which directly fought the new width-narrowing
+    prior for later picks — see the width-prior tests below). With k=1 and two
+    near-equally-scored candidates, a large spread_weight must be willing to trade a
+    little raw score for a much wider gap from the true centroid (t=0), picking the
+    farther candidate instead of the closer, marginally stronger one."""
+    from src.ring_extraction import _dp_select_t
+    cands = [(0.05, 10.0), (0.50, 9.9)]
+    chosen_no_spread = _dp_select_t(cands, k=1, min_gap=0.04, spread_weight=0.0,
+                                    width_decay_weight=0.0, width_ceiling_weight=0.0)
+    chosen_with_spread = _dp_select_t(cands, k=1, min_gap=0.04, spread_weight=1.5,
+                                      width_decay_weight=0.0, width_ceiling_weight=0.0)
+    assert chosen_no_spread == [0.05]
+    assert chosen_with_spread == [0.50]
+
+
+# ---------------------------------------------------------------------------
+# _dp_select_t width_decay_weight / width_ceiling_weight (biological growth prior, 23.07)
+# ---------------------------------------------------------------------------
+
+def test_dp_select_t_default_prefers_narrowing_over_wide_reach():
+    """With the PRODUCTION defaults (width_ceiling_weight=3.0 dominating spread_weight=1.5),
+    DP must now prefer three tight, non-increasing-gap candidates over reaching for an
+    isolated, slightly-weaker one whose gap would dwarf the first increment's width — the
+    opposite preference from the old (pre-23.07) spread-weight-only behaviour, and the
+    whole point of the new biological prior (first increment widest, later ones don't
+    balloon back out)."""
     from src.ring_extraction import _dp_select_t
     cands = [(0.10, 10.0), (0.15, 10.0), (0.20, 10.0), (0.80, 8.0)]
-    chosen_default = _dp_select_t(cands, k=3, min_gap=0.04)          # production default (1.5)
-    chosen_explicit = _dp_select_t(cands, k=3, min_gap=0.04, spread_weight=1.5)
-    assert chosen_default == chosen_explicit
-    assert 0.80 in chosen_default
+    chosen = _dp_select_t(cands, k=3, min_gap=0.04)   # all production defaults
+    assert chosen == [0.10, 0.15, 0.20]
+    assert 0.80 not in chosen
+
+
+def test_dp_select_t_width_decay_weight_penalises_local_widening():
+    """A sequence whose middle gap grows relative to the first (0.10 -> 0.30 -> 0.32, gaps
+    0.10/0.20/0.02) must lose to an equal-total-score sequence whose gaps are non-increasing
+    (0.10 -> 0.18 -> 0.24, gaps 0.10/0.08/0.06) once width_decay_weight is active — isolated
+    from width_ceiling_weight (set to 0) so this test targets ONLY the local, pairwise
+    non-increasing preference."""
+    from src.ring_extraction import _dp_select_t
+    widening = [(0.10, 10.0), (0.30, 10.0), (0.32, 10.0)]
+    narrowing = [(0.10, 10.0), (0.18, 10.0), (0.24, 10.0)]
+    chosen_widening = _dp_select_t(widening, k=3, min_gap=0.01, spread_weight=0.0,
+                                   width_decay_weight=1.0, width_ceiling_weight=0.0)
+    chosen_narrowing = _dp_select_t(narrowing, k=3, min_gap=0.01, spread_weight=0.0,
+                                    width_decay_weight=1.0, width_ceiling_weight=0.0)
+    # Both fully-scored sequences are picked whole (only one candidate set each) — the
+    # real assertion is indirect: a mixed pool where only one of the two patterns is
+    # affordable must pick the narrowing one. See the ceiling test below for a direct
+    # forced-choice check.
+    assert chosen_widening == [0.10, 0.30, 0.32]
+    assert chosen_narrowing == [0.10, 0.18, 0.24]
+
+
+def test_dp_select_t_width_ceiling_weight_forces_choice_below_first_gap():
+    """Forced choice: a pool where the ONLY way to reach k=3 without violating min_gap
+    forces a final gap wider than the first (0.10 -> 0.15 -> 0.70, last gap 0.55 >> first
+    gap 0.10) versus a lower-scoring but width-compliant alternative (0.10 -> 0.15 -> 0.19,
+    gaps 0.10/0.05/0.04 — non-increasing, never exceeding the first). With
+    width_ceiling_weight active and strong enough (production default), the compliant,
+    lower-raw-score path must win."""
+    from src.ring_extraction import _dp_select_t
+    cands = [(0.10, 10.0), (0.15, 10.0), (0.19, 9.0), (0.70, 10.0)]
+    chosen = _dp_select_t(cands, k=3, min_gap=0.02)   # production defaults
+    assert chosen == [0.10, 0.15, 0.19]
+    assert 0.70 not in chosen

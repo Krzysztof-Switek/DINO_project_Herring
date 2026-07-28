@@ -112,6 +112,16 @@ candidates:
   density_crop_pad_frac: 0.02     # zmierzone na 30 kartach (22.07): 0.05 zjadał niemal cały dostępny
                                   # margines (bbox 96.5% ramki); 0.02 zostawia realne ~11% przycięcia
                                   # przy wciąż bezpiecznym buforze na niedoskonałość segmentacji
+  # 23.07: biologiczny priorytet wzrostu otolitu w selektorze DP (select_increments/
+  # fuse_increments) — pierwszy przyrost (od PRAWDZIWEGO jądra, nie od inner_margin) jest
+  # najszerszy, kolejne co do zasady się zwężają (rule of thumb, nie twarda reguła). Obie
+  # kary MIĘKKIE (skalowane wynikiem kandydata), nie twarde ograniczenia. width_ceiling_weight
+  # (nigdy nie przekraczaj szerokości pierwszego) silniejsza niż width_decay_weight (lokalna
+  # preferencja malejąca) — użytkownik określił pierwszą regułę mocniej ("nie mogą być
+  # większe") niż drugą ("rule of thumb"). JAWNIE NIEZWERYFIKOWANY punkt startowy (ten sam
+  # status co inner_margin=0.20) — nie skalibrowane na prawdziwych kartach.
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
 
 segmentation:                     # otolith outline detection (src/otolith_axis.py)
   method: radial                  # radial (smooth, reaches faint rim) | threshold (Otsu+hysteresis fallback)

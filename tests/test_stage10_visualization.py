@@ -327,11 +327,11 @@ def test_fuse_increments_three_methods():
     cx, cy = axis_info["centroid"]
     fx, fy = axis_info["far_edge"]
 
-    def pk(t):
-        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)))
+    def pk(t, ray):
+        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)), ray)
 
-    density = [pk(0.30), pk(0.31), pk(0.60), pk(0.61)]
-    classical = [pk(0.29), pk(0.30), pk(0.60), pk(0.90), pk(0.91)]
+    density = [pk(0.30, 0), pk(0.31, 1), pk(0.60, 2), pk(0.61, 3)]
+    classical = [pk(0.29, 0), pk(0.30, 1), pk(0.60, 2), pk(0.90, 3), pk(0.91, 4)]
     for m in ("density", "classical", "consensus"):
         out = fuse_increments(density, classical, 2, axis_info, method=m)
         assert len(out["final_t"]) <= 2
@@ -361,13 +361,20 @@ def test_fuse_increments_dp_enforces_spacing():
     # score (0.4*support*siła + 0.6*arc_len*siła) redukuje się do starego support*siła.
     density = ([pk(0.20, i) for i in range(4)] + [pk(0.27, i) for i in range(3)]
                + [pk(0.80, i) for i in range(2)])
+    # (23.07: width_ceiling_weight — production default — now also weighs in. Jumping from
+    # t=0.20 to t=0.80 would overshoot the FIRST chosen gap far more (0.60 vs a 0.20
+    # baseline) than jumping from t=0.27 (0.53 vs a 0.27 baseline), so DP now anchors on
+    # 0.27 instead of the raw-score-strongest 0.20 — min_gap enforcement and "pick the
+    # distant candidate for spread" both still hold, just with a different, biologically
+    # cheaper anchor point.)
     out = fuse_increments(density, [], 2, axis_info, method="dp", dp_min_gap=0.12)
     ts = out["final_t"]
     assert len(ts) == 2
     assert ts == sorted(ts)                                  # inner→outer
     assert min(b - a for a, b in zip(ts, ts[1:])) >= 0.12    # rozstaw wymuszony
     assert min(abs(t - 0.80) for t in ts) < 0.06            # odległy pik wybrany (rozłożenie)
-    assert min(abs(t - 0.27) for t in ts) > 0.06            # 0.27 odrzucone na rzecz rozstawu
+    assert min(abs(t - 0.27) for t in ts) < 0.06            # 0.27 wybrane jako tańszy kotwica
+    assert min(abs(t - 0.20) for t in ts) > 0.06            # 0.20 odrzucone (mimo wyższego score)
     assert len(out["final_axis_pts"]) == 2
     # k większe niż liczba klastrów → zwraca tyle, ile jest (bez wysypki)
     assert len(fuse_increments(density, [], 9, axis_info, method="dp")["final_t"]) == 3

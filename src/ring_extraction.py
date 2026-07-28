@@ -388,10 +388,11 @@ def _cluster_by_radius_with_arcs(
     A ring genuinely visible along a compact stretch of the circumference (e.g. only
     the upper-left quadrant of an otolith) is stronger evidence than the same total
     ray count scattered randomly around all ``n_dirs`` directions — ``_cluster_by_radius``
-    gives both the same ``support`` and can't tell them apart. This is a SEPARATE
-    function (not a change to ``_cluster_by_radius``) so its many existing consumers
-    (``_topk_cluster_t``, ``select_increments``, the JS ``clusterByRadius``) are
-    untouched; only :func:`_merge_clusters` (the ``dp`` fusion path) uses this one.
+    gives both the same ``support`` and can't tell them apart. Kept as a SEPARATE function
+    (not a change to ``_cluster_by_radius``) because the JS ``clusterByRadius`` port (Krok-4
+    live widget) still uses the plain, non-arc version — :func:`select_increments`,
+    :func:`fuse_increments`, and :func:`_merge_clusters` (Python side) all use this one
+    (23.07: the arc-aware score is now shared production scoring, not just the ``dp`` path).
     Peaks must be ``_all_ray_peaks``-shaped tuples with a ray index at position 4.
     """
     if not peaks:
@@ -436,13 +437,16 @@ def _cluster_by_radius_with_arcs(
     return out
 
 
-def _topk_cluster_t(clusters, k: int) -> List[float]:
-    """Keep the ``k`` highest-scoring clusters (score = support × mean_strength),
-    return their radii sorted inner→outer."""
-    if k <= 0 or not clusters:
-        return []
-    scored = sorted(clusters, key=lambda c: c[1] * c[2], reverse=True)
-    return sorted(mt for (mt, _s, _st) in scored[:k])
+def _cluster_score(c) -> float:
+    """Score an arc-aware cluster ``(mean_t, support, mean_strength, arc_len, arc_strength)``
+    (23.07, hoisted out of ``_merge_clusters`` so ``select_increments``/``fuse_increments``'s
+    ``"density"``/``"classical"``/``"consensus"`` branches share the same arc-continuity-aware
+    scoring as the ``"dp"`` branch, instead of the old support×strength-only ranking that
+    couldn't tell a ring genuinely visible along a compact stretch of the circumference from
+    the same total support scattered randomly around all rays). 0.4 total-support + 0.6
+    best-arc — a reasonable first-pass split, not yet tuned/validated against real cards."""
+    _t, support, mean_strength, arc_len, arc_strength = c
+    return support * mean_strength * 0.4 + arc_len * arc_strength * 0.6
 
 
 def _project_to_axis(chosen_t, axis_info: dict) -> List[Tuple[int, int]]:
@@ -453,33 +457,47 @@ def _project_to_axis(chosen_t, axis_info: dict) -> List[Tuple[int, int]]:
             for t in chosen_t]
 
 
-def _dp_select_t(cands, k: int, min_gap: float, spread_weight: float = 1.5) -> List[float]:
+def _dp_select_t(cands, k: int, min_gap: float, spread_weight: float = 1.5,
+                 width_decay_weight: float = 1.0, width_ceiling_weight: float = 3.0) -> List[float]:
     """Pick exactly ``k`` radii from ``cands=[(t, score)]`` maximising total score (PLUS a
-    spread bonus) with a minimum spacing ``min_gap`` between chosen radii (DP peak selection,
-    monotone in ``t``).
+    first-gap spread bonus, MINUS width-growth penalties) with a minimum spacing ``min_gap``
+    between chosen radii (DP peak selection, monotone in ``t``).
 
     This is the ``method="dp"`` selector: unlike top-k (which can bunch several picks at
     almost the same radius), the spacing constraint spreads the ``k`` increments along the
     axis — the classic dynamic-programming ring/peak selection used in tree-ring counting.
 
-    ``spread_weight`` (20.07): a flat minimum-gap ALONE doesn't stop DP from bunching all
-    ``k`` picks in whichever single sub-region happens to have the highest raw score — real
-    otoliths often have one very strong, near-universally-supported band (e.g. close to the
-    nucleus) that would otherwise swallow every pick, even when decent candidates exist all
-    the way to the edge (20.07, user report: 3/3 picks landed in the inner third of the axis
-    despite good-scoring candidates out to t=0.98). Each DP transition adds
-    ``spread_weight * gap * mean_score`` (``mean_score`` = mean of all candidate scores, so the
-    bonus is on the same scale as the scores themselves regardless of their absolute units) —
-    rewarding WIDER gaps between consecutive picks, not just enforcing the ``min_gap`` floor.
-    ``spread_weight=0`` reproduces the exact previous (score-only) behaviour. Default 1.5 —
-    calibrated against the actual reported case (real classical+density scores, inner cluster
-    ~2-4x the outer candidates' score): weights below ~1.0 left the bunched selection
-    unchanged; 1.0-5.0 all reliably swap in the distant candidate. Still a first pass, not
-    exhaustively validated across many otoliths — worth revisiting once more real cards are
-    available.
+    ``spread_weight`` (20.07; RESCOPED 23.07 — see below): a flat minimum-gap ALONE doesn't
+    stop DP from bunching all ``k`` picks in whichever single sub-region happens to have the
+    highest raw score — real otoliths often have one very strong, near-universally-supported
+    band (e.g. close to the nucleus) that would otherwise swallow every pick, even when decent
+    candidates exist all the way to the edge (20.07, user report: 3/3 picks landed in the inner
+    third of the axis despite good-scoring candidates out to t=0.98).
 
-    Falls back to the top-``k`` by score (spacing ignored) when spacing makes ``k`` picks
-    infeasible, so it always returns as many as possible up to ``k``.
+    ``width_decay_weight`` / ``width_ceiling_weight`` (23.07): biological prior on otolith
+    growth — the first annual increment (true nucleus, t=0, to the first chosen ring) is the
+    WIDEST, and later increments generally narrow as the fish's growth slows (a rule of thumb,
+    not an absolute law — real sequences can wobble). Tracked via an auxiliary
+    ``first_gap[j][i]`` table (the first chosen gap along the optimal j-pick path ending at
+    ``i``) alongside ``dp``/``par`` — no DP state-space expansion needed, since the previous
+    gap is derivable from the stored backpointer (``ts[p] - ts[par[j-1][p]]``, or ``ts[p]``
+    itself when ``p`` was the first pick). Each transition is penalised by
+    ``width_decay_weight * max(0, gap - previous_gap) * mean_score`` (soft preference: don't
+    grow locally) PLUS ``width_ceiling_weight * max(0, gap - first_gap) * mean_score`` (soft
+    but stronger preference: never exceed the very first increment's width — the user
+    described this rule more firmly than the general narrowing tendency, hence the higher
+    default weight). Both are soft penalties, not hard constraints, so a strongly-enough-scored
+    candidate can still violate them and a valid k-pick sequence is always found.
+
+    ``spread_weight`` is now scoped to ONLY the first pick's base case
+    (``dp[1][i] = ss[i] + spread_weight * ts[i] * mean_score``, rewarding a WIDE first gap
+    from the true centroid t=0) instead of every transition — rewarding every gap being wide
+    directly fought the new narrowing preference for j≥2. ``spread_weight=0`` together with
+    ``width_decay_weight=0, width_ceiling_weight=0`` reproduces the exact pre-20.07
+    (score-only) behaviour.
+
+    Falls back to the top-``k`` by score (spacing ignored) when the hard ``min_gap`` floor
+    makes ``k`` picks infeasible, so it always returns as many as possible up to ``k``.
     """
     if k <= 0 or not cands:
         return []
@@ -492,19 +510,30 @@ def _dp_select_t(cands, k: int, min_gap: float, spread_weight: float = 1.5) -> L
     NEG = float("-inf")
     dp = [[NEG] * M for _ in range(k + 1)]                    # dp[j][i]: best score, j picks, last at i
     par = [[-1] * M for _ in range(k + 1)]
+    first_gap = [[0.0] * M for _ in range(k + 1)]             # first chosen gap along this optimal path
     for i in range(M):
-        dp[1][i] = ss[i]
+        dp[1][i] = ss[i] + spread_weight * ts[i] * mean_score  # reward a wide FIRST gap (from true t=0)
+        first_gap[1][i] = ts[i]
     for j in range(2, k + 1):
         for i in range(M):
             best, bp = NEG, -1
             for p in range(i):
-                if ts[i] - ts[p] >= min_gap:
-                    cand_val = dp[j - 1][p] + spread_weight * (ts[i] - ts[p]) * mean_score
-                    if dp[j - 1][p] > NEG and cand_val > best:
-                        best, bp = cand_val, p
+                if ts[i] - ts[p] < min_gap or dp[j - 1][p] == NEG:
+                    continue
+                g_cur = ts[i] - ts[p]
+                g_prev = ts[p] if j - 1 == 1 else ts[p] - ts[par[j - 1][p]]
+                g1 = first_gap[j - 1][p]
+                local_violation = max(0.0, g_cur - g_prev)
+                ceiling_violation = max(0.0, g_cur - g1)
+                cand_val = (dp[j - 1][p]
+                           - width_decay_weight * local_violation * mean_score
+                           - width_ceiling_weight * ceiling_violation * mean_score)
+                if cand_val > best:
+                    best, bp = cand_val, p
             if bp != -1:
                 dp[j][i] = best + ss[i]
                 par[j][i] = bp
+                first_gap[j][i] = first_gap[j - 1][bp]
     end, best_val = -1, NEG
     for i in range(M):
         if dp[k][i] > best_val:
@@ -534,13 +563,27 @@ def select_increments(
     inner_margin: float = 0.05,
     edge_margin: float = 0.08,
     t_tol: float = 0.06,
+    dp_min_gap: float = 0.04,
+    dp_spread_weight: float = 1.5,
+    width_decay_weight: float = 1.0,
+    width_ceiling_weight: float = 3.0,
 ) -> dict:
     """Multi-axis increment localisation with count = ``predicted_age`` (11.07 Punkt 7).
 
-    Casts ``n_dirs`` rays from the nucleus, finds probability peaks along each
-    (candidates), clusters them by normalised radius across rays, ranks clusters by
-    (support × mean strength), and keeps the top ``predicted_age`` as the FINAL
-    increments — projected onto the measurement axis (nucleus → far edge).
+    Casts ``n_dirs`` rays from the nucleus, finds probability peaks along each (candidates),
+    clusters them by normalised radius across rays (arc-aware: a ring visible along a compact,
+    contiguous stretch of the circumference scores higher than the same total support
+    scattered randomly around all rays — :func:`_cluster_by_radius_with_arcs`/
+    :func:`_cluster_score`), then DP-selects exactly ``predicted_age`` of them
+    (:func:`_dp_select_t`) honouring a minimum spacing plus the biological growth prior (first
+    increment widest, later ones generally non-increasing — see that function's docstring).
+    Final increments are projected onto the measurement axis (nucleus → far edge).
+
+    (23.07: switched from plain top-k-by-score to the same DP selector used by
+    ``fuse_increments(method="dp")``, so the actual rendered card rings [panel 6] share the
+    arc-continuity awareness and width prior with the report's method bake-off, not just the
+    comparison-only path. Side effect: ``dp_min_gap`` is now also enforced here, where before
+    top-k had no spacing awareness at all and could pick two nearly-identical radii.)
 
     Returns dict:
       final_t        : list[float]   normalised radii of chosen increments (≤ age), inner→outer
@@ -555,7 +598,10 @@ def select_increments(
         n_dirs=n_dirs, n_samples=n_samples, min_distance=min_distance,
         prominence=prominence, inner_margin=inner_margin, edge_margin=edge_margin,
     )
-    chosen_t = _topk_cluster_t(_cluster_by_radius(peaks, t_tol), max(0, int(predicted_age)))
+    clusters = _cluster_by_radius_with_arcs(peaks, t_tol, n_dirs)
+    cands = [(c[0], _cluster_score(c)) for c in clusters]
+    chosen_t = _dp_select_t(cands, max(0, int(predicted_age)), dp_min_gap, dp_spread_weight,
+                            width_decay_weight, width_ceiling_weight)
     return {"final_t": chosen_t,
             "final_axis_pts": _project_to_axis(chosen_t, axis_info),
             "candidate_pts": candidate_pts}
@@ -695,15 +741,11 @@ def _merge_clusters(density_pks, classical_pks, t_tol: float = 0.06, n_dirs: int
     dclust = _cluster_by_radius_with_arcs(density_pks, t_tol, n_dirs)
     cclust = _cluster_by_radius_with_arcs(classical_pks, t_tol, n_dirs)
 
-    def _score(c) -> float:
-        _t, support, mean_strength, arc_len, arc_strength = c
-        return support * mean_strength * 0.4 + arc_len * arc_strength * 0.6
-
     merged: List[Tuple[float, float, str]] = []
     used = [False] * len(cclust)
     for dc in dclust:
         dt = dc[0]
-        score = _score(dc)
+        score = _cluster_score(dc)
         t, source = dt, "density"
         best_i, best_d = -1, t_tol
         for i, c in enumerate(cclust):
@@ -712,12 +754,12 @@ def _merge_clusters(density_pks, classical_pks, t_tol: float = 0.06, n_dirs: int
         if best_i >= 0:                                  # density ring corroborated by classical
             c = cclust[best_i]
             used[best_i] = True
-            score += _score(c)
+            score += _cluster_score(c)
             t, source = 0.5 * (dt + c[0]), "consensus"
         merged.append((t, score, source))
     for i, c in enumerate(cclust):                       # classical-only rings still eligible
         if not used[i]:
-            merged.append((c[0], _score(c), "classical"))
+            merged.append((c[0], _cluster_score(c), "classical"))
     return merged
 
 
@@ -725,23 +767,26 @@ def fuse_increments(
     density_pks, classical_pks, predicted_age: int, axis_info: dict,
     *, method: str = "consensus", t_tol: float = 0.06, dp_min_gap: float = 0.04,
     n_dirs: int = 48, dp_spread_weight: float = 1.5,
+    width_decay_weight: float = 1.0, width_ceiling_weight: float = 3.0,
 ) -> dict:
     """Choose the final ``predicted_age`` increments on the axis from peak sources.
 
     ``density_pks`` / ``classical_pks`` are ``[(t, strength, x, y, ray_idx)]`` lists
-    (from :func:`density_peaks` / :func:`classical_increments`); ``n_dirs`` must match
-    the ray count they were cast with (only used by ``method="dp"``, for the arc-aware
-    scoring in :func:`_merge_clusters`). ``method``:
-      * ``"density"``   — top-`age` clusters of density peaks only (model localisation).
-      * ``"classical"`` — top-`age` clusters of classical (image-intensity) peaks only.
-      * ``"consensus"`` — clusters where density AND classical agree on radius ``t``
-        (combined support), top-`age`; falls back to top density clusters if fewer than
-        ``age`` agree.
-      * ``"dp"``        — merge density+classical clusters (consensus rings scored higher),
-        then dynamic-programming select exactly `age` radii maximising total score (plus a
-        spread bonus, ``dp_spread_weight`` — see :func:`_dp_select_t`) with a minimum
-        spacing ``dp_min_gap`` (spreads increments along the axis instead of bunching all
-        picks in whichever single sub-region scores highest).
+    (from :func:`density_peaks` / :func:`classical_increments`); ``n_dirs`` must match the ray
+    count they were cast with. ``method``:
+      * ``"density"``   — density peaks only (model localisation), arc-aware clusters
+        (:func:`_cluster_by_radius_with_arcs`/:func:`_cluster_score`), DP-selected.
+      * ``"classical"`` — classical (image-intensity) peaks only, same arc-aware DP selection.
+      * ``"consensus"`` — clusters where density AND classical agree on radius ``t`` (summed
+        arc-aware score), DP-selected; falls back to top density clusters if fewer than `age`
+        agree.
+      * ``"dp"``        — merge density+classical clusters (consensus rings scored higher via
+        :func:`_merge_clusters`), DP-selected.
+    All four branches now funnel through the SAME :func:`_dp_select_t` (23.07) — minimum
+    spacing ``dp_min_gap``, a first-gap spread bonus (``dp_spread_weight``), and the
+    biological growth prior (first increment widest, later ones generally non-increasing —
+    ``width_decay_weight``/``width_ceiling_weight``, see :func:`_dp_select_t`'s docstring) —
+    so the report's method bake-off is consistent with the production selector.
     Returns ``{final_t, final_axis_pts, candidate_pts}`` (candidates = the source(s) used).
     """
     empty = {"final_t": [], "final_axis_pts": [], "candidate_pts": []}
@@ -749,33 +794,40 @@ def fuse_increments(
         return empty
     k = max(0, int(predicted_age))
 
+    def _dp(cands):
+        return _dp_select_t(cands, k, dp_min_gap, dp_spread_weight,
+                            width_decay_weight, width_ceiling_weight)
+
     if method == "density":
-        chosen = _topk_cluster_t(_cluster_by_radius(density_pks, t_tol), k)
+        clusters = _cluster_by_radius_with_arcs(density_pks, t_tol, n_dirs)
+        chosen = _dp([(c[0], _cluster_score(c)) for c in clusters])
         cand = [(p[2], p[3]) for p in density_pks]
     elif method == "classical":
-        chosen = _topk_cluster_t(_cluster_by_radius(classical_pks, t_tol), k)
+        clusters = _cluster_by_radius_with_arcs(classical_pks, t_tol, n_dirs)
+        chosen = _dp([(c[0], _cluster_score(c)) for c in clusters])
         cand = [(p[2], p[3]) for p in classical_pks]
     elif method == "dp":
         merged = _merge_clusters(density_pks, classical_pks, t_tol, n_dirs)
-        chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap, dp_spread_weight)
+        chosen = _dp([(t, s) for (t, s, _src) in merged])
         cand = [(p[2], p[3]) for p in density_pks] + [(p[2], p[3]) for p in classical_pks]
     else:  # consensus
-        dclust = _cluster_by_radius(density_pks, t_tol)
-        cclust = _cluster_by_radius(classical_pks, t_tol)
-        agreed = []                                     # (combined_support, mean_t)
-        for (dt, ds, _dstr) in dclust:
+        dclust = _cluster_by_radius_with_arcs(density_pks, t_tol, n_dirs)
+        cclust = _cluster_by_radius_with_arcs(classical_pks, t_tol, n_dirs)
+        agreed = []                                     # (mean_t, combined_score)
+        for dc in dclust:
+            dt = dc[0]
             near = [c for c in cclust if abs(c[0] - dt) <= t_tol]
             if near:
                 c = min(near, key=lambda cc: abs(cc[0] - dt))
-                agreed.append((ds + c[1], 0.5 * (dt + c[0])))
-        agreed.sort(key=lambda s: s[0], reverse=True)
-        chosen = sorted(mt for _s, mt in agreed[:k])
+                agreed.append((0.5 * (dt + c[0]), _cluster_score(dc) + _cluster_score(c)))
+        chosen = _dp(agreed)
         if len(chosen) < k:                             # fallback: fill from top density clusters
-            for mt in _topk_cluster_t(dclust, len(dclust)):
+            ranked = sorted(dclust, key=_cluster_score, reverse=True)
+            for c in ranked:
                 if len(chosen) >= k:
                     break
-                if all(abs(mt - c) > t_tol for c in chosen):
-                    chosen.append(mt)
+                if all(abs(c[0] - x) > t_tol for x in chosen):
+                    chosen.append(c[0])
             chosen = sorted(chosen)
         cand = [(p[2], p[3]) for p in density_pks] + [(p[2], p[3]) for p in classical_pks]
 
@@ -837,6 +889,7 @@ def _example_ray_profiles(grid, axis_info: dict, image_h: int, image_w: int, *,
 def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int, image_w: int,
                         predicted_age: int, *, n_dirs: int = 48, n_samples: int = 64,
                         t_tol: float = 0.06, dp_min_gap: float = 0.04, dp_spread_weight: float = 1.5,
+                        width_decay_weight: float = 1.0, width_ceiling_weight: float = 3.0,
                         density_min_distance: int = 3, density_prominence: float = 0.1,
                         classical_smooth_sigma: float = 0.0, classical_min_distance: int = 1,
                         classical_prominence: float = 0.02, inner_margin: float = 0.05,
@@ -864,7 +917,8 @@ def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int,
     cpk, cpts = cinc["peaks"], cinc["candidate_pts"]
     merged = _merge_clusters(dpk, cpk, t_tol, n_dirs)
     k = max(0, int(predicted_age))
-    chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap, dp_spread_weight)
+    chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap, dp_spread_weight,
+                          width_decay_weight, width_ceiling_weight)
     return {
         "predicted_age": k,
         "n_dirs": n_dirs,

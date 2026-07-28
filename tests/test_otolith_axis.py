@@ -9,6 +9,7 @@ import pytest
 
 from src.otolith_axis import (
     apply_background_mask,
+    compute_polar_grid,
     detect_axis,
     find_centroid,
     find_farthest_edge,
@@ -431,5 +432,60 @@ def test_shift_axis_info_translates_geometry():
     assert np.array_equal(shifted["contour"], contour - np.array([5, 5]))
     assert shifted["contour"].dtype == contour.dtype
     assert shifted["length_px"] == 7.07                      # distance is translation-invariant
-    # original untouched
-    assert axis_info["centroid"] == (15, 15)
+    assert axis_info["centroid"] == (15, 15)                  # original untouched
+
+
+# ---------------------------------------------------------------------------
+# compute_polar_grid (E9 concentricity prior)
+# ---------------------------------------------------------------------------
+
+def _circular_mask(size: int = 100, radius: int = 40) -> tuple[np.ndarray, tuple[int, int]]:
+    yy, xx = np.mgrid[0:size, 0:size]
+    cx = cy = size // 2
+    mask = ((xx - cx) ** 2 + (yy - cy) ** 2 < radius ** 2).astype(np.uint8) * 255
+    return mask, (cx, cy)
+
+
+def test_compute_polar_grid_shapes_and_range():
+    mask, centroid = _circular_mask()
+    t_grid, valid_grid = compute_polar_grid(mask, centroid, 10, 10)
+    assert t_grid.shape == (10, 10)
+    assert valid_grid.shape == (10, 10)
+    assert valid_grid.dtype == bool
+    assert t_grid.min() >= 0.0
+
+
+def test_compute_polar_grid_nucleus_near_zero_edge_near_one():
+    """For a circular mask, the centre patch should have small t; a patch just
+    inside the boundary should have t close to 1."""
+    mask, centroid = _circular_mask(size=100, radius=40)
+    t_grid, valid_grid = compute_polar_grid(mask, centroid, 21, 21)
+    center_idx = 10
+    assert t_grid[center_idx, center_idx] < 0.2
+    # a valid patch on the outer ring of the mask should be close to the edge (t~1)
+    valid_ts = t_grid[valid_grid]
+    assert valid_ts.max() > 0.7
+
+
+def test_compute_polar_grid_marks_background_invalid():
+    mask, centroid = _circular_mask(size=100, radius=20)   # small circle, lots of background
+    _t_grid, valid_grid = compute_polar_grid(mask, centroid, 20, 20)
+    assert valid_grid.any()
+    assert not valid_grid.all()          # corners of the square grid are outside the circle
+
+
+def test_compute_polar_grid_horizontal_flip_matches_flipped_output():
+    """Per-ray radius must be MIRROR-consistent: computing directly on a horizontally
+    flipped mask should match simply flipping the unflipped grid (small numerical
+    slack from the ray-cast's finite angular resolution) — this is the property
+    OtolithDataset._load_image_with_polar relies on to synchronise a random flip
+    between the image and the polar grid without recomputing the geometry twice."""
+    mask, (cx, cy) = _circular_mask(size=100, radius=35)
+    W = mask.shape[1]
+    t_grid, _ = compute_polar_grid(mask, (cx, cy), 12, 12)
+
+    mask_flipped = mask[:, ::-1]
+    cx_flipped = W - 1 - cx
+    t_grid_direct, _ = compute_polar_grid(mask_flipped, (cx_flipped, cy), 12, 12)
+
+    assert np.abs(t_grid_direct - t_grid[:, ::-1]).max() < 0.1

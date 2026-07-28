@@ -169,6 +169,65 @@ def hp_wp_square(n: int) -> bool:
     return r * r == n
 
 
+def density_concentricity_loss(
+    density: Tensor,
+    polar_t: Tensor,
+    polar_valid: Tensor,
+    n_radial_bins: int = 12,
+) -> Tensor:
+    """E9 concentricity prior: density(r,θ) ≈ density(r) — low variance ACROSS ANGLE
+    at a fixed radius, since annual growth-ring increments are (approximately)
+    concentric circles around the otolith nucleus.
+
+    A NEW, independent loss term (not a modification of ``density_count_loss``) —
+    bins every valid patch into one of ``n_radial_bins`` fixed-width bins by its
+    per-ray-normalised radius ``polar_t`` (0=nucleus, ~1=otolith edge in that
+    direction — see ``otolith_axis.compute_polar_grid``; NOT raw pixel radius, which
+    would be biologically wrong for this non-circular contour), then penalises the
+    variance of ``density`` WITHIN each bin across the patches that fall into it
+    (i.e. across angle, since patches sharing a bin share ~the same radius but
+    differ in angle). ``n_radial_bins`` is a FIXED count, independent of the
+    patch-grid resolution (``density.shape[1]``) — density_head is already known to
+    NOT transfer cleanly across patch-grid resolutions (measured train/inference
+    mismatch, ``plans and summaries/22.07_TO_DO.MD``), so keeping the number of
+    radial bins constant across configs is a deliberate attempt to keep this loss's
+    scale comparable when the same weight is reused at a different ``data.image_size``.
+
+    Args:
+        density       : (B, N) per-patch density ∈ [0, 1] — the SAME stop-gradient
+                        tensor fed to ``density_count_loss``; this function adds no
+                        gradient hooks of its own, so it inherits that safety.
+        polar_t       : (B, N) per-ray-normalised radius, flattened to match ``density``.
+        polar_valid   : (B, N) bool — True where ``polar_t`` is meaningful (patch
+                        centre inside the segmented otolith); background/failed-
+                        segmentation patches are excluded from every bin.
+        n_radial_bins : number of fixed-width bins spanning t ∈ [0, 1].
+
+    Returns scalar loss — mean within-bin variance over (sample, bin) pairs with
+    at least 2 valid patches; 0.0 when no sample has any such bin (e.g. every
+    sample in the batch had segmentation fail).
+    """
+    valid = polar_valid.float()
+    bin_idx = torch.clamp((polar_t * n_radial_bins).long(), 0, n_radial_bins - 1)   # (B, N)
+
+    total = density.new_zeros(())
+    count = density.new_zeros(())
+    for b in range(n_radial_bins):
+        in_bin = (bin_idx == b).float() * valid                  # (B, N)
+        n_b = in_bin.sum(dim=1)                                  # (B,)
+        has_enough = (n_b >= 2).float()                          # (B,)
+        if float(has_enough.sum()) == 0.0:
+            continue
+        mean_b = (density * in_bin).sum(dim=1) / n_b.clamp(min=1.0)             # (B,)
+        var_b = (((density - mean_b.unsqueeze(1)) ** 2) * in_bin).sum(dim=1) \
+            / n_b.clamp(min=1.0)                                                # (B,)
+        total = total + (var_b * has_enough).sum()
+        count = count + has_enough.sum()
+    if float(count) == 0.0:
+        return density.new_zeros(())
+    return total / count
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
