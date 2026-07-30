@@ -363,6 +363,7 @@ def _compute_axis_data_for_samples(
     inner_margin = cfg.candidates.inner_margin
     width_decay_weight = cfg.candidates.width_decay_weight
     width_ceiling_weight = cfg.candidates.width_ceiling_weight
+    classical_concentricity_weight = cfg.candidates.classical_concentricity_weight
     n_samples_axis = 50
     walkthrough_iid = _pick_walkthrough_iid(samples, image_dir,
                                             seg_params=cfg.segmentation.as_params())
@@ -589,14 +590,20 @@ def _compute_axis_data_for_samples(
                                     inner_margin=inner_margin)
             if crop_x0 or crop_y0:
                 _dpk = [(t, s, x + crop_x0, y + crop_y0, r) for (t, s, x, y, r) in _dpk]
-            _cpk = classical_increments(orig_rgb, axis_info, inner_margin=inner_margin)["peaks"]
+            _cinc = classical_increments(
+                orig_rgb, axis_info, inner_margin=inner_margin,
+                return_profiles=(classical_concentricity_weight > 0.0))
+            _cpk = _cinc["peaks"]
+            _cprof = _cinc.get("profiles")
             _age = int(row.get("predicted_age", 0))
             _sc = min(1.0, 360 / max(H_img, W_img))
             _dw, _dh = max(1, int(W_img * _sc)), max(1, int(H_img * _sc))
             for _m in ("density", "classical", "consensus", "dp"):
                 _fr = fuse_increments(_dpk, _cpk, _age, axis_info, method=_m,
                                       width_decay_weight=width_decay_weight,
-                                      width_ceiling_weight=width_ceiling_weight)
+                                      width_ceiling_weight=width_ceiling_weight,
+                                      classical_profiles=_cprof,
+                                      classical_concentricity_weight=classical_concentricity_weight)
                 _ov = render_localization_overlay(orig_rgb, axis_info,
                                                   _fr["final_axis_pts"], _fr["candidate_pts"],
                                                   inner_margin=inner_margin)
@@ -628,7 +635,8 @@ def _compute_axis_data_for_samples(
                                           density_min_distance=min_dist, density_prominence=prominence,
                                           inner_margin=inner_margin,
                                           width_decay_weight=width_decay_weight,
-                                          width_ceiling_weight=width_ceiling_weight)
+                                          width_ceiling_weight=width_ceiling_weight,
+                                          classical_concentricity_weight=classical_concentricity_weight)
                 _p0 = render_patch_grid(orig_rgb, axis_info)          # krok 0: siatka patchy 37×37
                 _p1 = render_rays_and_candidates(orig_rgb, axis_info,
                                                  _wd["density_pts"], _wd["classical_pts"],

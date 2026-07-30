@@ -437,6 +437,104 @@ def _cluster_by_radius_with_arcs(
     return out
 
 
+def _best_arc_members(ray_idxs: np.ndarray, n_dirs: int, max_gap: int) -> set:
+    """Like :func:`_best_arc`, but returns the actual SET of ray indices in the winning
+    contiguous run instead of just its ``(run_len, run_strength)``. Visualization
+    support only (29.07, feeds :func:`assign_rays_to_clusters`) — ``_best_arc`` itself
+    is untouched, still used for scoring, so this never risks the scoring contract."""
+    uniq = sorted(set(int(r) for r in ray_idxs))
+    if not uniq:
+        return set()
+    if len(uniq) == 1:
+        return {uniq[0]}
+    doubled = uniq + [r + n_dirs for r in uniq]
+    n = len(doubled)
+    best_len, best_members = 0, set()
+    for start in range(len(uniq)):
+        end = start
+        while (end + 1 < n and doubled[end + 1] - doubled[end] - 1 <= max_gap
+               and doubled[end + 1] - doubled[start] < n_dirs):
+            end += 1
+        span = min(doubled[end] - doubled[start] + 1, n_dirs)
+        members = {x % n_dirs for x in doubled[start:end + 1]}
+        if span > best_len:
+            best_len, best_members = span, members
+    return best_members
+
+
+def _arc_band(ray_idxs: np.ndarray, n_dirs: int, max_gap: int) -> set:
+    """Like :func:`_best_arc_members`, but returns the FULL geometric angular band the
+    winning contiguous run spans — every ray index between its first and last member
+    (inclusive, wrapping around 0/``n_dirs``) — not just the subset that individually
+    registered a peak. :func:`_best_arc_members` deliberately excludes gap positions
+    (rays that fell below the peak-detection threshold there) because it's used to draw
+    which DETECTED peaks belong to the arc; this function is used to decide which rays'
+    raw signal VALUE should even be compared for within-segment consistency (29.07,
+    concentricity-restricted-to-segment fix) — a ray inside the arc's angular span that
+    simply didn't cross the peak threshold there still belongs to the expressed segment
+    and its value should count, not be treated as "outside evidence"."""
+    uniq = sorted(set(int(r) for r in ray_idxs))
+    if not uniq:
+        return set()
+    if len(uniq) == 1:
+        return {uniq[0]}
+    doubled = uniq + [r + n_dirs for r in uniq]
+    n = len(doubled)
+    best_len, best_band = 0, set()
+    for start in range(len(uniq)):
+        end = start
+        while (end + 1 < n and doubled[end + 1] - doubled[end] - 1 <= max_gap
+               and doubled[end + 1] - doubled[start] < n_dirs):
+            end += 1
+        span = min(doubled[end] - doubled[start] + 1, n_dirs)
+        band = {i % n_dirs for i in range(doubled[start], doubled[end] + 1)}
+        if span > best_len:
+            best_len, best_band = span, band
+    return best_band
+
+
+def assign_rays_to_clusters(
+    peaks, clusters, t_tol: float = 0.06, n_dirs: int = 48, max_gap: int = 2,
+) -> List[dict]:
+    """For each arc-aware ``cluster`` (from :func:`_cluster_by_radius_with_arcs`), which
+    of ``peaks``' ray indices belong to it — split into the winning contiguous arc vs
+    scattered-but-in-cluster support, plus the full angular band the arc spans. Used
+    both for visualization (``visualization.render_arc_cluster_overlay`` draws "which
+    rays merge") AND, via ``"band"``, to restrict :func:`_classical_concentricity_
+    variance` to the segment where a ring is actually expressed (29.07) rather than the
+    full circumference — see :func:`_scored_classical_cluster`.
+
+    Re-derives peak→cluster assignment by nearest ``mean_t`` (same rule
+    ``_cluster_by_radius_with_arcs`` used to build these clusters in the first place) —
+    a lightweight, self-contained recomputation is fine here since scoring call sites
+    that need this pass the SAME ``peaks``/``clusters``/``t_tol``/``n_dirs`` used to
+    build the clusters in the first place, so the recomputation is exact, not approximate.
+
+    Returns one dict per cluster: ``{"mean_t", "support", "arc_len", "score",
+    "arc_rays": set[int], "other_rays": set[int], "band": set[int]}`` (``other_rays`` =
+    same-cluster members NOT in the winning arc; ``band`` = every ray index within the
+    arc's angular span, detected-peak or not — see :func:`_arc_band`).
+    """
+    if not peaks or not clusters:
+        return []
+    ts = np.asarray([p[0] for p in peaks], dtype=np.float64)
+    rays = np.asarray([p[4] for p in peaks], dtype=np.int64)
+    modes = np.asarray([c[0] for c in clusters], dtype=np.float64)
+    nearest = np.abs(ts[:, None] - modes[None, :]).argmin(axis=1)
+    out: List[dict] = []
+    for mi, c in enumerate(clusters):
+        sel = (nearest == mi) & (np.abs(ts - modes[mi]) <= t_tol)
+        member_rays = {int(r) for r in rays[sel]}
+        arc_rays = _best_arc_members(rays[sel], n_dirs, max_gap) if sel.any() else set()
+        band = _arc_band(rays[sel], n_dirs, max_gap) if sel.any() else set()
+        out.append({
+            "mean_t": float(c[0]), "support": int(c[1]), "arc_len": int(c[3]),
+            "score": _cluster_score(c), "arc_rays": arc_rays,
+            "other_rays": member_rays - arc_rays, "band": band,
+        })
+    return out
+
+
 def _cluster_score(c) -> float:
     """Score an arc-aware cluster ``(mean_t, support, mean_strength, arc_len, arc_strength)``
     (23.07, hoisted out of ``_merge_clusters`` so ``select_increments``/``fuse_increments``'s
@@ -447,6 +545,116 @@ def _cluster_score(c) -> float:
     best-arc — a reasonable first-pass split, not yet tuned/validated against real cards."""
     _t, support, mean_strength, arc_len, arc_strength = c
     return support * mean_strength * 0.4 + arc_len * arc_strength * 0.6
+
+
+# Fixed, same-ray denoising half-width for the concentricity variance below — NOT a
+# second tunable, and NOT cross-ray averaging (that's E3's rejected mistake, see
+# polar_averaged_increments). It only smooths one ray's own value at its own sample
+# index over its own immediate neighbours before comparing that ray to the others.
+_CONCENTRICITY_IDX_HALF_WIDTH = 1
+
+
+def _classical_concentricity_variance(
+    mean_t: float, profiles: Optional[List[Optional[np.ndarray]]],
+    ray_indices: Optional[set] = None,
+) -> Optional[float]:
+    """Classical, post-hoc analogue of ``model.py::density_concentricity_loss`` (E9):
+    variance ACROSS ANGLE (across rays) of the classical signal at a fixed normalised
+    radius ``mean_t`` — using classical's own per-ray ``t = idx/(n_samples-1)``
+    (:func:`_all_ray_profiles`), not ``otolith_axis.compute_polar_grid``'s ``t`` (a
+    separately-computed, closely related but not numerically identical normalisation
+    — unifying them would be a bigger, unwarranted change; see the module notes on E9).
+
+    ``ray_indices`` (29.07, restricted-to-segment fix): when given, ONLY those rays'
+    values are compared — normally the arc's angular ``"band"`` from
+    :func:`assign_rays_to_clusters`, i.e. the segment of the circumference where this
+    ring is actually expressed. This matters biologically: annual increments are
+    rarely expressed evenly around the ENTIRE circumference — a segment with strong,
+    consistent expression and the rest of the circumference weak/absent is the NORMAL
+    case, not an inconsistency. Comparing all 48 rays regardless of whether the ring
+    is even expressed there would penalise that normal case identically to genuine
+    noise. When ``ray_indices`` is ``None`` (back-compat / no arc info available),
+    falls back to every valid ray, same as before.
+
+    Unlike arc-scoring (:func:`_best_arc`), this looks at EVERY ray's actual signal
+    VALUE at this radius (within the segment), not just the subset of rays whose own
+    per-ray peak-finding happened to cross a threshold here. Unlike E3
+    (:func:`polar_averaged_increments`), it never averages rays together into one
+    signal before anything else happens — clustering and peak-finding are already done
+    by the time this runs; only the final SCORE of an already-formed cluster is
+    affected, per the project's E3 lesson (averaging across rays destroys partial-arc
+    rings; this function only ever reduces WITHIN one ray, at one fixed sample index,
+    over ``2*_CONCENTRICITY_IDX_HALF_WIDTH+1`` neighbours, to denoise a single noisy
+    pixel reading — never across rays).
+
+    Returns the population variance of the (already-per-ray-[0,1]-normalised) values,
+    intrinsically bounded to ``[0, 0.25]`` (Bhatia-Davis), or ``None`` when fewer than
+    2 rays have data (mirrors E9's ``has_enough = n_b >= 2`` gate) — callers must treat
+    ``None`` as "can't measure, no penalty," never as evidence of concentricity.
+    """
+    if not profiles:
+        return None
+    if ray_indices is not None:
+        candidates = [profiles[r] for r in ray_indices
+                     if 0 <= r < len(profiles) and profiles[r] is not None]
+    else:
+        candidates = [p for p in profiles if p is not None]
+    if len(candidates) < 2:
+        return None
+    n_samples = len(candidates[0])
+    idx = int(round(mean_t * (n_samples - 1)))
+    idx = max(0, min(n_samples - 1, idx))
+    lo = max(0, idx - _CONCENTRICITY_IDX_HALF_WIDTH)
+    hi = min(n_samples - 1, idx + _CONCENTRICITY_IDX_HALF_WIDTH)
+    per_ray_vals = [float(np.mean(p[lo:hi + 1])) for p in candidates]
+    return float(np.var(per_ray_vals))
+
+
+def _classical_concentricity_factor(
+    mean_t: float, profiles: Optional[List[Optional[np.ndarray]]], weight: float,
+    ray_indices: Optional[set] = None,
+) -> float:
+    """Multiplicative [0,1] score factor from :func:`_classical_concentricity_variance`.
+
+    ``weight<=0`` or no profiles → exact no-op (``1.0``) — matches the off-by-default
+    contract of every experimental weight in this codebase (``density_concentricity_
+    weight``, ``width_decay_weight``/``width_ceiling_weight``). ``variance is None`` →
+    also ``1.0`` (can't measure → don't penalise). Otherwise ``max(0.0, 1 - weight*var)``:
+    scaled by the cluster's OWN score at the call site (see :func:`_scored_classical_
+    cluster`), not by a global mean like ``_dp_select_t``'s width penalties — the
+    penalty is a property of this one cluster, not a transition between two picks.
+    ``ray_indices`` restricts the variance to the expressed segment — see
+    :func:`_classical_concentricity_variance`.
+    """
+    if weight <= 0.0 or not profiles:
+        return 1.0
+    variance = _classical_concentricity_variance(mean_t, profiles, ray_indices)
+    if variance is None:
+        return 1.0
+    return max(0.0, 1.0 - weight * variance)
+
+
+def _scored_classical_cluster(
+    c: Tuple[float, int, float, int, float],
+    classical_profiles: Optional[List[Optional[np.ndarray]]],
+    classical_concentricity_weight: float,
+    ray_indices: Optional[set] = None,
+) -> float:
+    """THE ONE place a classical cluster's production score includes the concentricity
+    term — every call site scoring a classical-sourced cluster (``fuse_increments``'s
+    ``"classical"``/``"consensus"`` branches, both branches of ``_merge_clusters``) uses
+    this instead of bare ``_cluster_score``, so the term can never be applied
+    inconsistently across branches. Density-sourced clusters never call this — E9
+    already gives density a TRAINED concentricity prior; this is classical's own,
+    post-hoc, non-trained analogue, deliberately scoped away from density's scoring.
+
+    ``ray_indices`` should be this cluster's arc ``"band"`` (from
+    :func:`assign_rays_to_clusters`) — restricts the concentricity check to the segment
+    where the ring is actually expressed, instead of penalising the (biologically
+    normal) case where the rest of the circumference is weak/absent. ``None`` falls
+    back to checking all 48 rays (only used where no band is available)."""
+    return _cluster_score(c) * _classical_concentricity_factor(
+        c[0], classical_profiles, classical_concentricity_weight, ray_indices)
 
 
 def _project_to_axis(chosen_t, axis_info: dict) -> List[Tuple[int, int]]:
@@ -619,6 +827,7 @@ def classical_increments(
     inner_margin: float = 0.05,
     edge_margin: float = 0.08,
     t_tol: float = 0.06,
+    return_profiles: bool = False,
 ) -> dict:
     """Classical (image-intensity) increment candidates along the SAME rays as the model.
 
@@ -633,9 +842,15 @@ def classical_increments(
       candidate_pts : list[(x, y)]                every per-ray intensity peak (image px)
       peaks         : list[(t, strength, x, y)]   same, with normalised radius + strength
       clusters      : list[(mean_t, support, mean_strength)]  rings-by-radius (consensus)
+      profiles      : list[Optional[ndarray]]     per-ray [0,1]-normalised signal — ONLY
+                       present when ``return_profiles=True`` (default False = today's exact
+                       behaviour/cost; feeds the concentricity scoring in fuse_increments).
     """
     if not axis_info:
-        return {"candidate_pts": [], "peaks": [], "clusters": []}
+        empty: dict = {"candidate_pts": [], "peaks": [], "clusters": []}
+        if return_profiles:
+            empty["profiles"] = []
+        return empty
     gray = _to_numpy(gray_image)
     if gray.ndim == 3:                                  # RGB → luminancja
         gray = gray.mean(axis=2).astype(np.float32)
@@ -646,8 +861,14 @@ def classical_increments(
         prominence=prominence, inner_margin=inner_margin, edge_margin=edge_margin,
         smooth_sigma=smooth_sigma,
     )
-    return {"candidate_pts": candidate_pts, "peaks": peaks,
-            "clusters": _cluster_by_radius(peaks, t_tol)}
+    result = {"candidate_pts": candidate_pts, "peaks": peaks,
+             "clusters": _cluster_by_radius(peaks, t_tol)}
+    if return_profiles:
+        profiles, _line_xys, _contour_pts = _all_ray_profiles(
+            gray, axis_info, image_h, image_w,
+            n_dirs=n_dirs, n_samples=n_samples, smooth_sigma=smooth_sigma)
+        result["profiles"] = profiles
+    return result
 
 
 def polar_averaged_increments(
@@ -720,7 +941,11 @@ def density_peaks(
     )
 
 
-def _merge_clusters(density_pks, classical_pks, t_tol: float = 0.06, n_dirs: int = 48):
+def _merge_clusters(
+    density_pks, classical_pks, t_tol: float = 0.06, n_dirs: int = 48,
+    classical_profiles: Optional[List[Optional[np.ndarray]]] = None,
+    classical_concentricity_weight: float = 0.0,
+):
     """Merge density + classical radius-clusters into candidate rings ``[(t, score, source)]``.
 
     A density ring corroborated by a classical ring at a similar radius (``t_tol``) becomes
@@ -737,9 +962,27 @@ def _merge_clusters(density_pks, classical_pks, t_tol: float = 0.06, n_dirs: int
     one otolith's user-reported example: sharp bands visible in the top/left arcs only,
     faint elsewhere). Weighted 0.4 total-support + 0.6 best-arc — a reasonable first-pass
     split, not yet tuned/validated against real cards.
+
+    ``classical_profiles``/``classical_concentricity_weight`` (29.07, classical's own
+    post-hoc analogue of E9): when the weight is >0, the CLASSICAL side of both the
+    corroborated (consensus) and classical-only scores is computed via
+    :func:`_scored_classical_cluster` instead of bare :func:`_cluster_score` — a classical
+    ring whose signal is consistent WITHIN its own expressed arc (not just the ones that
+    individually peaked, but restricted to that arc's angular band, NOT the full
+    circumference — see :func:`assign_rays_to_clusters`'s ``"band"``) scores higher than
+    one that's equally supported but internally inconsistent. Restricting to the arc's
+    own band (rather than comparing against the whole 360°) matters biologically: annual
+    increments are rarely expressed evenly around the entire circumference, so a
+    strongly-expressed segment with a weak/absent rest-of-circumference must NOT be
+    penalised as inconsistent — only genuine disagreement WITHIN the expressed segment
+    should be. Density's own score is never touched by this — E9 already gives density a
+    TRAINED concentricity prior; this is classical's separate, non-trained mechanism.
+    Defaults to a no-op (``weight=0.0``) — byte-identical to calling this with no new args.
     """
     dclust = _cluster_by_radius_with_arcs(density_pks, t_tol, n_dirs)
     cclust = _cluster_by_radius_with_arcs(classical_pks, t_tol, n_dirs)
+    cbands = ([m["band"] for m in assign_rays_to_clusters(classical_pks, cclust, t_tol, n_dirs)]
+             if classical_concentricity_weight > 0.0 else [None] * len(cclust))
 
     merged: List[Tuple[float, float, str]] = []
     used = [False] * len(cclust)
@@ -754,12 +997,14 @@ def _merge_clusters(density_pks, classical_pks, t_tol: float = 0.06, n_dirs: int
         if best_i >= 0:                                  # density ring corroborated by classical
             c = cclust[best_i]
             used[best_i] = True
-            score += _cluster_score(c)
+            score += _scored_classical_cluster(
+                c, classical_profiles, classical_concentricity_weight, cbands[best_i])
             t, source = 0.5 * (dt + c[0]), "consensus"
         merged.append((t, score, source))
     for i, c in enumerate(cclust):                       # classical-only rings still eligible
         if not used[i]:
-            merged.append((c[0], _cluster_score(c), "classical"))
+            merged.append((c[0], _scored_classical_cluster(
+                c, classical_profiles, classical_concentricity_weight, cbands[i]), "classical"))
     return merged
 
 
@@ -768,6 +1013,8 @@ def fuse_increments(
     *, method: str = "consensus", t_tol: float = 0.06, dp_min_gap: float = 0.04,
     n_dirs: int = 48, dp_spread_weight: float = 1.5,
     width_decay_weight: float = 1.0, width_ceiling_weight: float = 3.0,
+    classical_profiles: Optional[List[Optional[np.ndarray]]] = None,
+    classical_concentricity_weight: float = 0.0,
 ) -> dict:
     """Choose the final ``predicted_age`` increments on the axis from peak sources.
 
@@ -776,7 +1023,8 @@ def fuse_increments(
     count they were cast with. ``method``:
       * ``"density"``   — density peaks only (model localisation), arc-aware clusters
         (:func:`_cluster_by_radius_with_arcs`/:func:`_cluster_score`), DP-selected.
-      * ``"classical"`` — classical (image-intensity) peaks only, same arc-aware DP selection.
+      * ``"classical"`` — classical (image-intensity) peaks only, same arc-aware DP selection
+        (plus the concentricity term below, on the classical side only).
       * ``"consensus"`` — clusters where density AND classical agree on radius ``t`` (summed
         arc-aware score), DP-selected; falls back to top density clusters if fewer than `age`
         agree.
@@ -787,6 +1035,15 @@ def fuse_increments(
     biological growth prior (first increment widest, later ones generally non-increasing —
     ``width_decay_weight``/``width_ceiling_weight``, see :func:`_dp_select_t`'s docstring) —
     so the report's method bake-off is consistent with the production selector.
+
+    ``classical_profiles``/``classical_concentricity_weight`` (29.07): classical's own
+    post-hoc, non-trained analogue of E9's concentricity prior — see
+    :func:`_scored_classical_cluster`. Only affects the CLASSICAL side of the
+    ``"classical"``/``"consensus"``/``"dp"`` branches (``"density"`` is untouched — E9
+    already gives density a trained concentricity prior). ``classical_concentricity_
+    weight=0.0`` (default) is an exact no-op, identical to calling this function without
+    these two arguments at all.
+
     Returns ``{final_t, final_axis_pts, candidate_pts}`` (candidates = the source(s) used).
     """
     empty = {"final_t": [], "final_axis_pts": [], "candidate_pts": []}
@@ -798,28 +1055,43 @@ def fuse_increments(
         return _dp_select_t(cands, k, dp_min_gap, dp_spread_weight,
                             width_decay_weight, width_ceiling_weight)
 
+    def _cscore(c, band=None):
+        return _scored_classical_cluster(c, classical_profiles, classical_concentricity_weight, band)
+
+    # Bands (the arc's angular span — see assign_rays_to_clusters) are only worth
+    # computing when the concentricity term is actually active; at weight<=0
+    # _cscore(c, None) is an exact no-op anyway, so skip the extra work.
+    def _bands_for(clusters, peaks):
+        if classical_concentricity_weight <= 0.0:
+            return [None] * len(clusters)
+        return [m["band"] for m in assign_rays_to_clusters(peaks, clusters, t_tol, n_dirs)]
+
     if method == "density":
         clusters = _cluster_by_radius_with_arcs(density_pks, t_tol, n_dirs)
         chosen = _dp([(c[0], _cluster_score(c)) for c in clusters])
         cand = [(p[2], p[3]) for p in density_pks]
     elif method == "classical":
         clusters = _cluster_by_radius_with_arcs(classical_pks, t_tol, n_dirs)
-        chosen = _dp([(c[0], _cluster_score(c)) for c in clusters])
+        bands = _bands_for(clusters, classical_pks)
+        chosen = _dp([(c[0], _cscore(c, b)) for c, b in zip(clusters, bands)])
         cand = [(p[2], p[3]) for p in classical_pks]
     elif method == "dp":
-        merged = _merge_clusters(density_pks, classical_pks, t_tol, n_dirs)
+        merged = _merge_clusters(density_pks, classical_pks, t_tol, n_dirs,
+                                 classical_profiles, classical_concentricity_weight)
         chosen = _dp([(t, s) for (t, s, _src) in merged])
         cand = [(p[2], p[3]) for p in density_pks] + [(p[2], p[3]) for p in classical_pks]
     else:  # consensus
         dclust = _cluster_by_radius_with_arcs(density_pks, t_tol, n_dirs)
         cclust = _cluster_by_radius_with_arcs(classical_pks, t_tol, n_dirs)
+        cbands = _bands_for(cclust, classical_pks)
         agreed = []                                     # (mean_t, combined_score)
         for dc in dclust:
             dt = dc[0]
-            near = [c for c in cclust if abs(c[0] - dt) <= t_tol]
-            if near:
-                c = min(near, key=lambda cc: abs(cc[0] - dt))
-                agreed.append((0.5 * (dt + c[0]), _cluster_score(dc) + _cluster_score(c)))
+            near_idx = [i for i, c in enumerate(cclust) if abs(c[0] - dt) <= t_tol]
+            if near_idx:
+                bi = min(near_idx, key=lambda i: abs(cclust[i][0] - dt))
+                c = cclust[bi]
+                agreed.append((0.5 * (dt + c[0]), _cluster_score(dc) + _cscore(c, cbands[bi])))
         chosen = _dp(agreed)
         if len(chosen) < k:                             # fallback: fill from top density clusters
             ranked = sorted(dclust, key=_cluster_score, reverse=True)
@@ -893,7 +1165,8 @@ def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int,
                         density_min_distance: int = 3, density_prominence: float = 0.1,
                         classical_smooth_sigma: float = 0.0, classical_min_distance: int = 1,
                         classical_prominence: float = 0.02, inner_margin: float = 0.05,
-                        edge_margin: float = 0.08, n_example_rays: int = 3) -> dict:
+                        edge_margin: float = 0.08, n_example_rays: int = 3,
+                        classical_concentricity_weight: float = 0.0) -> dict:
     """All intermediate artifacts of ``fuse_increments(method="dp")`` for ONE otolith.
 
     Feeds the step-by-step report section: candidates from 48 rays (density + classical),
@@ -905,6 +1178,11 @@ def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int,
     intensity is what a human eye — and, downstream, most of the fused score — actually responds
     to (20.07, user report: a chart showing near-zero density looked like "no signal" even though
     classical clearly found peaks at the same visible bands).
+
+    ``classical_concentricity_weight`` (29.07): when >0, requests per-ray profiles from
+    ``classical_increments`` and threads them into ``_merge_clusters`` — keeps
+    ``chosen_t == fuse_increments(..., method="dp", classical_concentricity_weight=...)
+    ["final_t"]`` true for any weight, not just 0.0.
     """
     dpk, dpts = density_peaks(density_grid, axis_info, image_h, image_w,
                               n_dirs=n_dirs, n_samples=n_samples, min_distance=density_min_distance,
@@ -913,9 +1191,11 @@ def dp_walkthrough_data(density_grid, gray_image, axis_info: dict, image_h: int,
     cinc = classical_increments(gray_image, axis_info, n_dirs=n_dirs, n_samples=n_samples,
                                 smooth_sigma=classical_smooth_sigma, min_distance=classical_min_distance,
                                 prominence=classical_prominence, inner_margin=inner_margin,
-                                edge_margin=edge_margin, t_tol=t_tol)
+                                edge_margin=edge_margin, t_tol=t_tol,
+                                return_profiles=(classical_concentricity_weight > 0.0))
     cpk, cpts = cinc["peaks"], cinc["candidate_pts"]
-    merged = _merge_clusters(dpk, cpk, t_tol, n_dirs)
+    cprof = cinc.get("profiles")
+    merged = _merge_clusters(dpk, cpk, t_tol, n_dirs, cprof, classical_concentricity_weight)
     k = max(0, int(predicted_age))
     chosen = _dp_select_t([(t, s) for (t, s, _src) in merged], k, dp_min_gap, dp_spread_weight,
                           width_decay_weight, width_ceiling_weight)

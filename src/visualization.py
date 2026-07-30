@@ -705,6 +705,64 @@ def render_rays_and_candidates(
     return img
 
 
+# Distinct per-cluster colours (RGB) — same values as ring_extraction._RING_PALETTE,
+# duplicated here (not imported) to keep visualization.py decoupled from
+# ring_extraction.py, matching every other render_* function in this module (they all
+# take plain lists/tuples, never ring_extraction's internal types).
+_ARC_CLUSTER_PALETTE = [
+    (228, 26, 28), (55, 126, 184), (77, 175, 74), (152, 78, 163),
+    (255, 127, 0), (0, 206, 209), (166, 86, 40), (247, 129, 191),
+]
+
+
+def render_arc_cluster_overlay(
+    image: np.ndarray,
+    axis_info: Optional[dict],
+    cluster_memberships: list[dict],
+    n_dirs: int = 48,
+    inner_margin: float = 0.05,
+) -> np.ndarray:
+    """Visualize the arc-aware clustering mechanism (``ring_extraction._best_arc`` /
+    ``_cluster_by_radius_with_arcs``) directly on the otolith — "which rays merge into
+    one ring candidate" (29.07).
+
+    ``cluster_memberships`` comes from ``ring_extraction.assign_rays_to_clusters``:
+    one dict per radius-cluster with ``arc_rays`` (ray indices in the winning
+    CONTIGUOUS run — drawn thick, full colour) and ``other_rays`` (same-cluster rays
+    OUTSIDE that run — scattered support, drawn thin/faint, same colour). Each cluster
+    gets its own colour (cycled from a fixed palette) so "thick+thin, same colour" reads
+    as one candidate ring, distinct from every other cluster's colour.
+    """
+    img = np.ascontiguousarray(image[..., :3]).copy()
+    H = img.shape[0]
+    if axis_info is None:
+        return img
+    draw_nucleus_exclusion_zone(img, axis_info, inner_margin=inner_margin, n_dirs=n_dirs)
+    contour = axis_info.get("contour")
+    centroid = axis_info.get("centroid")
+    if contour is None or centroid is None:
+        return img
+    cx, cy = int(centroid[0]), int(centroid[1])
+    cpts = contour.reshape(-1, 2)
+    idx_sel = np.linspace(0, len(cpts) - 1, min(n_dirs, len(cpts)), dtype=int)
+    thin_lt = 1
+    thick_lt = max(3, H // 150)
+    for ci, membership in enumerate(cluster_memberships):
+        color = _ARC_CLUSTER_PALETTE[ci % len(_ARC_CLUSTER_PALETTE)]
+        for ray_idx in membership.get("other_rays", ()):
+            if 0 <= ray_idx < len(idx_sel):
+                pt = cpts[idx_sel[ray_idx]]
+                overlay = img.copy()
+                cv2.line(overlay, (cx, cy), (int(pt[0]), int(pt[1])), color, thin_lt, cv2.LINE_AA)
+                cv2.addWeighted(overlay, 0.45, img, 0.55, 0, dst=img)
+        for ray_idx in membership.get("arc_rays", ()):
+            if 0 <= ray_idx < len(idx_sel):
+                pt = cpts[idx_sel[ray_idx]]
+                cv2.line(img, (cx, cy), (int(pt[0]), int(pt[1])), color, thick_lt, cv2.LINE_AA)
+    cv2.drawContours(img, [contour], -1, _CONTOUR_COLOR, max(2, H // 300))
+    return img
+
+
 _RAY_HIGHLIGHT_COLOR = (230, 30, 30)   # red — the ONE ray singled out for Krok 2
 
 

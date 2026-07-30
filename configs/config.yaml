@@ -122,6 +122,12 @@ candidates:
   # status co inner_margin=0.20) — nie skalibrowane na prawdziwych kartach.
   width_decay_weight: 1.0
   width_ceiling_weight: 3.0
+  # 29.07: klasyczny, NIE-trenowany odpowiednik E9 (model.density_concentricity_weight)
+  # — kara za wariancję sygnału klasycznego między promieniami przy tym samym promieniu
+  # klastra (src/ring_extraction.py::_scored_classical_cluster). 0.0 = wyłączone, zero
+  # zmiany zachowania. JAWNIE NIEZWERYFIKOWANY punkt startowy, do zmierzenia przez
+  # scripts/diagnostics/sweep_classical_concentricity_weight.py.
+  classical_concentricity_weight: 0.0
 
 segmentation:                     # otolith outline detection (src/otolith_axis.py)
   method: radial                  # radial (smooth, reaches faint rim) | threshold (Otsu+hysteresis fallback)

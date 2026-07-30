@@ -213,6 +213,15 @@ class CandidatesConfig(BaseModel):
     # calibrated against real cards. See plans and summaries/22.07_TO_DO.MD.
     width_decay_weight: float = Field(1.0, ge=0.0)
     width_ceiling_weight: float = Field(3.0, ge=0.0)
+    # 29.07: classical's own POST-HOC, non-trained analogue of ModelConfig.
+    # density_concentricity_weight (E9) — penalises a classical radius-cluster whose
+    # signal VALUE varies a lot across the 48 rays at that radius (not just whether each
+    # ray individually cleared the peak-detection threshold — that's arc-scoring, a
+    # different, already-existing mechanism). See src/ring_extraction.py::
+    # _scored_classical_cluster / _classical_concentricity_variance. 0.0 (off) = zero
+    # behaviour change, exactly the E9 rollout pattern. EXPLICITLY UNVERIFIED starting
+    # point pending scripts/diagnostics/sweep_classical_concentricity_weight.py.
+    classical_concentricity_weight: float = Field(0.0, ge=0.0)
 
 
 class SegmentationConfig(BaseModel):

@@ -286,6 +286,31 @@ def test_classical_increments_multi_ray_on_gray():
     assert classical_increments(gray, None)["candidate_pts"] == []   # bez osi → pusto, bez crasha
 
 
+def test_classical_increments_return_profiles_flag():
+    """return_profiles=False (domyślne) = dokładnie dzisiejszy zestaw kluczy (zero kosztu);
+    True dorzuca 'profiles' — n_dirs znormalizowanych do [0,1] profili per-promień."""
+    import numpy as np
+    from src.ring_extraction import classical_increments
+    H, W = 120, 200
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    cx, cy = axis_info["centroid"]
+    yy, xx = np.mgrid[0:H, 0:W]
+    r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    gray = (128 + 100 * np.cos(r / 6.0)).astype(np.float32)
+
+    default_out = classical_increments(gray, axis_info)
+    assert "profiles" not in default_out
+
+    out = classical_increments(gray, axis_info, return_profiles=True, n_dirs=48)
+    assert "profiles" in out
+    assert len(out["profiles"]) == 48
+    for p in out["profiles"]:
+        assert p is None or (0.0 - 1e-6 <= p.min() and p.max() <= 1.0 + 1e-6)
+
+    no_axis = classical_increments(gray, None, return_profiles=True)
+    assert no_axis == {"candidate_pts": [], "peaks": [], "clusters": [], "profiles": []}
+
+
 def test_density_peaks_shape():
     import numpy as np
     from src.ring_extraction import density_peaks
@@ -380,6 +405,74 @@ def test_fuse_increments_dp_enforces_spacing():
     assert len(fuse_increments(density, [], 9, axis_info, method="dp")["final_t"]) == 3
 
 
+def test_fuse_increments_classical_concentricity_weight_zero_is_noop():
+    """classical_concentricity_weight=0.0 (default) must reproduce EXACTLY today's
+    fuse_increments output (byte-identical final_t) for every method that scores
+    classical clusters — confirms the off-by-default contract end-to-end, not just at
+    the helper-function level."""
+    from src.ring_extraction import fuse_increments
+    H, W = 120, 200
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    cx, cy = axis_info["centroid"]
+    fx, fy = axis_info["far_edge"]
+
+    def pk(t, ray):
+        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)), ray)
+
+    density = [pk(0.30, 0), pk(0.31, 1), pk(0.60, 2), pk(0.61, 3)]
+    classical = [pk(0.29, 0), pk(0.30, 1), pk(0.60, 2), pk(0.90, 3), pk(0.91, 4)]
+    fake_profiles = [np.linspace(0.0, 1.0, 64, dtype=np.float32) for _ in range(48)]
+    for m in ("classical", "consensus", "dp"):
+        baseline = fuse_increments(density, classical, 2, axis_info, method=m)["final_t"]
+        with_zero_weight = fuse_increments(
+            density, classical, 2, axis_info, method=m,
+            classical_profiles=fake_profiles, classical_concentricity_weight=0.0,
+        )["final_t"]
+        assert with_zero_weight == baseline
+
+
+def test_fuse_increments_classical_concentricity_weight_prefers_concentric_cluster():
+    """Forced choice: a 9-ray classical cluster (t_high, slightly higher raw
+    _cluster_score than an 8-ray one at t_low) normally wins at weight=0 — but its
+    signal is wildly inconsistent across rays at its own radius, while t_low's is
+    perfectly consistent. A strong enough classical_concentricity_weight must flip the
+    choice to the concentric (t_low) ring. dp_spread_weight/width_*_weight forced to 0
+    to isolate the concentricity effect from _dp_select_t's OWN "prefer larger t for a
+    lone first pick" bonus, which would otherwise confound this forced choice."""
+    from src.ring_extraction import fuse_increments
+    H, W = 120, 200
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    cx, cy = axis_info["centroid"]
+    fx, fy = axis_info["far_edge"]
+
+    def pk(t, ray):
+        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)), ray)
+
+    t_low, t_high = 0.30, 0.60
+    classical = [pk(t_low, i) for i in range(8)] + [pk(t_high, i) for i in range(9)]
+
+    n_samples = 64
+    idx_low = int(round(t_low * (n_samples - 1)))
+    idx_high = int(round(t_high * (n_samples - 1)))
+    profiles = []
+    for ray in range(48):
+        p = np.full(n_samples, 0.5, dtype=np.float32)
+        p[idx_low] = 0.8                                    # every ray agrees at t_low
+        p[idx_high] = 0.0 if ray % 2 == 0 else 1.0          # rays wildly disagree at t_high
+        profiles.append(p)
+
+    common = dict(dp_spread_weight=0.0, width_decay_weight=0.0, width_ceiling_weight=0.0)
+    chosen_no_weight = fuse_increments(
+        [], classical, 1, axis_info, method="classical",
+        classical_profiles=profiles, classical_concentricity_weight=0.0, **common)["final_t"]
+    chosen_with_weight = fuse_increments(
+        [], classical, 1, axis_info, method="classical",
+        classical_profiles=profiles, classical_concentricity_weight=5.0, **common)["final_t"]
+
+    assert min(abs(t - t_high) for t in chosen_no_weight) < 0.05    # weight=0 → higher-score t_high wins
+    assert min(abs(t - t_low) for t in chosen_with_weight) < 0.05   # weight>0 → concentric t_low wins
+
+
 def test_merge_clusters_consensus_sums_scores():
     """_merge_clusters: pierścień widziany przez density I klasykę na tym samym promieniu →
     jeden pierścień 'consensus' o zsumowanym score; pierścienie solo zachowują źródło."""
@@ -404,6 +497,56 @@ def test_merge_clusters_consensus_sums_scores():
     # pierścień 0.70: tylko density
     key2 = min(merged, key=lambda k: abs(k - 0.70))
     assert merged[key2][1] == "density"
+
+
+def test_merge_clusters_classical_concentricity_weight_reduces_scores():
+    """classical_concentricity_weight>0 must lower BOTH the consensus (density+classical
+    combined) score AND a classical-only score when the classical side is high-variance
+    — covering both scoring branches inside _merge_clusters — while density's own score
+    (0.70, density-only) is completely untouched."""
+    import numpy as np
+    from src.ring_extraction import _merge_clusters
+    H, W = 120, 200
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    cx, cy = axis_info["centroid"]
+    fx, fy = axis_info["far_edge"]
+
+    def pk(t, ray=0):
+        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)), ray)
+
+    density = [pk(0.30, i) for i in range(3)] + [pk(0.70, i) for i in range(2)]
+    classical = [pk(0.31, i) for i in range(4)] + [pk(0.85, i) for i in range(3)]
+
+    n_samples = 64
+    idx_consensus = int(round(0.31 * (n_samples - 1)))
+    idx_solo = int(round(0.85 * (n_samples - 1)))
+    profiles = []
+    for ray in range(48):
+        p = np.full(n_samples, 0.5, dtype=np.float32)
+        p[idx_consensus] = 0.0 if ray % 2 == 0 else 1.0     # high variance, consensus radius
+        p[idx_solo] = 0.0 if ray % 2 == 0 else 1.0          # high variance, classical-only radius
+        profiles.append(p)
+
+    def _merged_dict(weight):
+        return {round(t, 2): (score, src) for (t, score, src) in
+                _merge_clusters(density, classical, classical_profiles=profiles,
+                                classical_concentricity_weight=weight)}
+
+    m0, mw = _merged_dict(0.0), _merged_dict(3.0)
+
+    k_cons_0 = min(m0, key=lambda k: abs(k - 0.30))
+    k_cons_w = min(mw, key=lambda k: abs(k - 0.30))
+    assert m0[k_cons_0][1] == mw[k_cons_w][1] == "consensus"
+    assert mw[k_cons_w][0] < m0[k_cons_0][0]
+
+    k_solo_0 = min(m0, key=lambda k: abs(k - 0.85))
+    k_solo_w = min(mw, key=lambda k: abs(k - 0.85))
+    assert m0[k_solo_0][1] == mw[k_solo_w][1] == "classical"
+    assert mw[k_solo_w][0] < m0[k_solo_0][0]
+
+    k_dens_0 = min(m0, key=lambda k: abs(k - 0.70))
+    k_dens_w = min(mw, key=lambda k: abs(k - 0.70))
+    assert m0[k_dens_0] == mw[k_dens_w]                     # density-only score untouched
 
 
 def test_dp_walkthrough_data_keys_and_consistency():
@@ -449,6 +592,30 @@ def test_dp_walkthrough_data_sample_profiles_use_classical_not_density():
     ref = _example_ray_profiles(gray, axis_info, H, W, min_distance=1, prominence=0.02)
     assert [p["norm"] for p in wd["sample_profiles"]] == [p["norm"] for p in ref]
     assert any(p["peak_t"] for p in wd["sample_profiles"]), "classical signal should yield peaks"
+
+
+def test_dp_walkthrough_data_respects_classical_concentricity_weight():
+    """dp_walkthrough_data's chosen_t must match fuse_increments(method='dp') for ANY
+    classical_concentricity_weight, not just the default 0.0 — guards the plumbing added
+    for the concentricity term against ever silently diverging from real fuse_increments
+    output once the feature is turned on."""
+    import numpy as np
+    from src.ring_extraction import dp_walkthrough_data, fuse_increments, density_peaks, classical_increments
+    H, W = 140, 220
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    rng = np.random.default_rng(0)
+    grid = rng.random((10, 16)).astype(np.float32)
+    gray = rng.random((H, W)).astype(np.float32)
+    age = 3
+    weight = 3.0
+    wd = dp_walkthrough_data(grid, gray, axis_info, H, W, age,
+                             classical_concentricity_weight=weight)
+    dpk, _ = density_peaks(grid, axis_info, H, W)
+    cinc = classical_increments(gray, axis_info, return_profiles=True)
+    ref = fuse_increments(dpk, cinc["peaks"], age, axis_info, method="dp",
+                          classical_profiles=cinc["profiles"],
+                          classical_concentricity_weight=weight)["final_t"]
+    assert wd["chosen_t"] == ref
 
 
 def test_dp_interactive_data_profiles_match_server_peaks():
@@ -583,6 +750,55 @@ def test_render_rays_and_candidates_draws_exclusion_zone():
     out = render_rays_and_candidates(original, axis_info, density_pts=[], classical_pts=[])
     cx, cy = axis_info["centroid"]
     assert not np.array_equal(out[cy, cx], original[cy, cx])
+
+
+def test_render_arc_cluster_overlay_draws_arc_and_scattered_rays():
+    """render_arc_cluster_overlay (29.07): visualizes assign_rays_to_clusters' output —
+    must produce a changed image (rays drawn) and, for a scattered cluster, actually
+    have non-arc ('other_rays') members to draw thin, distinct from the arc-aware
+    contiguous cluster's fully-arc membership."""
+    from src.visualization import render_arc_cluster_overlay
+    from src.ring_extraction import assign_rays_to_clusters, _cluster_by_radius_with_arcs
+    H, W = 120, 200
+    original = np.full((H, W, 3), 200, dtype=np.uint8)
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    cx, cy = axis_info["centroid"]
+    fx, fy = axis_info["far_edge"]
+
+    def pk(t, ray):
+        return (t, 1.0, int(cx + t * (fx - cx)), int(cy + t * (fy - cy)), ray)
+
+    contiguous = [pk(0.5, i) for i in range(8)]
+    scattered = [pk(0.8, i) for i in range(0, 48, 6)]
+    peaks = contiguous + scattered
+    clusters = _cluster_by_radius_with_arcs(peaks, t_tol=0.06, n_dirs=48)
+    memberships = assign_rays_to_clusters(peaks, clusters, t_tol=0.06, n_dirs=48)
+    assert len(memberships) == 2
+    assert any(m["other_rays"] for m in memberships), "scattered cluster should have non-arc members"
+
+    out = render_arc_cluster_overlay(original, axis_info, memberships, n_dirs=48)
+    assert out.shape == original.shape
+    assert not np.array_equal(out, original)
+
+
+def test_render_arc_cluster_overlay_none_axis_info_returns_copy():
+    from src.visualization import render_arc_cluster_overlay
+    H, W = 60, 90
+    original = np.zeros((H, W, 3), dtype=np.uint8)
+    out = render_arc_cluster_overlay(original, None, [])
+    assert out.shape == original.shape
+    assert np.array_equal(out, original)
+
+
+def test_render_arc_cluster_overlay_empty_memberships_still_draws_contour():
+    """No clusters at all must still return a valid (contour-drawn) image, not crash."""
+    from src.visualization import render_arc_cluster_overlay
+    H, W = 120, 200
+    original = np.full((H, W, 3), 200, dtype=np.uint8)
+    _, axis_info, _, _, _ = _make_axis_payload(H, W)
+    out = render_arc_cluster_overlay(original, axis_info, [], n_dirs=48)
+    assert out.shape == original.shape
+    assert not np.array_equal(out, original)
 
 
 def test_render_candidate_rings_draws_exclusion_zone():
