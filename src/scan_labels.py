@@ -21,7 +21,8 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.prepare_labels import scan_image_dir, assign_split_by_fish, GOOD_TYPES, has_bad_quality_token
+from scripts.prepare_labels import (scan_image_dir, assign_split_by_fish, GOOD_TYPES,
+                                    has_bad_quality_token, extract_campaign_token)
 
 UNKNOWN_AGE = -9
 
@@ -41,7 +42,9 @@ def parse_filename(name: str) -> dict | None:
     Expected format (9+ underscore-separated tokens):
         {YEAR}_{CAMPAIGN}_{SPECIES}_{LOCATION}_{TYPE}_{POSTPROC}_FishIndex{N}_Single{N}_{SIDE}.ext
 
-    Returns dict with keys: image_id, preprocessing_type, neutral_fish_key, side.
+    Returns dict with keys: image_id, preprocessing_type, neutral_fish_key, side,
+    campaign (05.08 — survey campaign/quarter token, e.g. "BITS1q"; used by the
+    opt-in quarter/"-1" age adjustment, see extract_campaign_token).
     Returns None if name does not match (too short or unknown type token).
     """
     stem = Path(name).stem
@@ -73,6 +76,7 @@ def parse_filename(name: str) -> dict | None:
         "preprocessing_type": preprocessing_type,
         "neutral_fish_key": neutral_fish_key,
         "side": side,
+        "campaign": extract_campaign_token(name),
     }
 
 
@@ -131,7 +135,7 @@ def build_combined_labels(
     DataFrame with columns:
         image_id, neutral_fish_key, preprocessing_type,
         age, length_mm, weight_g, sex, population, subdivision, otolith_type, year,
-        split, orphan
+        split, orphan, campaign
     """
     # --- Scan / inject images ---
     if _image_filenames is not None:
@@ -243,7 +247,7 @@ def build_combined_labels(
     return img_df[[
         "image_id", "neutral_fish_key", "preprocessing_type",
         "age", "length_mm", "weight_g", "sex", "population",
-        "subdivision", "otolith_type", "year", "split", "orphan",
+        "subdivision", "otolith_type", "year", "split", "orphan", "campaign",
     ]].copy()
 
 

@@ -263,7 +263,7 @@ def main() -> None:
 
     # --- Krok 1: compute_polar_grid — sektor + t dla KAŻDEGO patcha ---
     print("Krok 1: compute_polar_grid...", flush=True)
-    t_grid, valid_grid = compute_polar_grid(mask_cropped, (cx, cy), H_p, W_p, n_angle_bins=N_DIRS)
+    t_grid, valid_grid, _theta_grid = compute_polar_grid(mask_cropped, (cx, cy), H_p, W_p, n_angle_bins=N_DIRS)
     bin_idx = _bin_idx_grid(H_p, W_p, ch, cw, cx, cy, N_DIRS)
     n_valid = int(valid_grid.sum())
     new_pct = 100 * n_valid / total

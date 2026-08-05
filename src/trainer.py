@@ -53,6 +53,9 @@ class Trainer:
         # E9: concentricity prior weight/bin-count — 0.0 weight = off (default).
         self.density_concentricity_w = getattr(cfg.model, "density_concentricity_weight", 0.0)
         self.density_concentricity_bins = getattr(cfg.model, "density_concentricity_bins", 12)
+        # Change B (05.08): angle-windowed/"local" E9 — None = old global behaviour.
+        self.density_concentricity_window_deg = getattr(
+            cfg.model, "density_concentricity_window_deg", None)
         self.last_val_metrics: dict = {}   # Section-B diagnostics from validate()
 
         self.optimizer = self._build_optimizer()
@@ -127,7 +130,8 @@ class Trainer:
 
     def _loss_parts(self, out: dict, targets: torch.Tensor, ages: torch.Tensor,
                     polar_grid: Optional[torch.Tensor] = None,
-                    polar_valid: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
+                    polar_valid: Optional[torch.Tensor] = None,
+                    polar_theta: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
         """Weighted CORAL / MIL components + their sum, keyed by name.
 
         Returned so the trainer can log the head losses separately (report
@@ -152,6 +156,8 @@ class Trainer:
                     density_concentricity_loss(
                         out["density"], polar_grid.reshape(B, N), polar_valid.reshape(B, N),
                         n_radial_bins=self.density_concentricity_bins,
+                        polar_theta=polar_theta.reshape(B, N) if polar_theta is not None else None,
+                        window_deg=self.density_concentricity_window_deg,
                     )
         if not parts:
             raise RuntimeError("Model produced no recognised head outputs")
@@ -160,9 +166,10 @@ class Trainer:
 
     def _combined_loss(self, out: dict, targets: torch.Tensor, ages: torch.Tensor,
                        polar_grid: Optional[torch.Tensor] = None,
-                       polar_valid: Optional[torch.Tensor] = None) -> torch.Tensor:
+                       polar_valid: Optional[torch.Tensor] = None,
+                       polar_theta: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Combined CORAL + MIL loss (the scalar we optimise)."""
-        return self._loss_parts(out, targets, ages, polar_grid, polar_valid)["total"]
+        return self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta)["total"]
 
     @staticmethod
     def _predict_age(out: dict) -> torch.Tensor:
@@ -191,13 +198,15 @@ class Trainer:
                 metadata = metadata.to(self.device)
             polar_grid = batch.get("polar_grid")
             polar_valid = batch.get("polar_valid")
+            polar_theta = batch.get("polar_theta")
             if polar_grid is not None:
                 polar_grid = polar_grid.to(self.device)
                 polar_valid = polar_valid.to(self.device)
+                polar_theta = polar_theta.to(self.device) if polar_theta is not None else None
 
             self.optimizer.zero_grad()
             out = self.model(images, metadata=metadata)
-            loss = self._combined_loss(out, targets, ages, polar_grid, polar_valid)
+            loss = self._combined_loss(out, targets, ages, polar_grid, polar_valid, polar_theta)
             loss.backward()
             self.optimizer.step()
 
@@ -241,12 +250,14 @@ class Trainer:
                     metadata = metadata.to(self.device)
                 polar_grid = batch.get("polar_grid")
                 polar_valid = batch.get("polar_valid")
+                polar_theta = batch.get("polar_theta")
                 if polar_grid is not None:
                     polar_grid = polar_grid.to(self.device)
                     polar_valid = polar_valid.to(self.device)
+                    polar_theta = polar_theta.to(self.device) if polar_theta is not None else None
 
                 out = self.model(images, metadata=metadata)
-                parts = self._loss_parts(out, targets, ages, polar_grid, polar_valid)
+                parts = self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta)
                 pred_ages = self._predict_age(out)
 
                 bs = images.size(0)

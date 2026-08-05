@@ -11,6 +11,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
+from scripts.prepare_labels import extract_campaign_token
 from src.config import OtolithConfig
 from src.otolith_axis import (apply_background_mask, compute_polar_grid, get_or_compute_mask,
                               mask_bbox, resolve_centroid)
@@ -26,6 +27,13 @@ _SEX_MAP: Dict[str, float] = {
     "m": 1.0, "male": 1.0,
     "f": 0.0, "female": 0.0,
 }
+
+
+def _wrap_angle(theta: np.ndarray) -> np.ndarray:
+    """Wrap radians to (-pi, pi] — used when a flip transforms compute_polar_grid's
+    theta_grid (see _load_image_with_polar), since pi - theta / -theta can land
+    just outside that range."""
+    return ((theta + np.pi) % (2.0 * np.pi) - np.pi).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +168,11 @@ class OtolithDataset(Dataset):
 
         self.df = full_df[full_df["split"] == split].reset_index(drop=True)
         self.df = self._maybe_demo_subsample(self.df, split)
+        # Change C (05.08): materialized "campaign" column (from scan_labels.py /
+        # prepare_labels.py) is optional/additive — REQUIRED_COLUMNS deliberately
+        # does NOT include it, so this works on CSVs generated before the label
+        # pipeline was updated too (see _effective_age's re-parsing fallback).
+        self._has_campaign_col = "campaign" in self.df.columns
 
         # E9: the polar-coordinate grid (needed only when the concentricity loss is
         # actually on) requires an EXPLICIT, shared flip decision between the image
@@ -220,27 +233,53 @@ class OtolithDataset(Dataset):
     def __len__(self) -> int:
         return len(self.df)
 
+    def _effective_age(self, row: "pd.Series", image_id: str, recorded_age: int) -> int:
+        """Change C (05.08, opt-in, default OFF): fish caught in BITS1q/BITS2q
+        hauls (Jan-June) may not have finished forming that year's ring — the TRUE
+        number of visible, complete increments can be recorded_age - 1. Prefers the
+        materialized "campaign" column when present, falls back to re-parsing
+        image_id (works even on CSVs generated before the label pipeline added the
+        column). Feeds BOTH CORAL's ordinal target and MIL/density/val-MAE (all of
+        which read the single "age" value returned from here) — per the user's
+        explicit choice, not a density-only adjustment.
+        """
+        if not self.cfg.data.quarter_age_adjustment_enabled:
+            return recorded_age
+        campaign = None
+        if self._has_campaign_col:
+            val = row.get("campaign")
+            if pd.notna(val):
+                campaign = str(val)
+        if campaign is None:
+            campaign = extract_campaign_token(image_id)
+        if campaign in set(self.cfg.data.quarter_age_adjustment_campaigns):
+            return max(recorded_age - 1, 0)
+        return recorded_age
+
     def __getitem__(self, idx: int) -> Dict:
         row = self.df.iloc[idx]
         image_id = str(row["image_id"])
-        age = int(row["age"])
+        recorded_age = int(row["age"])
+        age = self._effective_age(row, image_id, recorded_age)
 
         if self._need_polar:
-            image_tensor, polar_grid, polar_valid = self._load_image_with_polar(image_id)
+            image_tensor, polar_grid, polar_valid, polar_theta = self._load_image_with_polar(image_id)
         else:
             image_tensor = self._load_image(image_id)
-            polar_grid = polar_valid = None
+            polar_grid = polar_valid = polar_theta = None
         age_ordinal = encode_age_ordinal(age, self.num_age_classes)
 
         sample: Dict = {
             "image": image_tensor,
             "age_ordinal": age_ordinal,
             "age": torch.tensor(age, dtype=torch.long),
+            "age_original": torch.tensor(recorded_age, dtype=torch.long),
             "image_id": image_id,
         }
         if polar_grid is not None:
             sample["polar_grid"] = polar_grid
             sample["polar_valid"] = polar_valid
+            sample["polar_theta"] = polar_theta
 
         if self.use_metadata and self.metadata_cols:
             sample["metadata"] = self._encode_metadata(row)
@@ -272,9 +311,12 @@ class OtolithDataset(Dataset):
         ``include_flips`` docstring for why this can't just reuse the normal
         Compose-embedded random flips on the train split).
 
-        Returns (image_tensor, polar_t_grid, polar_valid_grid); the latter two are
-        all-zero / all-False when segmentation fails, matching the rest of this
-        module's "never crash on a bad photo" fallback philosophy.
+        Returns (image_tensor, polar_t_grid, polar_valid_grid, polar_theta_grid); the
+        latter three are all-zero / all-False when segmentation fails, matching the
+        rest of this module's "never crash on a bad photo" fallback philosophy.
+        polar_theta_grid (05.08, windowed/"local" E9) carries a signed direction, so
+        unlike the other two it needs an actual VALUE transform (not just an array
+        reversal) under a flip — see the wrap_angle calls below.
         """
         path = self.img_dir / image_id
         if not path.exists():
@@ -296,11 +338,12 @@ class OtolithDataset(Dataset):
 
         h_patches = w_patches = self.cfg.data.image_size // self.cfg.data.patch_size
         if mask is not None and centroid is not None:
-            t_grid, valid_grid = compute_polar_grid(mask, centroid, h_patches, w_patches)
+            t_grid, valid_grid, theta_grid = compute_polar_grid(mask, centroid, h_patches, w_patches)
             rgb = apply_background_mask(rgb, mask)
         else:
             t_grid = np.zeros((h_patches, w_patches), dtype=np.float32)
             valid_grid = np.zeros((h_patches, w_patches), dtype=bool)
+            theta_grid = np.zeros((h_patches, w_patches), dtype=np.float32)
 
         pil_img = Image.fromarray(rgb)
         if self.split == "train":
@@ -309,16 +352,27 @@ class OtolithDataset(Dataset):
                 pil_img = pil_img.transpose(Image.FLIP_LEFT_RIGHT)
                 t_grid = np.ascontiguousarray(t_grid[:, ::-1])
                 valid_grid = np.ascontiguousarray(valid_grid[:, ::-1])
+                # theta is a signed DIRECTION, not a plain scalar field — mirroring the
+                # image negates dx (theta=atan2(dy,dx)), so besides reversing the array
+                # (which relocates values to their new spatial position, same as t_grid/
+                # valid_grid above) the VALUE itself must transform: atan2(dy,-dx) =
+                # wrap(pi - atan2(dy,dx)). Getting only the array-reversal half of this
+                # right (as t_grid/valid_grid do) would silently attach each patch a
+                # pre-flip direction that no longer matches its post-flip geometry.
+                theta_grid = _wrap_angle(np.pi - theta_grid[:, ::-1])
             if do_vflip:
                 pil_img = pil_img.transpose(Image.FLIP_TOP_BOTTOM)
                 t_grid = np.ascontiguousarray(t_grid[::-1, :])
                 valid_grid = np.ascontiguousarray(valid_grid[::-1, :])
+                # Mirrors negate dy instead: atan2(-dy,dx) = wrap(-atan2(dy,dx)).
+                theta_grid = _wrap_angle(-theta_grid[::-1, :])
 
         image_tensor = self.transform(pil_img)
         return (
             image_tensor,
             torch.from_numpy(t_grid.copy()),
             torch.from_numpy(valid_grid.copy()),
+            torch.from_numpy(np.ascontiguousarray(theta_grid).copy()),
         )
 
     def _decide_flip(self) -> tuple:

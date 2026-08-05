@@ -1,6 +1,7 @@
 """Stage 3 tests: OtolithModel, ordinal loss, freeze/unfreeze, backward pass."""
 from __future__ import annotations
 
+import contextlib
 from typing import Dict
 
 import pytest
@@ -531,6 +532,109 @@ def test_density_tv_prior_penalises_scattered_more_than_coherent():
 
 
 # ---------------------------------------------------------------------------
+# Change A (05.08): attention-based density head (density_head_type="attention")
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _isolated_rng():
+    """Snapshot/restore torch's global RNG state around a test.
+
+    This module doesn't seed globally, so tests implicitly share one RNG
+    stream in file order — constructing AttentionDensityHead's extra
+    nn.TransformerEncoderLayer parameters consumes more random draws than the
+    old plain-MLP head, which would otherwise silently shift which "random"
+    weights every LATER test in this file gets (observed: it flipped
+    test_density_concentricity_loss_stop_gradient_safe's density_head init
+    into a degenerate all-equal-output case with a genuinely zero gradient).
+    """
+    state = torch.get_rng_state()
+    try:
+        yield
+    finally:
+        torch.set_rng_state(state)
+
+
+def _make_attention_density_model():
+    from src.config import OtolithConfig
+    from src.model import OtolithModel
+    cfg = OtolithConfig()
+    cfg.model.num_age_classes = 10
+    cfg.model.dropout = 0.0
+    cfg.model.head_type = "coral"          # isolate: only the density head reads patches
+    cfg.model.use_density_head = True
+    cfg.model.density_head_type = "attention"
+    cfg.model.density_attn_num_heads = 4   # divides _GradPatchBackbone.embed_dim=64
+    cfg.model.density_attn_num_layers = 1
+    return OtolithModel(cfg, backbone=_GradPatchBackbone())
+
+
+def test_attention_density_head_forward_keys_and_shape():
+    with _isolated_rng():
+        model = _make_attention_density_model()
+        out = model(torch.randn(2, 3, 56, 56))
+        assert "density" in out and "density_count" in out
+        assert out["density"].shape == (2, 16)
+        assert out["density_count"].shape == (2,)
+        d = out["density"].detach()
+        assert float(d.min()) >= 0.0 and float(d.max()) <= 1.0
+
+
+def test_attention_density_head_stop_gradient_blocks_backbone():
+    """Same CRITICAL guarantee as the plain-MLP head: attention density loss must
+    NOT update the backbone — it is computed on the same STOP-GRADIENT tensor."""
+    from src.model import density_count_loss
+    with _isolated_rng():
+        model = _make_attention_density_model()
+        out = model(torch.randn(2, 3, 56, 56))
+        loss = density_count_loss(out["density"], torch.tensor([2, 4]), conc_weight=1.0)
+        model.zero_grad(set_to_none=True)
+        loss.backward()
+        bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                      for p in model.backbone.parameters())
+        dh_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                      for p in model.density_head.parameters())
+        assert not bb_grad, "attention density loss leaked gradient into the backbone"
+        assert dh_grad, "attention density head received no gradient"
+
+
+def test_attention_density_head_cross_patch_dependency():
+    """The whole point of Change A: unlike the plain-MLP head (independent per
+    patch), a patch's output CAN depend on OTHER patches' inputs — cross-patch
+    attention is meant to bridge gaps between fragments rather than scoring every
+    patch in total isolation. A real behavioural test, not just "it runs"."""
+    from src.model import AttentionDensityHead
+
+    with _isolated_rng():
+        gen = torch.Generator().manual_seed(0)
+        head = AttentionDensityHead(embed_dim=8, hidden_dim=16, dropout=0.0, num_heads=2, num_layers=1)
+        head.eval()   # kill dropout stochasticity
+        patches_a = torch.randn(1, 6, 8, generator=gen)
+        patches_b = patches_a.clone()
+        # A NON-uniform perturbation — adding the same constant to every dim of a
+        # patch's vector would be exactly cancelled by the head's LayerNorm (which
+        # subtracts the per-patch mean), so use per-dim random noise instead.
+        patches_b[0, 0] += torch.randn(8, generator=gen) * 5.0
+
+        with torch.no_grad():
+            out_a = head(patches_a)
+            out_b = head(patches_b)
+        assert not torch.allclose(out_a[0, 1:], out_b[0, 1:]), \
+            "attention head output for unperturbed patches should change when another patch changes"
+
+        # Negative control: the plain-MLP head has no such dependency by construction —
+        # contrasts the new behaviour against the old, unchanged default.
+        mlp_head = nn.Sequential(
+            nn.LayerNorm(8), nn.Linear(8, 16), nn.GELU(), nn.Dropout(p=0.0), nn.Linear(16, 1),
+        )
+        mlp_head.eval()
+        with torch.no_grad():
+            mlp_out_a = mlp_head(patches_a)
+            mlp_out_b = mlp_head(patches_b)
+        assert torch.allclose(mlp_out_a[0, 1:], mlp_out_b[0, 1:]), \
+            "plain MLP head output for unperturbed patches must NOT change (independent per patch)"
+
+
+# ---------------------------------------------------------------------------
 # E9: density_concentricity_loss
 # ---------------------------------------------------------------------------
 
@@ -585,3 +689,77 @@ def test_density_concentricity_loss_stop_gradient_safe():
                   for p in model.density_head.parameters())
     assert not bb_grad, "concentricity loss leaked gradient into the backbone"
     assert dh_grad, "density head received no gradient"
+
+
+# ---------------------------------------------------------------------------
+# Change B (05.08): angle-windowed ("local") E9 concentricity loss
+# ---------------------------------------------------------------------------
+
+def test_density_concentricity_loss_backward_compat_when_window_none():
+    """polar_theta supplied but window_deg=None must reproduce the OLD global
+    behaviour byte-for-byte — the hard backward-compat guarantee."""
+    from src.model import density_concentricity_loss
+
+    polar_t = torch.tensor([[0.1] * 4 + [0.4] * 4 + [0.7] * 4 + [0.9] * 4])
+    polar_valid = torch.ones(1, 16, dtype=torch.bool)
+    scattered = torch.tensor([[0.9, 0.1, 0.9, 0.1, 0.2, 0.9, 0.2, 0.1,
+                               0.5, 0.1, 0.9, 0.2, 0.1, 0.9, 0.1, 0.9]])
+    polar_theta = torch.rand(1, 16) * 6.28 - 3.14   # arbitrary — must be IGNORED
+
+    without_args = density_concentricity_loss(scattered, polar_t, polar_valid, n_radial_bins=4)
+    with_theta_no_window = density_concentricity_loss(
+        scattered, polar_t, polar_valid, n_radial_bins=4,
+        polar_theta=polar_theta, window_deg=None,
+    )
+    assert torch.equal(without_args, with_theta_no_window)
+
+
+def test_density_concentricity_loss_ignores_opposite_side_when_windowed():
+    """The key differentiating behaviour: two clusters of patches on OPPOSITE
+    sides of the same radial bin (~180deg apart) must NOT penalise each other
+    under a small angular window, even though the OLD global loss (comparing the
+    whole bin at once) would — real rings are typically visible on only part of
+    the circumference, so this is what makes the loss stop punishing normal
+    partial visibility as if it were noise."""
+    from src.model import density_concentricity_loss
+    import math as _math
+
+    density = torch.tensor([[0.9, 0.85, 0.1, 0.15]])
+    theta = torch.tensor([[0.0, _math.radians(5), _math.radians(175), _math.radians(180)]])
+    polar_t = torch.full((1, 4), 0.5)          # irrelevant with n_radial_bins=1
+    polar_valid = torch.ones(1, 4, dtype=torch.bool)
+
+    global_loss = density_concentricity_loss(density, polar_t, polar_valid, n_radial_bins=1)
+    windowed_loss = density_concentricity_loss(
+        density, polar_t, polar_valid, n_radial_bins=1,
+        polar_theta=theta, window_deg=30.0,
+    )
+    assert float(global_loss) == pytest.approx(0.14125, abs=1e-4)
+    assert float(windowed_loss) == pytest.approx(0.000625, abs=1e-6)
+    assert float(windowed_loss) < float(global_loss) * 0.05, \
+        "windowed loss should be near-zero (each cluster is internally consistent) " \
+        "while the global loss penalises the two clusters disagreeing with each other"
+
+
+def test_density_concentricity_loss_wraparound_0_360():
+    """Two patches straddling the +-180deg seam (theta=-179deg and +179deg) are
+    only 2deg apart on the circle, not 358deg — a naive |theta_i - theta_j|
+    difference (no wraparound) would wrongly treat them as maximally far apart
+    and exclude them from each other's neighbourhood, silently zeroing the loss.
+    """
+    from src.model import density_concentricity_loss
+    import math as _math
+
+    density = torch.tensor([[0.9, 0.1]])
+    theta = torch.tensor([[_math.radians(-179), _math.radians(179)]])
+    polar_t = torch.full((1, 2), 0.5)
+    polar_valid = torch.ones(1, 2, dtype=torch.bool)
+
+    windowed_loss = density_concentricity_loss(
+        density, polar_t, polar_valid, n_radial_bins=1,
+        polar_theta=theta, window_deg=10.0,     # true circular distance (2deg) is well inside
+    )
+    assert float(windowed_loss) == pytest.approx(0.16, abs=1e-4), (
+        "with correct wraparound the two patches ARE each other's neighbour "
+        "(2deg apart) — a broken wraparound would silently return 0.0 instead"
+    )

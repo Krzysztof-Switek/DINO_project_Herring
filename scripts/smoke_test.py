@@ -96,6 +96,12 @@ def _make_cfg(tmp: Path):
     cfg.training.scheduler = "none"
     cfg.training.checkpoint_dir = str(tmp / "checkpoints")
     cfg.training.log_dir = str(tmp / "logs")
+    # Step 2 below asserts one checkpoint_epoch*.pt file per epoch persists (to
+    # verify Trainer.save_checkpoint actually runs every epoch) — keep_only_best
+    # defaults to True in production (deletes per-epoch checkpoints once best.pt
+    # holds a copy), which would make that assertion fail with 0 files instead of
+    # 2. Explicit here so the smoke test verifies its own stated behaviour.
+    cfg.training.keep_only_best = False
     cfg.candidates.min_peak_distance = 1
     cfg.candidates.prominence_threshold = 0.0
     return cfg

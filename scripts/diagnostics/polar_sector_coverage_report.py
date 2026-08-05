@@ -315,7 +315,7 @@ def process_resolution(res: dict, orig_rgb: np.ndarray, axis_info: dict, mask_ar
     old_final_pts = old_result["final_axis_pts"]
 
     # --- NOWA metoda: compute_polar_grid + agregacja sektorowa MAX. ---
-    t_grid, valid_grid = compute_polar_grid(mask_cropped, (cx, cy), H_p, W_p, n_angle_bins=N_DIRS)
+    t_grid, valid_grid, _theta_grid = compute_polar_grid(mask_cropped, (cx, cy), H_p, W_p, n_angle_bins=N_DIRS)
     bin_idx = _bin_idx_grid(H_p, W_p, ch, cw, cx, cy, N_DIRS)
     n_valid = int(valid_grid.sum())
     new_pct = 100 * n_valid / total

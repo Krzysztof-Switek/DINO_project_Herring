@@ -448,18 +448,20 @@ def _circular_mask(size: int = 100, radius: int = 40) -> tuple[np.ndarray, tuple
 
 def test_compute_polar_grid_shapes_and_range():
     mask, centroid = _circular_mask()
-    t_grid, valid_grid = compute_polar_grid(mask, centroid, 10, 10)
+    t_grid, valid_grid, theta_grid = compute_polar_grid(mask, centroid, 10, 10)
     assert t_grid.shape == (10, 10)
     assert valid_grid.shape == (10, 10)
     assert valid_grid.dtype == bool
     assert t_grid.min() >= 0.0
+    assert theta_grid.shape == (10, 10)
+    assert theta_grid.min() >= -np.pi and theta_grid.max() <= np.pi
 
 
 def test_compute_polar_grid_nucleus_near_zero_edge_near_one():
     """For a circular mask, the centre patch should have small t; a patch just
     inside the boundary should have t close to 1."""
     mask, centroid = _circular_mask(size=100, radius=40)
-    t_grid, valid_grid = compute_polar_grid(mask, centroid, 21, 21)
+    t_grid, valid_grid, _theta_grid = compute_polar_grid(mask, centroid, 21, 21)
     center_idx = 10
     assert t_grid[center_idx, center_idx] < 0.2
     # a valid patch on the outer ring of the mask should be close to the edge (t~1)
@@ -469,7 +471,7 @@ def test_compute_polar_grid_nucleus_near_zero_edge_near_one():
 
 def test_compute_polar_grid_marks_background_invalid():
     mask, centroid = _circular_mask(size=100, radius=20)   # small circle, lots of background
-    _t_grid, valid_grid = compute_polar_grid(mask, centroid, 20, 20)
+    _t_grid, valid_grid, _theta_grid = compute_polar_grid(mask, centroid, 20, 20)
     assert valid_grid.any()
     assert not valid_grid.all()          # corners of the square grid are outside the circle
 
@@ -482,10 +484,27 @@ def test_compute_polar_grid_horizontal_flip_matches_flipped_output():
     between the image and the polar grid without recomputing the geometry twice."""
     mask, (cx, cy) = _circular_mask(size=100, radius=35)
     W = mask.shape[1]
-    t_grid, _ = compute_polar_grid(mask, (cx, cy), 12, 12)
+    t_grid, _, _ = compute_polar_grid(mask, (cx, cy), 12, 12)
 
     mask_flipped = mask[:, ::-1]
     cx_flipped = W - 1 - cx
-    t_grid_direct, _ = compute_polar_grid(mask_flipped, (cx_flipped, cy), 12, 12)
+    t_grid_direct, _, _ = compute_polar_grid(mask_flipped, (cx_flipped, cy), 12, 12)
 
     assert np.abs(t_grid_direct - t_grid[:, ::-1]).max() < 0.1
+
+
+def test_compute_polar_grid_theta_matches_atan2_dy_dx():
+    """theta_grid must be atan2(dy, dx) in the image-pixel frame (dy = row offset
+    from centroid, dx = column offset) — the exact convention Change B's flip
+    transform (OtolithDataset._load_image_with_polar) is derived from. A patch
+    directly BELOW the centroid (larger row => +dy, dx=0) must read theta≈+pi/2;
+    directly to the RIGHT (dx>0, dy=0) must read theta≈0."""
+    mask, (cx, cy) = _circular_mask(size=100, radius=45)
+    _t_grid, _valid_grid, theta_grid = compute_polar_grid(mask, (cx, cy), 20, 20)
+    cell_h, cell_w = 100 / 20, 100 / 20
+    row_below = int((cy + 30) / cell_h)
+    col_center = int(cx / cell_w)
+    row_center = int(cy / cell_h)
+    col_right = int((cx + 30) / cell_w)
+    assert theta_grid[row_below, col_center] == pytest.approx(np.pi / 2, abs=0.2)
+    assert theta_grid[row_center, col_right] == pytest.approx(0.0, abs=0.2)

@@ -101,6 +101,26 @@ def test_neutral_key_same_fish():
 
 
 # ---------------------------------------------------------------------------
+# Tests: campaign token (05.08, Change C — quarter/"-1" age adjustment)
+# ---------------------------------------------------------------------------
+
+def test_parse_filename_includes_campaign_token():
+    """parse_filename's dict must carry the survey campaign/quarter token —
+    OtolithDataset._effective_age's materialized-column fast path reads it."""
+    assert parse_filename(EMB_FISH1)["campaign"] == "BIAS"
+    assert parse_filename(EMB_FISH3)["campaign"] == "BITS1q"
+
+
+def test_extract_campaign_token_helper():
+    from scripts.prepare_labels import extract_campaign_token
+    assert extract_campaign_token(EMB_FISH1) == "BIAS"
+    assert extract_campaign_token(EMB_FISH3) == "BITS1q"
+    assert extract_campaign_token("2022_BITS4q_HER_Loc_Embedded_Sharpest_FishIndex1_Single1_Left.jpg") == "BITS4q"
+    assert extract_campaign_token("too_short.jpg") == "short"   # 2 tokens: still returns parts[1]
+    assert extract_campaign_token("onlyonetoken.jpg") is None
+
+
+# ---------------------------------------------------------------------------
 # Tests: build_combined_labels
 # ---------------------------------------------------------------------------
 
@@ -159,6 +179,26 @@ def test_build_combined_orphan_flag():
     orphan_rows = df[df["image_id"] == NOTEMB_ORPHAN]
     assert len(orphan_rows) == 1
     assert orphan_rows.iloc[0]["orphan"] is True or orphan_rows.iloc[0]["orphan"] == True
+
+
+def test_build_combined_labels_includes_campaign_column():
+    """05.08, Change C: the returned DataFrame must carry a materialized "campaign"
+    column (previously only recoverable by re-parsing image_id) — OtolithDataset.
+    _effective_age reads this directly when present."""
+    filenames = [EMB_FISH1, EMB_FISH3, NOTEMB_FISH1]
+    meta = _make_meta_lookup({
+        _neutral_key(EMB_FISH1): 3,
+        _neutral_key(EMB_FISH3): 7,
+    })
+    df = build_combined_labels(
+        image_dir=None, excel_path=None,
+        _image_filenames=filenames, _excel_df=meta,
+    )
+    assert "campaign" in df.columns
+    row1 = df[df["image_id"] == EMB_FISH1].iloc[0]
+    row3 = df[df["image_id"] == EMB_FISH3].iloc[0]
+    assert row1["campaign"] == "BIAS"
+    assert row3["campaign"] == "BITS1q"
 
 
 def test_assign_split_is_age_balanced():

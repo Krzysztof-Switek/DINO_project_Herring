@@ -52,6 +52,19 @@ def has_bad_quality_token(filename: str) -> bool:
     return any(p.lower() in _BAD_FILENAME_TOKENS for p in stem.split("_"))
 
 
+def extract_campaign_token(image_id: str) -> str | None:
+    """Second underscore-separated token of ``image_id`` — the survey campaign/
+    quarter code (e.g. ``BITS1q``, ``BITS4q``, ``BIAS``, ``BASS``). Same token
+    position ``scan_labels.parse_filename`` already relies on for one component of
+    ``neutral_fish_key`` (``parts[1]``) — shared here so ``prepare_labels.build_
+    labels`` and ``scan_labels`` agree, same precedent as ``has_bad_quality_token``.
+    Used (05.08) by the opt-in quarter/"-1" age adjustment (``OtolithDataset.
+    _effective_age``) — see ``data.quarter_age_adjustment_enabled`` in configs/config.yaml.
+    """
+    parts = Path(image_id).stem.split("_")
+    return parts[1] if len(parts) > 1 else None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -208,6 +221,10 @@ def build_labels(
     n_fish = records["fish_id"].nunique()
     print(f"  Unikalnych ryb (fish_id): {n_fish}")
     print(f"  Srednio zdjec/ryba: {len(records) / n_fish:.1f}")
+
+    # Survey campaign/quarter token (05.08) — additive, optional column consumed by
+    # OtolithDataset's opt-in quarter/"-1" age adjustment; see extract_campaign_token.
+    records["campaign"] = records["image_id"].apply(extract_campaign_token)
 
     # ------------------------------------------------------------------ #
     # [4] Obsługa Wiek = -9

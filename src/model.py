@@ -16,6 +16,7 @@ Forward always returns a dict; callers select the head they need.
 """
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -174,10 +175,24 @@ def density_concentricity_loss(
     polar_t: Tensor,
     polar_valid: Tensor,
     n_radial_bins: int = 12,
+    polar_theta: Optional[Tensor] = None,
+    window_deg: Optional[float] = None,
 ) -> Tensor:
     """E9 concentricity prior: density(r,θ) ≈ density(r) — low variance ACROSS ANGLE
     at a fixed radius, since annual growth-ring increments are (approximately)
     concentric circles around the otolith nucleus.
+
+    05.08 ("windowed E9" / Change B): when ``polar_theta`` and ``window_deg`` are
+    BOTH given, the comparison is restricted to a LOCAL angular neighbourhood
+    (``window_deg`` wide) instead of the full 360° bin — real growth rings are
+    typically visible on only PART of the circumference, so the original global
+    version punishes normal partial visibility the same as real noise (measured
+    to have ~zero localisation effect at any tested weight, see ``plans and
+    summaries/31.07_radial_Analiza_wnioski.md``). This mirrors the ``_arc_band``
+    fix that DID give a real signal for the classical (non-trained) concentricity
+    score in ``src/ring_extraction.py``. Leaving either argument as ``None``
+    (the default) reproduces the exact old global behaviour byte-for-byte — this
+    is a hard backward-compatibility guarantee, not an approximation.
 
     A NEW, independent loss term (not a modification of ``density_count_loss``) —
     bins every valid patch into one of ``n_radial_bins`` fixed-width bins by its
@@ -202,30 +217,120 @@ def density_concentricity_loss(
                         centre inside the segmented otolith); background/failed-
                         segmentation patches are excluded from every bin.
         n_radial_bins : number of fixed-width bins spanning t ∈ [0, 1].
+        polar_theta   : (B, N) per-patch angle in radians (-pi, pi], flattened to
+                        match ``density`` — see ``otolith_axis.compute_polar_grid``.
+                        ``None`` (default) = old global behaviour.
+        window_deg    : angular window width in degrees for the local/windowed
+                        variant. ``None`` (default) = old global behaviour.
 
-    Returns scalar loss — mean within-bin variance over (sample, bin) pairs with
-    at least 2 valid patches; 0.0 when no sample has any such bin (e.g. every
-    sample in the batch had segmentation fail).
+    Returns scalar loss. Global variant: mean within-bin variance over (sample,
+    bin) pairs with at least 2 valid patches; 0.0 when no sample has any such bin
+    (e.g. every sample in the batch had segmentation fail). Windowed variant: mean
+    per-patch squared deviation from its own local (radius+angle) neighbourhood
+    mean, over patches with at least 2 valid neighbours (self included); 0.0 when
+    no patch anywhere has one.
     """
-    valid = polar_valid.float()
-    bin_idx = torch.clamp((polar_t * n_radial_bins).long(), 0, n_radial_bins - 1)   # (B, N)
+    if polar_theta is None or window_deg is None:
+        # --- Global (original E9) path — byte-identical to the pre-05.08 code. ---
+        valid = polar_valid.float()
+        bin_idx = torch.clamp((polar_t * n_radial_bins).long(), 0, n_radial_bins - 1)   # (B, N)
 
-    total = density.new_zeros(())
-    count = density.new_zeros(())
-    for b in range(n_radial_bins):
-        in_bin = (bin_idx == b).float() * valid                  # (B, N)
-        n_b = in_bin.sum(dim=1)                                  # (B,)
-        has_enough = (n_b >= 2).float()                          # (B,)
-        if float(has_enough.sum()) == 0.0:
-            continue
-        mean_b = (density * in_bin).sum(dim=1) / n_b.clamp(min=1.0)             # (B,)
-        var_b = (((density - mean_b.unsqueeze(1)) ** 2) * in_bin).sum(dim=1) \
-            / n_b.clamp(min=1.0)                                                # (B,)
-        total = total + (var_b * has_enough).sum()
-        count = count + has_enough.sum()
-    if float(count) == 0.0:
+        total = density.new_zeros(())
+        count = density.new_zeros(())
+        for b in range(n_radial_bins):
+            in_bin = (bin_idx == b).float() * valid                  # (B, N)
+            n_b = in_bin.sum(dim=1)                                  # (B,)
+            has_enough = (n_b >= 2).float()                          # (B,)
+            if float(has_enough.sum()) == 0.0:
+                continue
+            mean_b = (density * in_bin).sum(dim=1) / n_b.clamp(min=1.0)             # (B,)
+            var_b = (((density - mean_b.unsqueeze(1)) ** 2) * in_bin).sum(dim=1) \
+                / n_b.clamp(min=1.0)                                                # (B,)
+            total = total + (var_b * has_enough).sum()
+            count = count + has_enough.sum()
+        if float(count) == 0.0:
+            return density.new_zeros(())
+        return total / count
+
+    # --- Windowed (local) path — Change B, 05.08. ---
+    valid = polar_valid.float()                                                  # (B, N)
+    bin_idx = torch.clamp((polar_t * n_radial_bins).long(), 0, n_radial_bins - 1)  # (B, N)
+    same_bin = bin_idx.unsqueeze(2) == bin_idx.unsqueeze(1)                      # (B, N, N)
+
+    # Circular angular distance via atan2(sin(d), cos(d)) — correctly handles the
+    # 0/360-degree seam (e.g. 359deg vs 1deg are 2deg apart, not 358deg), unlike a
+    # naive |theta_i - theta_j| difference.
+    delta = polar_theta.unsqueeze(2) - polar_theta.unsqueeze(1)                  # (B, N, N)
+    delta = torch.atan2(torch.sin(delta), torch.cos(delta))
+    angular_close = delta.abs() <= (math.radians(window_deg) / 2.0)
+
+    pair_valid = valid.unsqueeze(2) * valid.unsqueeze(1)                         # (B, N, N)
+    neighbor_mask = (same_bin & angular_close).float() * pair_valid              # (B, N, N)
+    n_neighbors = neighbor_mask.sum(dim=2)                                       # (B, N) incl. self
+    has_enough = (n_neighbors >= 2).float()                                      # (B, N)
+
+    local_mean = (density.unsqueeze(1) * neighbor_mask).sum(dim=2) \
+        / n_neighbors.clamp(min=1.0)                                             # (B, N)
+    sq_dev = ((density - local_mean) ** 2) * valid * has_enough                  # (B, N)
+    denom = (valid * has_enough).sum()
+    if float(denom) == 0.0:
         return density.new_zeros(())
-    return total / count
+    return sq_dev.sum() / denom
+
+
+class AttentionDensityHead(nn.Module):
+    """Cross-patch self-attention density head (density_head_type="attention").
+
+    Today's default density head (see below, "mlp" branch) scores every patch
+    independently — no patch ever "knows" about any other, so any spatial
+    coherence between patches (e.g. "these two patches, both plausible ring
+    fragments, are part of the SAME ring") has to be imposed from outside via a
+    hand-crafted geometric loss term (E9). CS-Net/CS²-Net (curvilinear-structure
+    segmentation networks used for e.g. retinal vessels) show that giving the
+    network itself cross-patch self-attention lets it bridge gaps between
+    fragmented/partially-visible curve segments directly — an architectural
+    capability, not a loss-term penalty.
+
+    Always called on a STOP-GRADIENT input (``patches.detach()`` in
+    ``OtolithModel.forward()``) — inherits that safety automatically, exactly
+    like the plain-MLP head; nothing in this module changes that boundary.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int,
+        dropout: float,
+        num_heads: int = 4,
+        num_layers: int = 1,
+    ) -> None:
+        super().__init__()
+        self.input_norm = nn.LayerNorm(embed_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        # enable_nested_tensor=False: the nested-tensor fast path is unavailable
+        # anyway with norm_first=True (PyTorch emits a UserWarning every forward
+        # otherwise) — explicit opt-out silences that noise without changing output.
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers, enable_nested_tensor=False)
+        self.out_head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, patches: Tensor) -> Tensor:
+        """(B, N, D) -> (B, N, 1), same output contract as the plain-MLP head."""
+        x = self.input_norm(patches)
+        x = self.encoder(x)          # residual self-attention + FFN (built into the layer)
+        return self.out_head(x)
 
 
 # ---------------------------------------------------------------------------
@@ -303,19 +408,36 @@ class OtolithModel(nn.Module):
         # reshapes the backbone. Independent of head_type — can ride on top of coral/both.
         self.use_density_head = bool(getattr(cfg.model, "use_density_head", False))
         if self.use_density_head:
-            # LayerNorm first: `_reg` backbones flatten the patch-token norm
-            # distribution (that's how they suppress the register-token artifact),
-            # which may rob density of a useful ranking signal derived from raw
-            # norm scale. Normalising the input removes that scale-dependence
-            # regardless — cheap, and safe since this head is stop-gradient (see
-            # forward()): it can only ever affect density_head's own weights.
-            self.density_head = nn.Sequential(
-                nn.LayerNorm(embed_dim),
-                nn.Linear(embed_dim, cfg.model.mil_hidden_dim),
-                nn.GELU(),
-                nn.Dropout(p=cfg.model.dropout),
-                nn.Linear(cfg.model.mil_hidden_dim, 1),
-            )
+            density_head_type = getattr(cfg.model, "density_head_type", "mlp")
+            if density_head_type == "attention":
+                # Cross-patch self-attention (see AttentionDensityHead above) — opt-in,
+                # off by default. Kept as a SEPARATE branch (not a wrapper around the
+                # "mlp" case below) so every existing checkpoint's density_head state-
+                # dict keys stay byte-identical when density_head_type is left at its
+                # default "mlp" — wrapping unconditionally would rename every key
+                # (density_head.0.weight -> density_head.mlp.0.weight) and silently
+                # re-randomise the density head on load for every existing checkpoint.
+                self.density_head = AttentionDensityHead(
+                    embed_dim=embed_dim,
+                    hidden_dim=cfg.model.mil_hidden_dim,
+                    dropout=cfg.model.dropout,
+                    num_heads=getattr(cfg.model, "density_attn_num_heads", 4),
+                    num_layers=getattr(cfg.model, "density_attn_num_layers", 1),
+                )
+            else:
+                # LayerNorm first: `_reg` backbones flatten the patch-token norm
+                # distribution (that's how they suppress the register-token artifact),
+                # which may rob density of a useful ranking signal derived from raw
+                # norm scale. Normalising the input removes that scale-dependence
+                # regardless — cheap, and safe since this head is stop-gradient (see
+                # forward()): it can only ever affect density_head's own weights.
+                self.density_head = nn.Sequential(
+                    nn.LayerNorm(embed_dim),
+                    nn.Linear(embed_dim, cfg.model.mil_hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(p=cfg.model.dropout),
+                    nn.Linear(cfg.model.mil_hidden_dim, 1),
+                )
 
     # ------------------------------------------------------------------
     # Forward

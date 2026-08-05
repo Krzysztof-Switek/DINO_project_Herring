@@ -330,6 +330,190 @@ def test_polar_grid_flip_synced_with_image(ellipse_data, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Change B (05.08): polar_theta (angle-windowed/"local" E9 geometry)
+# ---------------------------------------------------------------------------
+
+def test_polar_theta_absent_by_default(ellipse_data, tmp_path):
+    """Same gate as polar_grid/polar_valid — density_concentricity_weight=0.0
+    (default) means no polar geometry of any kind is computed."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _make_cfg()
+    cfg.data.image_size = 196
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    assert "polar_theta" not in ds[0]
+
+
+def test_polar_theta_absent_without_density_head(ellipse_data, tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _e9_cfg(tmp_path)
+    cfg.model.use_density_head = False
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    assert "polar_theta" not in ds[0]
+
+
+def test_polar_theta_present_and_shaped_when_enabled(ellipse_data, tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _e9_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    h_p = w_p = cfg.data.image_size // cfg.data.patch_size
+    assert item["polar_theta"].shape == (h_p, w_p)
+    assert item["polar_theta"].dtype == torch.float32
+    assert item["polar_theta"].min() >= -3.1416 and item["polar_theta"].max() <= 3.1416
+
+
+def test_polar_theta_flip_synced_with_image(ellipse_data, tmp_path, monkeypatch):
+    """Unlike polar_grid/polar_valid (plain scalar fields, correctly synced by a
+    simple np.fliplr), polar_theta is a signed DIRECTION — a horizontal flip must
+    transform its VALUE (wrap(pi - theta)), not just reverse the array. A naive
+    fliplr (as used for polar_grid above) would attach each patch a pre-flip
+    direction that no longer matches its post-flip geometry; this test would catch
+    exactly that class of bug."""
+    import numpy as np
+    import torchvision.transforms as T
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+
+    monkeypatch.setattr(T.ColorJitter, "forward", lambda self, img: img)
+    ds = OtolithDataset(_e9_cfg(tmp_path), "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    monkeypatch.setattr(ds, "_decide_flip", lambda: (False, False))
+    baseline = ds[0]
+    monkeypatch.setattr(ds, "_decide_flip", lambda: (True, False))
+    hflipped = ds[0]
+
+    raw_reversed = np.fliplr(baseline["polar_theta"].numpy())
+    expected_theta = ((np.pi - raw_reversed + np.pi) % (2.0 * np.pi)) - np.pi
+    actual = hflipped["polar_theta"].numpy()
+    # Compare on the unit circle (cos/sin) rather than raw radians so the +-pi
+    # branch cut doesn't produce a spurious ~2*pi mismatch for angles near it.
+    assert np.allclose(np.cos(actual), np.cos(expected_theta), atol=1e-3)
+    assert np.allclose(np.sin(actual), np.sin(expected_theta), atol=1e-3)
+    # And explicitly NOT the naive (un-transformed) reversal — pins down that the
+    # value transform is actually happening, not just the array reversal.
+    assert not np.allclose(actual, raw_reversed, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# Change C (05.08): quarter/campaign "-1" age adjustment
+# ---------------------------------------------------------------------------
+
+def _quarter_data(tmp_path, with_campaign_col: bool = True):
+    """One BITS1q-campaign image (age=4) + one BITS4q-campaign image (age=5).
+    Filenames carry the campaign token at the real production position (2nd
+    underscore-separated token) so extract_campaign_token's re-parsing fallback
+    works even when ``with_campaign_col=False`` (no materialized column)."""
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    name_q1 = "2022_BITS1q_HER_Loc_Embedded_Sharpest_FishIndex1_Single1_Left.png"
+    name_q4 = "2022_BITS4q_HER_Loc_Embedded_Sharpest_FishIndex2_Single1_Left.png"
+    Image.new("RGB", (56, 56), color=(10, 100, 200)).save(img_dir / name_q1)
+    Image.new("RGB", (56, 56), color=(20, 100, 200)).save(img_dir / name_q4)
+    rows = [
+        {"image_id": name_q1, "age": 4, "split": "train"},
+        {"image_id": name_q4, "age": 5, "split": "train"},
+    ]
+    if with_campaign_col:
+        rows[0]["campaign"] = "BITS1q"
+        rows[1]["campaign"] = "BITS4q"
+    csv_path = tmp_path / "labels.csv"
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    return csv_path, img_dir
+
+
+def test_quarter_age_adjustment_off_by_default_unchanged(tmp_path):
+    """quarter_age_adjustment_enabled=False (default) => byte-identical to today —
+    regression test for every existing config that never sets this flag."""
+    from src.dataset import OtolithDataset, encode_age_ordinal
+    csv_path, img_dir = _quarter_data(tmp_path)
+    ds = OtolithDataset(_make_cfg(), "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert int(item["age"]) == 4
+    assert int(item["age_original"]) == 4
+    assert torch.equal(item["age_ordinal"], encode_age_ordinal(4, ds.num_age_classes))
+
+
+def test_quarter_age_adjustment_applies_for_adjustable_campaign(tmp_path):
+    from src.dataset import OtolithDataset, encode_age_ordinal
+    csv_path, img_dir = _quarter_data(tmp_path)
+    cfg = _make_cfg()
+    cfg.data.quarter_age_adjustment_enabled = True
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]   # BITS1q row, recorded age=4
+    assert int(item["age"]) == 3
+    assert int(item["age_original"]) == 4
+    assert torch.equal(item["age_ordinal"], encode_age_ordinal(3, ds.num_age_classes))
+
+
+def test_quarter_age_adjustment_skips_non_adjustable_campaign(tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = _quarter_data(tmp_path)
+    cfg = _make_cfg()
+    cfg.data.quarter_age_adjustment_enabled = True
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[1]   # BITS4q row, recorded age=5 — not in the default adjustable set
+    assert int(item["age"]) == 5
+    assert int(item["age_original"]) == 5
+
+
+def test_quarter_age_adjustment_floors_at_zero(tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = _quarter_data(tmp_path)
+    df = pd.read_csv(csv_path)
+    df.loc[0, "age"] = 0
+    df.to_csv(csv_path, index=False)
+    cfg = _make_cfg()
+    cfg.data.quarter_age_adjustment_enabled = True
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert int(item["age"]) == 0, "age must floor at 0, never go negative"
+    assert int(item["age_original"]) == 0
+
+
+def test_age_original_always_equals_recorded(tmp_path):
+    """age_original must equal the raw recorded value regardless of the flag —
+    it's a diagnostic field, never itself adjusted."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = _quarter_data(tmp_path)
+    for enabled in (False, True):
+        cfg = _make_cfg()
+        cfg.data.quarter_age_adjustment_enabled = enabled
+        ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+        assert int(ds[0]["age_original"]) == 4
+        assert int(ds[1]["age_original"]) == 5
+
+
+def test_quarter_age_adjustment_prefers_campaign_column_over_reparsing(tmp_path):
+    """A materialized 'campaign' column that CONTRADICTS what image_id parsing
+    would give must win — validates the precedence design in _effective_age."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = _quarter_data(tmp_path, with_campaign_col=True)
+    df = pd.read_csv(csv_path)
+    df.loc[0, "campaign"] = "BITS4q"   # image_id says BITS1q, column says BITS4q
+    df.to_csv(csv_path, index=False)
+    cfg = _make_cfg()
+    cfg.data.quarter_age_adjustment_enabled = True
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert int(item["age"]) == 4, "materialized column (BITS4q, not adjustable) must win over image_id (BITS1q)"
+
+
+def test_quarter_age_adjustment_falls_back_when_campaign_column_absent(tmp_path):
+    """No 'campaign' column at all (e.g. a CSV from before the label pipeline was
+    updated) — must still adjust correctly via the image_id re-parsing fallback."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = _quarter_data(tmp_path, with_campaign_col=False)
+    cfg = _make_cfg()
+    cfg.data.quarter_age_adjustment_enabled = True
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    assert int(ds[0]["age"]) == 3   # BITS1q, adjusted via fallback
+    assert int(ds[1]["age"]) == 5   # BITS4q, unchanged
+
+
+# ---------------------------------------------------------------------------
 # DensityFineTuneDataset (22.07 — fine-tune density_head at density_image_size/crop)
 # ---------------------------------------------------------------------------
 

@@ -560,7 +560,7 @@ def compute_polar_grid(
     h_patches: int,
     w_patches: int,
     n_angle_bins: int = 360,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Per-patch, per-ray-normalised polar coordinates for the E9 concentricity prior.
 
     For every cell of an ``(h_patches, w_patches)`` grid overlaid on the image that
@@ -589,6 +589,14 @@ def compute_polar_grid(
         t_grid     : (h_patches, w_patches) float32, per-ray-normalised radius.
         valid_grid : (h_patches, w_patches) bool — True where the patch centre lies
                      inside ``mask`` (background/edge-of-frame patches are False).
+        theta_grid : (h_patches, w_patches) float32, per-patch angle in radians
+                     ``(-pi, pi]`` (``atan2(dy, dx)``, image-pixel convention: dy is
+                     the row offset from the centroid, dx the column offset). Added
+                     05.08 for the angle-windowed ("local") concentricity loss —
+                     previously computed here and discarded. NOT wrapped/adjusted
+                     for any downstream flip; callers applying a flip to the image
+                     must transform this value too (see OtolithDataset._load_image_
+                     with_polar's flip handling for the exact reflection formula).
     """
     mask_bin = np.asarray(mask) > 0
     H, W = mask_bin.shape[:2]
@@ -628,7 +636,8 @@ def compute_polar_grid(
     valid_grid = cv2.resize(
         mask_bin.astype(np.float32), (w_patches, h_patches), interpolation=cv2.INTER_AREA,
     ) > 0.5
-    return t_grid, valid_grid
+    theta_grid = theta.astype(np.float32)
+    return t_grid, valid_grid, theta_grid
 
 
 # ---------------------------------------------------------------------------

@@ -51,6 +51,22 @@ class ModelConfig(BaseModel):
     # is already known to not transfer cleanly across patch-grid densities — see
     # plans and summaries/22.07_TO_DO.MD).
     density_concentricity_bins: int = Field(12, ge=2)
+    # Angle-restricted E9 ("windowed E9", 05.08): the global (whole-360°) variant
+    # above measured ~zero localisation effect at any tested weight (real rings are
+    # usually visible on only PART of the circumference, so a full-circle
+    # consistency requirement punishes normal partial visibility the same as real
+    # noise — plans and summaries/31.07_radial_Analiza_wnioski.md). Restricting the
+    # comparison to a local angular neighbourhood mirrors the arc-band fix that DID
+    # give a real signal for the classical (non-trained) concentricity score
+    # (src/ring_extraction.py's _arc_band). None = old global behaviour, unchanged.
+    density_concentricity_window_deg: Optional[float] = Field(None, gt=0.0)
+    # Attention-based density head (05.08, "weak-supervision, attention-first"):
+    # lets a patch's density score be informed by OTHER patches (see
+    # AttentionDensityHead in src/model.py), instead of today's fully independent
+    # per-patch MLP. "mlp" = today's exact Sequential, unchanged default.
+    density_head_type: Literal["mlp", "attention"] = "mlp"
+    density_attn_num_heads: int = Field(4, ge=1)
+    density_attn_num_layers: int = Field(1, ge=1)
 
 
 class DataConfig(BaseModel):
@@ -72,6 +88,18 @@ class DataConfig(BaseModel):
     # and across runs). None → "<image_dir>/../masks_cache".
     mask_background: bool = False
     mask_cache_dir: Optional[str] = None
+    # Quarter/campaign "-1" age adjustment (05.08, Change C): fish caught in
+    # BITS1q/BITS2q survey hauls (Jan-June) may not yet have finished forming that
+    # year's growth ring at capture time — the TRUE number of complete visible
+    # increments can be recorded_age - 1, not recorded_age. Off by default. Unlike
+    # A/B (density-head-only, stop-gradient, safe by construction), this changes
+    # CORAL's own supervision target for ~40% of the dataset — genuinely capable of
+    # moving age accuracy in either direction, must be validated with a real
+    # training run against an unadjusted baseline, not assumed safe. See memory
+    # quarter_age_convention_issue.md — the underlying premise (whether recorded
+    # `Wiek` already accounts for this) is still empirically UNVERIFIED.
+    quarter_age_adjustment_enabled: bool = False
+    quarter_age_adjustment_campaigns: List[str] = Field(default_factory=lambda: ["BITS1q", "BITS2q"])
 
     @field_validator("image_size")
     @classmethod
