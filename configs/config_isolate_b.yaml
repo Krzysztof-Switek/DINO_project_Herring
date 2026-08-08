@@ -1,0 +1,142 @@
+# 08.08 — Izolacja Zmiany B (windowed E9) od Zmiany A (attention density head).
+# Bezpośredni follow-up po analizie `outputs/06.08_attention_first` (Run K, A+B+C naraz):
+# density_active=0.0000 przez WSZYSTKIE 50 epok — głowica density nigdy nie ożyła, więc Run K
+# nie mówi nic wiarygodnego o tym, czy Zmiana A czy Zmiana B (czy obie) są winne. Ten bieg
+# zmienia DOKŁADNIE JEDNĄ rzecz względem produkcyjnej receptury `22.07_reg`:
+#
+#   Zmiana B (density_concentricity_window_deg=45.0) — WŁĄCZONA
+#   Zmiana A (density_head_type)                     — WYŁĄCZONA (zwykły "mlp", jak w 22.07_reg)
+#   Zmiana C (quarter_age_adjustment_enabled)         — WYŁĄCZONA (czysta kontrola;
+#     06.08 code-review wykazał, że podnosi udział próbek wiek=0 w treningu 11,4%→18,3%,
+#     co samo w sobie mogło tłumić aktywację density — nie chcemy tego mieszać z pytaniem o A/B)
+#
+# Pytanie na które ma odpowiedzieć ten bieg: czy zwykła głowica MLP budzi się NORMALNIE
+# (jak w historii projektu, epoka 10-23) pod nową, okienkową stratą E9 — jeśli TAK, winna za
+# Run K była architektura uwagi (Zmiana A) lub interakcja A+B, nie sama Zmiana B. Jeśli MLP
+# TEŻ się nie obudzi, podejrzana jest sama Zmiana B (albo jej skala/waga — patrz komentarz
+# przy density_concentricity_weight niżej, JAWNIE NIEZWERYFIKOWANY).
+#
+# Bramka dojrzałości density ma teraz naprawiony (08.08, src/trainer.py) mechanizm: jeśli
+# density i tak się nie obudzi, trening NIE zjada już całego budżetu epok na próżno — po tylu
+# epokach ile sama metryka wieku już nie poprawia się (density_gate_max_wait_epochs, domyślnie
+# = early_stopping_patience), bramka poddaje się i wraca do normalnego early-stoppingu.
+#
+# Zobacz też: plans and summaries/8.08_trening_summary_ATENTION_FIRST.md (pełna analiza Run K),
+# configs/config_attention_first.yaml (oryginalny config A+B+C, dla porównania nagłówków).
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # niezmienione względem 22.07_reg / config_attention_first.yaml
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  head_type: both                 # coral | mil | both
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  density_conc_weight: 1.0        # UWAGA: to jest WEWNĘTRZNY człon top-k w density_count_loss,
+                                  # NIE to samo co density_concentricity_weight niżej (E9/Zmiana B)
+                                  # — dwie różne, niebezpiecznie podobne nazwy, patrz 08.08 code-review.
+  density_tv_weight: 0.03
+
+  # Zmiana A WYŁĄCZONA — wraca do domyślnej, zwykłej (per-patch, bez self-attention) głowicy MLP,
+  # dokładnie jak w 22.07_reg. Pole zostawione jawnie (zamiast pominięte) żeby było widać, że to
+  # świadoma decyzja tego biegu, nie przeoczenie.
+  density_head_type: mlp          # mlp (stare, domyślne) | attention (Zmiana A, WYŁĄCZONA tutaj)
+
+  # ------------------------------------------------------------------------
+  # ZMIANA B (05.08) — WŁĄCZONA, jedyna zmiana względem 22.07_reg w tym biegu.
+  # E9 v2: lokalna (nie globalna) spójność promieniowa — porównuje kwadracik TYLKO z sąsiadami
+  # w małym oknie kątowym, zamiast z całym obwodem 360° (stary E9 dał zerowy efekt lokalizacyjny
+  # nawet przy 100-krotnie różnej wadze, 31.07_radial_Analiza_wnioski.md). Pełny opis mechanizmu:
+  # src/model.py::density_concentricity_loss, config_attention_first.yaml (ten sam komentarz).
+  density_concentricity_weight: 1.0    # JAWNIE NIEZWERYFIKOWANA skala w wariancie lokalnym
+  density_concentricity_bins: 12
+  density_concentricity_window_deg: 45.0   # JAWNIE NIEZWERYFIKOWANY punkt startowy
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  mask_background: true
+  mask_cache_dir: null
+
+  # Zmiana C WYŁĄCZONA — czysta kontrola, patrz nagłówek pliku.
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  # density_gate_max_wait_epochs: nie ustawione = domyślne (08.08 fix) — bramka podda się
+  # po tylu epokach bez poprawy wieku ile early_stopping_patience (8), licząc od momentu gdy
+  # wiek sam przestał się poprawiać; NIE od startu treningu. Patrz src/config.py docstring.
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  density_image_size: 728
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8

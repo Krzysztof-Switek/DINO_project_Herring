@@ -334,6 +334,11 @@ class Trainer:
         # (no extra file) when the model has no density head — best.pt already IS the
         # age-best checkpoint in that case.
         best_age_metric = float("inf")
+        # 08.08 bug fix: counts epochs since best_age_metric last improved — i.e. the
+        # patience the UNGATED age metric alone would already have used up, exactly as
+        # if there were no density head/gate at all. Used below to give up waiting on a
+        # density head that never matures (see the gate block).
+        age_patience_counter = 0
 
         for epoch in range(1, self.cfg.training.epochs + 1):
             if freeze_until > 0 and epoch == freeze_until + 1:
@@ -362,6 +367,18 @@ class Trainer:
                 current = metric_ema
             else:
                 current = raw_metric
+            # Ungated age-best tracking (two-checkpoint fix) — runs every epoch,
+            # independent of gate_open, so the age-optimal checkpoint is never lost to
+            # the gate reset below. Uses the SAME (possibly EMA-smoothed) `current`.
+            # Also drives age_patience_counter (08.08), used by the gate timeout below.
+            age_improved = uses_density and current < best_age_metric - min_delta
+            if age_improved:
+                best_age_metric = current
+                self._save_best_checkpoint(epoch, val_loss, filename="best_age.pt")
+                age_patience_counter = 0
+            elif uses_density:
+                age_patience_counter += 1
+
             # Density-maturity gate: open once the density head is "alive". When it first
             # opens, restart selection (best_metric/patience) so best.pt is chosen among
             # mature epochs, not the early age-only ones. No gating when density head is off.
@@ -369,20 +386,41 @@ class Trainer:
                                    .get("density_active", 0.0) or 0.0)
             density_mature = (not uses_density) or min_density_active <= 0.0 \
                 or density_active >= min_density_active
+            # 08.08 bug fix: without this timeout, a density head that never matures
+            # keeps the gate closed forever — since patience_counter only increments
+            # while gate_open (below), an eternally-closed gate silently disables
+            # early stopping for the ENTIRE run (confirmed for real on
+            # outputs/06.08_attention_first: density_active=0.0000 for all 50 epochs,
+            # zero "Early stopping" log line, full epoch ceiling burned for nothing —
+            # ~26-28 wasted epochs). Give up once the AGE metric alone has already gone
+            # `density_gate_max_wait_epochs` epochs without improving (default: the same
+            # `patience` used for normal early stopping) — i.e. once age itself would
+            # already be eligible to stop on its own, exactly as if there were no
+            # density head/gate at all. Tying this to age_patience_counter (rather than
+            # a fixed epoch count) keeps it adaptive: a density head racing a
+            # still-improving age metric keeps getting more time, matching this
+            # project's real observed wake-up epochs (10-23) instead of an arbitrary
+            # fixed deadline that risks cutting off a legitimately late-but-real wake-up.
+            gate_timed_out = False
+            if uses_density and min_density_active > 0.0 and not density_mature and patience > 0:
+                max_wait_patience = getattr(self.cfg.training, "density_gate_max_wait_epochs", None)
+                if max_wait_patience is None:
+                    max_wait_patience = patience
+                if age_patience_counter >= max_wait_patience and epoch >= min_epochs:
+                    density_mature = True
+                    gate_timed_out = True
             if density_mature and not gate_open:
                 gate_open = True
                 best_metric = float("inf")
                 patience_counter = 0
-                if uses_density and min_density_active > 0.0:
+                if gate_timed_out:
+                    self._log(f"Density NIE dojrzała (active={density_active:.2f} < "
+                              f"{min_density_active}) po {epoch} epokach (wiek bez poprawy "
+                              f"od {age_patience_counter} epok) — rezygnacja z czekania, "
+                              f"start normalnego early-stoppingu")
+                elif uses_density and min_density_active > 0.0:
                     self._log(f"Density dojrzałe (active={density_active:.2f}) @e{epoch} "
                               f"— start wyboru best.pt / early-stopping")
-
-            # Ungated age-best tracking (two-checkpoint fix) — runs every epoch,
-            # independent of gate_open, so the age-optimal checkpoint is never lost to
-            # the gate reset below. Uses the SAME (possibly EMA-smoothed) `current`.
-            if uses_density and current < best_age_metric - min_delta:
-                best_age_metric = current
-                self._save_best_checkpoint(epoch, val_loss, filename="best_age.pt")
 
             improved = current < best_metric - min_delta
             if improved:

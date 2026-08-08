@@ -371,6 +371,13 @@ def test_density_gate_delays_stop_until_density_alive(tmp_path):
 
     Constant val_mae would normally stop at e3 (patience 2). But while density_active=0 the
     gate holds (no patience, no stop); density wakes at e5, then patience(2) → stop ~e7.
+
+    density_gate_max_wait_epochs is set explicitly large here to isolate THIS behaviour
+    (waiting for a real, eventual density wake-up) from the separate 08.08 timeout safety
+    valve (tested below in test_density_gate_gives_up_after_max_wait_epochs) — with a flat
+    val_mae from epoch 1, the age metric "plateaus" immediately by construction, so the
+    default timeout would otherwise fire (correctly, by design) before density's scripted
+    wake-up at e5.
     """
     from src.trainer import Trainer
 
@@ -386,6 +393,7 @@ def test_density_gate_delays_stop_until_density_alive(tmp_path):
     cfg.training.early_stopping_min_delta = 0.001
     cfg.training.min_epochs = 0
     cfg.training.min_density_active = 1.0
+    cfg.training.density_gate_max_wait_epochs = 100   # disable the timeout for this test
     cfg.training.keep_only_best = False           # count per-epoch checkpoints as an epoch proxy
 
     model = _make_model(cfg)
@@ -459,6 +467,82 @@ def test_two_checkpoints_age_best_survives_gate_reset(tmp_path):
     density_ckpt = _torch.load(best_path, map_location="cpu", weights_only=False)
     assert age_ckpt["epoch"] in (1, 2), "best_age.pt must come from the pre-gate age-best epoch"
     assert density_ckpt["epoch"] in (3, 4), "best.pt must come from a density-mature epoch"
+
+
+def test_density_gate_gives_up_after_max_wait_epochs(tmp_path):
+    """08.08 bug fix: if density NEVER matures, the gate must give up and fall back to
+    normal early stopping instead of silently disabling it for the whole run.
+
+    Real bug found on outputs/06.08_attention_first: density_active=0.0000 for all 50
+    epochs → gate never opened → patience_counter (only incremented while gate_open)
+    never moved → zero "Early stopping" log line → the run silently burned the full
+    epoch ceiling (~26-28 wasted epochs) even though val_mae had long plateaued.
+
+    Timeout is keyed off the ungated AGE metric's OWN patience, not a fixed epoch
+    number (see config.py's density_gate_max_wait_epochs docstring for why). Here
+    val_mae is flat from epoch 1, so best_age_metric only ever "improves" trivially at
+    e1 (inf→5.0); with default max_wait=patience=2, age_patience_counter reaches 2 at
+    e3 (min_epochs=3 is already satisfied by then) → gate times out and opens (with a
+    reset) at e3, then 2 more non-improving epochs (e4, e5) → stop @e5.
+    """
+    from src.trainer import Trainer
+
+    class ForeverDeadTrainer(Trainer):
+        def validate(self):
+            self.last_val_metrics = {"density_active": 0.0}   # never crosses min_density_active
+            return 1.0, 5.0                                   # constant val_mae — never "improves"
+
+    cfg = _make_cfg(tmp_path, epochs=20)
+    cfg.model.use_density_head = True
+    cfg.training.early_stopping_patience = 2
+    cfg.training.early_stopping_min_delta = 0.001
+    cfg.training.min_epochs = 3
+    cfg.training.min_density_active = 1.0
+    cfg.training.keep_only_best = False
+
+    model = _make_model(cfg)
+    trainer = ForeverDeadTrainer(cfg, model, _make_loader(), _make_loader())
+    trainer.fit()
+
+    ckpt_files = list(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt"))
+    assert len(ckpt_files) == 5, (
+        f"gate should give up at e3 and stop by e5 (patience=2 after timeout), "
+        f"ran {len(ckpt_files)} epochs instead"
+    )
+    assert (trainer.checkpoint_dir / "best.pt").exists()
+
+    log_text = trainer.log_path.read_text(encoding="utf-8")
+    assert "NIE dojrzała" in log_text, "timeout must be logged distinctly from real maturity"
+    assert "Early stopping" in log_text
+
+
+def test_density_gate_max_wait_epochs_override(tmp_path):
+    """Explicit density_gate_max_wait_epochs overrides the default (= early_stopping_patience)
+    used as the age-metric-plateau deadline for giving up on a density head that never matures."""
+    from src.trainer import Trainer
+
+    class ForeverDeadTrainer(Trainer):
+        def validate(self):
+            self.last_val_metrics = {"density_active": 0.0}
+            return 1.0, 5.0
+
+    cfg = _make_cfg(tmp_path, epochs=20)
+    cfg.model.use_density_head = True
+    cfg.training.early_stopping_patience = 2
+    cfg.training.early_stopping_min_delta = 0.001
+    cfg.training.min_epochs = 0
+    cfg.training.min_density_active = 1.0
+    cfg.training.density_gate_max_wait_epochs = 3   # wait longer than the default (2) before giving up
+    cfg.training.keep_only_best = False
+
+    model = _make_model(cfg)
+    trainer = ForeverDeadTrainer(cfg, model, _make_loader(), _make_loader())
+    trainer.fit()
+
+    # age_patience_counter reaches 3 at e4 → gate times out/opens (reset) at e4, then
+    # 2 more non-improving epochs (e5, e6) → stop @e6.
+    ckpt_files = list(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt"))
+    assert len(ckpt_files) == 6, f"custom max_wait=3 should stop by e6, ran {len(ckpt_files)} epochs"
 
 
 def test_no_best_age_checkpoint_without_density_head(tmp_path):

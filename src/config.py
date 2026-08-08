@@ -153,6 +153,27 @@ class TrainingConfig(BaseModel):
     # Defaults 0 = old behaviour (no gating).
     min_epochs: int = Field(0, ge=0)
     min_density_active: float = Field(0.0, ge=0.0)
+    # 08.08 bug fix: safety valve for the gate above. Without a cap, a density head
+    # that never matures (observed for real: `outputs/06.08_attention_first`,
+    # density_active=0.0000 for all 50 epochs) keeps the gate closed forever — since
+    # patience only ever counts while the gate is open (see Trainer.fit), an
+    # eternally-closed gate silently disables early stopping for the WHOLE run, which
+    # then always burns the full `epochs` ceiling even after the age metric has long
+    # stopped improving. That contradicts the gate's own intended fallback ("density
+    # never wakes up -> behaves like a run with no density head"), which should mean
+    # normal early stopping, not none at all. Counts consecutive epochs the AGE metric
+    # itself has gone without improving (NOT a fixed epoch number) — once that reaches
+    # this value (default None = reuse `early_stopping_patience`, i.e. "give up once
+    # age alone would already be eligible to stop"), the gate is force-opened and
+    # falls back to normal, ungated early stopping from there. Tied to age's OWN
+    # plateau rather than a fixed deadline so a density head racing a still-improving
+    # age metric keeps getting more time — a fixed `min_epochs + patience` deadline
+    # was tried first and rejected: it can cut off a legitimately late (but real)
+    # wake-up, since this project has observed density mature as late as epoch 22-23
+    # (`16.07_rx`) while age itself was still improving well past a short fixed floor.
+    # Set explicitly for a different amount of patience, or to a very large number to
+    # restore the old (unbounded-wait) behaviour on purpose.
+    density_gate_max_wait_epochs: Optional[int] = Field(None, ge=1)
     device: str = "auto"
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
