@@ -329,6 +329,7 @@ def _compute_axis_data_for_samples(
                                      compute_cls_attention, compute_cls_attention_patched)
     from src.otolith_axis import (
         apply_background_mask,
+        compute_polar_grid,
         detect_axis,
         find_farthest_edge,
         load_mask,
@@ -357,6 +358,25 @@ def _compute_axis_data_for_samples(
     # signal only (see need_hires_density below) — cheap to build even when unused.
     density_transform = build_transforms(
         cfg.candidates.density_image_size or cfg.data.image_size, "test")
+
+    def _polar_tensors_for(mask_for_polar, centroid, patch_grid_size):
+        """(10.08) Build (polar_t, polar_theta, polar_valid) batched (1, N) tensors
+        matching what RadialAttentionDensityHead was trained on (src/dataset.py's
+        _load_image_with_polar), for inference-time cards/localisation_quality.json —
+        without this, a radial_attention checkpoint would see a train/inference input
+        mismatch (no positional info, unrestricted attention) exactly like the 21.07
+        masking gap this project already fixed once for a different mechanism. Returns
+        (None, None, None) when mask/centroid aren't available (segmentation failed) —
+        RadialAttentionDensityHead already degrades gracefully to that (documented,
+        not a crash).
+        """
+        if mask_for_polar is None or centroid is None:
+            return None, None, None
+        h_p = w_p = patch_grid_size // cfg.data.patch_size
+        t_grid, valid_grid, theta_grid = compute_polar_grid(mask_for_polar, centroid, h_p, w_p)
+        to_flat = lambda a, dt: torch.from_numpy(a.reshape(1, -1).copy()).to(dt).to(device)
+        return (to_flat(t_grid, torch.float32), to_flat(theta_grid, torch.float32),
+                to_flat(valid_grid, torch.bool))
 
     min_dist = cfg.candidates.min_peak_distance
     prominence = cfg.candidates.prominence_threshold
@@ -435,7 +455,12 @@ def _compute_axis_data_for_samples(
                 # Localisation signal: prefer the DECOUPLED density map (Kierunek B) when
                 # the model has one, else the MIL / L2 importance map.
                 if getattr(model, "use_density_head", False) and hasattr(model, "density_head"):
-                    grid = model.get_density_probs(tensor).squeeze(0).cpu().numpy()
+                    p_t, p_th, p_v = _polar_tensors_for(
+                        mask_arr, axis_info["centroid"] if axis_info else None,
+                        cfg.data.image_size)
+                    grid = model.get_density_probs(
+                        tensor, polar_t=p_t, polar_theta=p_th, polar_valid=p_v,
+                    ).squeeze(0).cpu().numpy()
                 else:
                     grid = compute_patch_importance(model, tensor).cpu().numpy()
             grids[iid] = grid
@@ -492,16 +517,28 @@ def _compute_axis_data_for_samples(
             try:
                 density_source_rgb = orig_rgb
                 d_axis_info = axis_info
+                mask_for_density = mask_arr
                 if cfg.candidates.density_crop_to_otolith and mask_arr is not None:
                     crop_x0, crop_y0, cw, ch = mask_bbox(
                         mask_arr, cfg.candidates.density_crop_pad_frac)
                     density_source_rgb = orig_rgb[crop_y0:crop_y0 + ch, crop_x0:crop_x0 + cw]
                     d_axis_info = shift_axis_info(axis_info, -crop_x0, -crop_y0)
+                    # shift_axis_info deliberately does NOT crop "mask" (not meaningful
+                    # post-crop for its usual callers) — crop it ourselves here, the
+                    # same way density_source_rgb was cropped, so compute_polar_grid
+                    # below sees a mask in the SAME coordinate frame as d_axis_info's
+                    # shifted centroid.
+                    mask_for_density = mask_arr[crop_y0:crop_y0 + ch, crop_x0:crop_x0 + cw]
                     dH_img, dW_img = ch, cw
                 density_tensor = density_transform(
                     PILImage.fromarray(density_source_rgb)).unsqueeze(0).to(device)
+                p_t, p_th, p_v = _polar_tensors_for(
+                    mask_for_density, d_axis_info["centroid"] if d_axis_info else None,
+                    cfg.candidates.density_image_size or cfg.data.image_size)
                 with torch.no_grad():
-                    density_grid = model.get_density_probs(density_tensor).squeeze(0).cpu().numpy()
+                    density_grid = model.get_density_probs(
+                        density_tensor, polar_t=p_t, polar_theta=p_th, polar_valid=p_v,
+                    ).squeeze(0).cpu().numpy()
                 density_axis_info = d_axis_info
             except Exception as e:
                 print(f"    [cards] density wysokorozdzielcza błąd dla {iid}: {e}")

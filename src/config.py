@@ -64,9 +64,30 @@ class ModelConfig(BaseModel):
     # lets a patch's density score be informed by OTHER patches (see
     # AttentionDensityHead in src/model.py), instead of today's fully independent
     # per-patch MLP. "mlp" = today's exact Sequential, unchanged default.
-    density_head_type: Literal["mlp", "attention"] = "mlp"
+    # "radial_attention" (10.08, v2): see RadialAttentionDensityHead in src/model.py —
+    # built after the isolation matrix (plans and summaries/9.08_uwaga_plan_TO.DO.md
+    # §1/§4) showed density_active=0.0000 in EVERY real run with plain "attention" on,
+    # regardless of the windowed E9 loss — the architecture itself, not an interaction,
+    # was implicated. Adds two literature-motivated fixes at once (RadialFormer, same
+    # doc §2.1): explicit polar (t,θ) positional encoding, and self-attention
+    # restricted to a local radial×angular window instead of all ~1369 patches at once.
+    density_head_type: Literal["mlp", "attention", "radial_attention"] = "mlp"
     density_attn_num_heads: int = Field(4, ge=1)
     density_attn_num_layers: int = Field(1, ge=1)
+    # radial_attention-only fields below — inert for "mlp"/"attention".
+    # Number of sin/cos harmonics for the Fourier positional encoding of angle/radius
+    # (NeRF/Transformer-PE-style multi-frequency encoding; angle harmonics are what
+    # guarantee continuity across the 0/360° seam — a raw theta value would not be).
+    # JAWNIE NIEZWERYFIKOWANY punkt startowy, same status as inner_margin=0.20 elsewhere.
+    density_attn_num_angle_freqs: int = Field(4, ge=1)
+    density_attn_num_radius_freqs: int = Field(4, ge=1)
+    # Local attention window — deliberately SEPARATE fields from density_concentricity_
+    # bins/window_deg above (not reused 1:1): this defines what the ATTENTION MECHANISM
+    # is structurally allowed to see, not what the E9 LOSS penalises disagreement over;
+    # the two mechanisms are independent and may want different granularity. Same
+    # defaults as E9's windowed variant as a reasonable, but unverified, starting point.
+    density_attn_radial_bins: int = Field(12, ge=2)
+    density_attn_window_deg: float = Field(45.0, gt=0.0)
 
 
 class DataConfig(BaseModel):

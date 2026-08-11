@@ -1,0 +1,159 @@
+# 10.08 — Zmiana A v2: kodowanie pozycyjne biegunowe + LOKALNA (nie globalna) uwaga
+# w głowicy density (density_head_type=radial_attention).
+#
+# Bezpośredni follow-up po zamknięciu macierzy izolacji A×B (`outputs/09.08_isolate_a`,
+# `outputs/08.08_isolate_b`, `outputs/06.08_attention_first` — patrz plans and summaries/
+# 9.08_uwaga_plan_TO.DO.md §1/§4): density_active=0,0000 w KAŻDYM realnym biegu ze zwykłą
+# architekturą uwagi (density_head_type=attention), niezależnie od okienkowej straty E9 —
+# winna jest sama architektura, nie interakcja z Zmianą B. Ten config NIE jest kolejnym
+# małym testem izolacyjnym — to świadomie WIĘKSZY, skonsolidowany krok (decyzja
+# użytkownika 10.08: "czy od razu nie kodować większych i konkretnych zmian"), łączący
+# NARAZ dwa niezależnie umotywowane mechanizmy z tego samego źródła (RadialFormer,
+# rozpoznawanie tęczówki — niemal identyczna geometria: tekstura współśrodkowa wokół
+# centrum, okresowa kątowo — 9.08_uwaga_plan_TO.DO.md §2.1):
+#
+#   1. JAWNE kodowanie pozycyjne biegunowe (t, θ) każdego patcha, dodane do treści
+#      przed uwagą (Fourierowe, na wzór LPPE) — dziś głowica NIE WIE, gdzie geometrycznie
+#      leży patch, tylko jak wygląda.
+#   2. Uwaga ograniczona LOKALNIE (promień×kąt), nie globalnie po wszystkich ~1369
+#      patchach naraz — bezpośrednia odpowiedź na realnie zaobserwowany objaw
+#      (isolate_a, 09.08): wyjście zapadające się w jedną rozlaną, niezróżnicowaną
+#      "plamę" zamiast wyraźnych szczytów. Ponownie wykorzystuje TĘ SAMĄ geometrię
+#      koszyk-promienia/okno-kątowe co już zwalidowana strata E9 (density_concentricity_
+#      loss, wariant okienkowy) — teraz wymuszoną STRUKTURALNIE w samym mechanizmie
+#      uwagi, nie tylko karaną post-hoc.
+#
+# Zmiana B (okienkowy E9, density_concentricity_weight) celowo WYŁĄCZONA w tym biegu —
+# testujemy najpierw, czy sama nowa ARCHITEKTURA (bez dodatkowej straty) już rozwiązuje
+# problem. Zmiana C wyłączona, spójnie z całą serią izolacyjną.
+#
+# Zobacz: plans and summaries/9.08_uwaga_plan_TO.DO.md (pełne uzasadnienie + literatura),
+# src/model.py::RadialAttentionDensityHead (implementacja + docstring).
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # niezmienione względem całej serii izolacyjnej
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  head_type: both                 # coral | mil | both
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  density_conc_weight: 1.0        # UWAGA: to jest WEWNĘTRZNY człon top-k w density_count_loss,
+                                  # NIE to samo co density_concentricity_weight niżej (E9/Zmiana B)
+                                  # — dwie różne, niebezpiecznie podobne nazwy, patrz 08.08 code-review.
+  density_tv_weight: 0.03
+
+  # ------------------------------------------------------------------------
+  # ZMIANA A v2 (10.08) — WŁĄCZONA, główna zmiana tego biegu. Patrz nagłówek pliku +
+  # src/model.py::RadialAttentionDensityHead dla pełnego uzasadnienia.
+  density_head_type: radial_attention   # mlp | attention (v1, martwa) | radial_attention (v2)
+  density_attn_num_heads: 4       # jak w poprzednich biegach z uwagą
+  density_attn_num_layers: 1
+  # Liczba harmonik Fouriera (sin/cos) dla kodowania kąta/promienia — JAWNIE
+  # NIEZWERYFIKOWANY punkt startowy, ten sam status co inner_margin=0.20 niżej.
+  density_attn_num_angle_freqs: 4
+  density_attn_num_radius_freqs: 4
+  # Lokalne okno uwagi (promień×kąt) — CELOWO osobne pola od density_concentricity_
+  # bins/window_deg (Zmiana B) niżej: to definiuje co MECHANIZM UWAGI strukturalnie
+  # widzi, nie co STRATA E9 karze za niezgodność — mechanizmy niezależne. Te same
+  # wartości domyślne co E9 jako rozsądny, ale niezweryfikowany punkt startowy.
+  density_attn_radial_bins: 12
+  density_attn_window_deg: 45.0
+
+  # Zmiana B WYŁĄCZONA — testujemy samą nową architekturę najpierw, patrz nagłówek pliku.
+  density_concentricity_weight: 0.0
+  density_concentricity_bins: 12
+  density_concentricity_window_deg: 45.0   # nieużywane przy wadze 0,0, zostawione dla spójności
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  # WYMAGANE dla radial_attention: OtolithDataset._load_image_with_polar liczy
+  # maskę/centroid (a więc i siatkę biegunową) TYLKO gdy mask_background=true — bez
+  # tego głowica dostawałaby same zerowe/nieważne tensory polarne mimo _need_polar=True.
+  mask_background: true
+  mask_cache_dir: null
+
+  # Zmiana C WYŁĄCZONA — spójne z resztą serii izolacyjnej (isolate_a/isolate_b).
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  # density_gate_max_wait_epochs: nie ustawione = domyślne (08.08 fix) — bramka podda się
+  # po tylu epokach bez poprawy WIEKU ile early_stopping_patience (8); jeśli density i
+  # tak się nie obudzi, bieg NIE zjada pełnych 50 epok na próżno (zweryfikowane w praktyce
+  # dwukrotnie: outputs/08.08_isolate_b i outputs/09.08_isolate_a).
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  density_image_size: 728
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8

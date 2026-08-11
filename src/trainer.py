@@ -200,12 +200,19 @@ class Trainer:
             polar_valid = batch.get("polar_valid")
             polar_theta = batch.get("polar_theta")
             if polar_grid is not None:
-                polar_grid = polar_grid.to(self.device)
-                polar_valid = polar_valid.to(self.device)
-                polar_theta = polar_theta.to(self.device) if polar_theta is not None else None
+                # Flatten (B, H_p, W_p) -> (B, N) HERE, once, so the SAME flat tensors
+                # feed both the model call below (RadialAttentionDensityHead consumes
+                # them directly, 10.08) and _loss_parts (E9 concentricity loss) — no
+                # double reshape, no risk of the two seeing different flattenings.
+                B_ = polar_grid.shape[0]
+                polar_grid = polar_grid.to(self.device).reshape(B_, -1)
+                polar_valid = polar_valid.to(self.device).reshape(B_, -1)
+                polar_theta = (polar_theta.to(self.device).reshape(B_, -1)
+                               if polar_theta is not None else None)
 
             self.optimizer.zero_grad()
-            out = self.model(images, metadata=metadata)
+            out = self.model(images, metadata=metadata, polar_t=polar_grid,
+                              polar_theta=polar_theta, polar_valid=polar_valid)
             loss = self._combined_loss(out, targets, ages, polar_grid, polar_valid, polar_theta)
             loss.backward()
             self.optimizer.step()
@@ -252,11 +259,14 @@ class Trainer:
                 polar_valid = batch.get("polar_valid")
                 polar_theta = batch.get("polar_theta")
                 if polar_grid is not None:
-                    polar_grid = polar_grid.to(self.device)
-                    polar_valid = polar_valid.to(self.device)
-                    polar_theta = polar_theta.to(self.device) if polar_theta is not None else None
+                    B_ = polar_grid.shape[0]
+                    polar_grid = polar_grid.to(self.device).reshape(B_, -1)
+                    polar_valid = polar_valid.to(self.device).reshape(B_, -1)
+                    polar_theta = (polar_theta.to(self.device).reshape(B_, -1)
+                                   if polar_theta is not None else None)
 
-                out = self.model(images, metadata=metadata)
+                out = self.model(images, metadata=metadata, polar_t=polar_grid,
+                                  polar_theta=polar_theta, polar_valid=polar_valid)
                 parts = self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta)
                 pred_ages = self._predict_age(out)
 

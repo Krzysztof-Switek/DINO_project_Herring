@@ -174,15 +174,18 @@ class OtolithDataset(Dataset):
         # pipeline was updated too (see _effective_age's re-parsing fallback).
         self._has_campaign_col = "campaign" in self.df.columns
 
-        # E9: the polar-coordinate grid (needed only when the concentricity loss is
-        # actually on) requires an EXPLICIT, shared flip decision between the image
-        # and the geometry grid — build_transforms' built-in random flips can't be
-        # synchronised with a second tensor, so they're disabled here and redone
-        # manually in _load_image_with_polar(). Off by default (density_concentricity_
-        # weight=0.0): zero behaviour change for every existing config.
-        self._need_polar = (
-            bool(getattr(cfg.model, "use_density_head", False))
-            and getattr(cfg.model, "density_concentricity_weight", 0.0) > 0.0
+        # E9: the polar-coordinate grid (needed when the concentricity loss is on, OR
+        # (10.08) when density_head_type="radial_attention" — that head also consumes
+        # per-patch (t, theta) directly, see model.RadialAttentionDensityHead) requires
+        # an EXPLICIT, shared flip decision between the image and the geometry grid —
+        # build_transforms' built-in random flips can't be synchronised with a second
+        # tensor, so they're disabled here and redone manually in
+        # _load_image_with_polar(). Off by default: zero behaviour change for every
+        # existing config (density_concentricity_weight=0.0 and density_head_type!=
+        # "radial_attention" both being the defaults).
+        self._need_polar = bool(getattr(cfg.model, "use_density_head", False)) and (
+            getattr(cfg.model, "density_concentricity_weight", 0.0) > 0.0
+            or getattr(cfg.model, "density_head_type", "mlp") == "radial_attention"
         )
         self.transform = transform or build_transforms(
             cfg.data.image_size, split, include_flips=not self._need_polar)

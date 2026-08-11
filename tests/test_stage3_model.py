@@ -635,6 +635,229 @@ def test_attention_density_head_cross_patch_dependency():
 
 
 # ---------------------------------------------------------------------------
+# Change A v2 (10.08): RadialAttentionDensityHead — positional encoding + local
+# radius x angle attention window (density_head_type="radial_attention")
+# ---------------------------------------------------------------------------
+
+def _make_radial_attention_density_model():
+    from src.config import OtolithConfig
+    from src.model import OtolithModel
+    cfg = OtolithConfig()
+    cfg.model.num_age_classes = 10
+    cfg.model.dropout = 0.0
+    cfg.model.head_type = "coral"          # isolate: only the density head reads patches
+    cfg.model.use_density_head = True
+    cfg.model.density_head_type = "radial_attention"
+    cfg.model.density_attn_num_heads = 4   # divides _GradPatchBackbone.embed_dim=64
+    cfg.model.density_attn_num_layers = 1
+    return OtolithModel(cfg, backbone=_GradPatchBackbone())
+
+
+def _grid_polar_tensors(batch: int, h_p: int, w_p: int, valid: bool = True):
+    """Synthetic (B, N) polar_t/theta/valid tensors for an h_p x w_p patch grid,
+    computed the same way otolith_axis.compute_polar_grid would (t = normalised
+    radius from centre, theta = angle) — good enough for shape/behaviour tests
+    without needing a real mask/image."""
+    ys, xs = torch.meshgrid(
+        torch.arange(h_p, dtype=torch.float32), torch.arange(w_p, dtype=torch.float32),
+        indexing="ij",
+    )
+    cy, cx = (h_p - 1) / 2.0, (w_p - 1) / 2.0
+    dy, dx = ys - cy, xs - cx
+    r = torch.hypot(dy, dx)
+    t = (r / r.max().clamp(min=1e-6)).reshape(-1).unsqueeze(0).repeat(batch, 1)
+    theta = torch.atan2(dy, dx).reshape(-1).unsqueeze(0).repeat(batch, 1)
+    valid_t = torch.full((batch, h_p * w_p), valid, dtype=torch.bool)
+    return t, theta, valid_t
+
+
+def test_polar_fourier_features_shape_and_angle_continuity():
+    """Output width matches the documented formula, and the encoding of an angle
+    just BELOW +pi is close to the encoding just ABOVE -pi (the 0/360deg seam) —
+    the whole reason this uses sin/cos harmonics instead of the raw theta value."""
+    from src.model import polar_fourier_features, polar_positional_feature_dim
+    import math as _math
+
+    eps = 0.001
+    t = torch.tensor([0.3, 0.3])
+    theta = torch.tensor([_math.pi - eps, -_math.pi + eps])   # two sides of the seam
+    feats = polar_fourier_features(t, theta, num_angle_freqs=4, num_radius_freqs=4)
+    assert feats.shape == (2, polar_positional_feature_dim(4, 4)) == (2, 17)
+    # Each sin(k*theta)/cos(k*theta) term differs by at most ~2*k*eps near the seam
+    # (small-angle slope) — atol scaled for the highest harmonic used (k=4) with
+    # generous headroom, not a tight bound; the point is "small", not "exactly zero".
+    assert torch.allclose(feats[0], feats[1], atol=4 * 2 * eps + 1e-3), \
+        "angle encoding must be continuous across the +-pi seam"
+
+    # Negative control: a raw (unwrapped) angle difference would NOT be small here —
+    # confirms the test is actually exercising the wraparound case, not a no-op.
+    assert abs(float(theta[0] - theta[1])) > 6.0
+
+
+def test_radial_local_attention_mask_blocks_far_allows_near_and_self():
+    from src.model import radial_local_attention_mask
+
+    # 1 sample, 3 patches: [0]=query at (t=0, ang=0); [1] same radius bin + close
+    # angle (should be ALLOWED); [2] same radius bin but far angle (BLOCKED).
+    t = torch.tensor([[0.1, 0.1, 0.1]])
+    theta = torch.tensor([[0.0, 0.1, 3.0]])
+    valid = torch.ones(1, 3, dtype=torch.bool)
+    mask = radial_local_attention_mask(
+        t, theta, valid, n_radial_bins=4, window_deg=45.0, num_heads=2,
+    )
+    assert mask.shape == (2, 3, 3)
+    blocked = mask[0]
+    assert not blocked[0, 0], "self-attention must always be allowed"
+    assert not blocked[0, 1], "nearby patch (same bin, close angle) must be allowed"
+    assert blocked[0, 2], "far-angle patch (same bin, outside window) must be blocked"
+
+
+def test_radial_local_attention_mask_per_sample_fallback_when_all_invalid():
+    """A sample with NO valid polar data (segmentation failed) must fall back to
+    fully-unrestricted attention for THAT sample only — other samples in the same
+    batch keep their real restriction."""
+    from src.model import radial_local_attention_mask
+
+    t = torch.tensor([[0.1, 0.9], [0.1, 0.9]])
+    theta = torch.tensor([[0.0, 3.0], [0.0, 3.0]])
+    valid = torch.tensor([[True, True], [False, False]])   # sample 1: nothing valid
+    mask = radial_local_attention_mask(
+        t, theta, valid, n_radial_bins=4, window_deg=45.0, num_heads=1,
+    )
+    assert mask[0, 0, 1], "sample 0 (real polar data): far patch stays blocked"
+    assert not mask[1, 0, 1], "sample 1 (no valid polar data): must fall back to unrestricted"
+    assert torch.isnan(mask.float()).sum() == 0
+
+
+def test_radial_attention_density_head_forward_keys_and_shape():
+    with _isolated_rng():
+        model = _make_radial_attention_density_model()
+        t, theta, valid = _grid_polar_tensors(2, 4, 4)   # 4x4=16 patches, matches _GradPatchBackbone
+        out = model(torch.randn(2, 3, 56, 56), polar_t=t, polar_theta=theta, polar_valid=valid)
+        assert "density" in out and "density_count" in out
+        assert out["density"].shape == (2, 16)
+        d = out["density"].detach()
+        assert float(d.min()) >= 0.0 and float(d.max()) <= 1.0
+
+
+def test_radial_attention_density_head_stop_gradient_blocks_backbone():
+    """Same CRITICAL guarantee as every other density head: loss on this head's
+    output must NEVER update the backbone."""
+    from src.model import density_count_loss
+    with _isolated_rng():
+        model = _make_radial_attention_density_model()
+        t, theta, valid = _grid_polar_tensors(2, 4, 4)
+        out = model(torch.randn(2, 3, 56, 56), polar_t=t, polar_theta=theta, polar_valid=valid)
+        loss = density_count_loss(out["density"], torch.tensor([2, 4]), conc_weight=1.0)
+        model.zero_grad(set_to_none=True)
+        loss.backward()
+        bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                      for p in model.backbone.parameters())
+        dh_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                      for p in model.density_head.parameters())
+        assert not bb_grad, "radial_attention density loss leaked gradient into the backbone"
+        assert dh_grad, "radial_attention density head received no gradient"
+
+
+def test_radial_attention_density_head_graceful_fallback_without_polar_args():
+    """Omitting polar_t/theta/valid entirely must not crash — degrades to plain
+    (unrestricted, non-positional) attention, same contract as AttentionDensityHead."""
+    with _isolated_rng():
+        model = _make_radial_attention_density_model()
+        out = model(torch.randn(2, 3, 56, 56))   # no polar_t/theta/valid at all
+        assert out["density"].shape == (2, 16)
+        assert torch.isnan(out["density"]).sum() == 0
+
+
+def test_radial_attention_density_head_window_excludes_far_patch():
+    """Behavioural analogue of test_attention_density_head_cross_patch_dependency,
+    but for the WINDOWED head: a patch INSIDE the local radius x angle window must
+    still be able to influence another patch's output; a patch OUTSIDE it must not
+    (that's the entire point of adding the mask — unlike plain global attention,
+    which isolate_a showed collapses toward one undifferentiated blob)."""
+    from src.model import RadialAttentionDensityHead
+
+    with _isolated_rng():
+        gen = torch.Generator().manual_seed(0)
+        head = RadialAttentionDensityHead(
+            embed_dim=8, hidden_dim=16, dropout=0.0, num_heads=2, num_layers=1,
+        )
+        head.eval()
+        patches = torch.randn(1, 3, 8, generator=gen)
+        # t/theta: [0]=query; [1]=same bin+close angle (IN window); [2]=same bin+far
+        # angle (OUT of window) — identical geometry to the mask unit test above.
+        t = torch.tensor([[0.1, 0.1, 0.1]])
+        theta = torch.tensor([[0.0, 0.1, 3.0]])
+        valid = torch.ones(1, 3, dtype=torch.bool)
+
+        def _run(perturb_idx: int) -> Tensor:
+            p = patches.clone()
+            p[0, perturb_idx] += torch.randn(8, generator=gen) * 5.0
+            with torch.no_grad():
+                return head(p, polar_t=t, polar_theta=theta, polar_valid=valid)
+
+        with torch.no_grad():
+            out_base = head(patches, polar_t=t, polar_theta=theta, polar_valid=valid)
+        out_near_perturbed = _run(1)
+        out_far_perturbed = _run(2)
+
+        assert not torch.allclose(out_base[0, 0], out_near_perturbed[0, 0]), \
+            "perturbing an IN-WINDOW patch must change the query patch's output"
+        assert torch.allclose(out_base[0, 0], out_far_perturbed[0, 0], atol=1e-5), \
+            "perturbing an OUT-OF-WINDOW patch must NOT change the query patch's output"
+
+
+def test_radial_attention_density_head_positional_encoding_distinguishes_position():
+    """Two patches with IDENTICAL content but DIFFERENT (t, theta) must get
+    different scores — the entire point of adding positional encoding (plain
+    AttentionDensityHead judges only content, never location)."""
+    from src.model import RadialAttentionDensityHead
+
+    with _isolated_rng():
+        gen = torch.Generator().manual_seed(0)
+        head = RadialAttentionDensityHead(
+            embed_dim=8, hidden_dim=16, dropout=0.0, num_heads=2, num_layers=1,
+        )
+        head.eval()
+        # Single-patch batches (no cross-patch attention to confound the comparison) —
+        # isolates the positional-encoding effect specifically.
+        content = torch.randn(1, 1, 8, generator=gen)
+        t_a, theta_a = torch.tensor([[0.2]]), torch.tensor([[0.0]])
+        t_b, theta_b = torch.tensor([[0.8]]), torch.tensor([[2.5]])
+        valid = torch.ones(1, 1, dtype=torch.bool)
+        with torch.no_grad():
+            out_a = head(content, polar_t=t_a, polar_theta=theta_a, polar_valid=valid)
+            out_b = head(content, polar_t=t_b, polar_theta=theta_b, polar_valid=valid)
+        assert not torch.allclose(out_a, out_b), \
+            "identical content at different (t, theta) must produce different scores"
+
+
+def test_radial_attention_head_type_does_not_break_plain_mlp_call_path():
+    """Regression guard for a real bug caught while building this (10.08): OtolithModel
+    .forward() briefly called EVERY density head with polar_t=/polar_theta=/polar_valid=
+    kwargs unconditionally — but the "mlp" head is a bare nn.Sequential and TypeErrors
+    on unknown kwargs. The default ("mlp") path must keep working exactly as before,
+    polar args or not."""
+    from src.config import OtolithConfig
+    from src.model import OtolithModel
+
+    with _isolated_rng():
+        cfg = OtolithConfig()
+        cfg.model.num_age_classes = 10
+        cfg.model.dropout = 0.0
+        cfg.model.head_type = "coral"
+        cfg.model.use_density_head = True
+        cfg.model.density_head_type = "mlp"
+        model = OtolithModel(cfg, backbone=_GradPatchBackbone())
+
+        t, theta, valid = _grid_polar_tensors(2, 4, 4)
+        out = model(torch.randn(2, 3, 56, 56), polar_t=t, polar_theta=theta, polar_valid=valid)
+        assert out["density"].shape == (2, 16)
+        out_no_polar = model(torch.randn(2, 3, 56, 56))
+        assert out_no_polar["density"].shape == (2, 16)
+
+
+# ---------------------------------------------------------------------------
 # E9: density_concentricity_loss
 # ---------------------------------------------------------------------------
 

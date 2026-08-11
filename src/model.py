@@ -326,10 +326,239 @@ class AttentionDensityHead(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, patches: Tensor) -> Tensor:
-        """(B, N, D) -> (B, N, 1), same output contract as the plain-MLP head."""
+    def forward(
+        self,
+        patches: Tensor,
+        polar_t: Optional[Tensor] = None,
+        polar_theta: Optional[Tensor] = None,
+        polar_valid: Optional[Tensor] = None,
+    ) -> Tensor:
+        """(B, N, D) -> (B, N, 1), same output contract as the plain-MLP head.
+
+        Accepts (and ignores) the same optional polar-coordinate kwargs as
+        ``RadialAttentionDensityHead`` purely so ``OtolithModel.forward()`` can call
+        every density head through one uniform signature — this head has no use for
+        position/locality itself (that is exactly what v2 below adds).
+        """
         x = self.input_norm(patches)
         x = self.encoder(x)          # residual self-attention + FFN (built into the layer)
+        return self.out_head(x)
+
+
+def polar_fourier_features(
+    t: Tensor,
+    theta: Tensor,
+    num_angle_freqs: int = 4,
+    num_radius_freqs: int = 4,
+) -> Tensor:
+    """Fixed (non-learned) multi-frequency Fourier encoding of per-patch polar
+    coordinates — the positional-encoding half of ``RadialAttentionDensityHead``
+    (density_head_type="radial_attention"), mirroring RadialFormer's Learnable Polar
+    Position Encoding (iris recognition; near-identical geometry to otolith rings —
+    concentric texture around a centre, periodic angular coordinate) without the
+    "learnable" part, for a first, cheap version.
+
+    The ANGLE branch is why this can't just be the raw scalars: ``theta`` wraps at
+    the 0/360° seam, so a plain linear encoding would tell the network that 359° and
+    1° are almost maximally far apart when geometrically they are 2° apart — exactly
+    the discontinuity ``_wrap_angle``/``atan2(sin,cos)`` elsewhere in this project
+    (``src/dataset.py``, ``density_concentricity_loss``) were built to avoid. Each
+    sin/cos harmonic pair is continuous and periodic by construction, so no explicit
+    wrapping is needed here. The RADIUS branch (``t`` in [0, 1], already bounded, no
+    wraparound) uses the same multi-frequency-sinusoid recipe purely because it's a
+    standard, cheap way to give a network an easier time discriminating close-vs-far
+    positions than a single raw scalar (NeRF / original Transformer positional
+    encoding) — not required for correctness the way the angle encoding is.
+
+    Args:
+        t     : (...,) per-patch normalised radius in [0, 1].
+        theta : (...,) per-patch angle in radians, same shape as ``t``.
+        num_angle_freqs, num_radius_freqs: number of harmonics per branch. JAWNIE
+            NIEZWERYFIKOWANY punkt startowy (4/4) — not tuned against real data.
+
+    Returns:
+        (..., 1 + 2*num_angle_freqs + 2*num_radius_freqs) — ``[t, sin(kθ), cos(kθ)
+        for k=1..num_angle_freqs, sin(kπt), cos(kπt) for k=1..num_radius_freqs]``.
+    """
+    feats = [t.unsqueeze(-1)]
+    for k in range(1, num_angle_freqs + 1):
+        feats.append(torch.sin(k * theta).unsqueeze(-1))
+        feats.append(torch.cos(k * theta).unsqueeze(-1))
+    for k in range(1, num_radius_freqs + 1):
+        feats.append(torch.sin(k * math.pi * t).unsqueeze(-1))
+        feats.append(torch.cos(k * math.pi * t).unsqueeze(-1))
+    return torch.cat(feats, dim=-1)
+
+
+def polar_positional_feature_dim(num_angle_freqs: int, num_radius_freqs: int) -> int:
+    """Output width of :func:`polar_fourier_features` for the given harmonic counts."""
+    return 1 + 2 * num_angle_freqs + 2 * num_radius_freqs
+
+
+def radial_local_attention_mask(
+    polar_t: Tensor,
+    polar_theta: Tensor,
+    polar_valid: Tensor,
+    n_radial_bins: int,
+    window_deg: float,
+    num_heads: int,
+) -> Tensor:
+    """Boolean self-attention mask restricting each patch to a local radius×angle
+    neighbourhood — the locality half of ``RadialAttentionDensityHead``, mirroring
+    RadialFormer's Radial Stripe Window Attention. Deliberately reuses the EXACT same
+    same-bin/angular-window geometry as ``density_concentricity_loss``'s windowed
+    variant above (same ``atan2(sin,cos)`` circular-distance trick for the 0/360° seam)
+    — that geometry is already implemented and separately validated there; this just
+    enforces it structurally in the attention mechanism itself, not as a post-hoc loss
+    penalty on patches that were already free to see each other.
+
+    Self-attention (each patch attending to itself) is ALWAYS allowed regardless of
+    validity or window membership — guarantees no attention row is ever fully
+    blocked (which would make softmax degenerate). Samples with NO valid polar data at
+    all (segmentation failed for that one image) fall back to fully UNRESTRICTED
+    attention for that sample only, not the whole batch — matches this project's
+    established "never crash / never silently degrade the whole batch over one bad
+    photo" philosophy (``otolith_axis.py``).
+
+    Args:
+        polar_t, polar_theta, polar_valid: (B, N) each, flattened per-patch polar
+            coordinates/validity (see ``otolith_axis.compute_polar_grid``).
+        n_radial_bins : number of fixed-width radius bins spanning t ∈ [0, 1].
+        window_deg    : full angular window width in degrees.
+        num_heads     : attention head count — the returned mask is repeated per head
+            to match ``nn.TransformerEncoder``'s expected (B*num_heads, N, N) shape for
+            a per-sample (not globally shared) mask.
+
+    Returns:
+        (B*num_heads, N, N) bool — True = blocked (not allowed to attend), per
+        ``nn.MultiheadAttention``'s convention.
+    """
+    B, N = polar_t.shape
+    bin_idx = torch.clamp((polar_t * n_radial_bins).long(), 0, n_radial_bins - 1)   # (B, N)
+    same_bin = bin_idx.unsqueeze(2) == bin_idx.unsqueeze(1)                          # (B, N, N)
+
+    delta = polar_theta.unsqueeze(2) - polar_theta.unsqueeze(1)
+    delta = torch.atan2(torch.sin(delta), torch.cos(delta))
+    angular_close = delta.abs() <= (math.radians(window_deg) / 2.0)
+
+    valid_pair = polar_valid.unsqueeze(2) & polar_valid.unsqueeze(1)                 # (B, N, N)
+    allowed = same_bin & angular_close & valid_pair                                  # (B, N, N)
+
+    eye = torch.eye(N, dtype=torch.bool, device=polar_t.device).unsqueeze(0)         # (1, N, N)
+    allowed = allowed | eye
+
+    has_any_valid = polar_valid.any(dim=1).view(B, 1, 1)                             # (B, 1, 1)
+    allowed = torch.where(has_any_valid, allowed, torch.ones_like(allowed))
+
+    blocked = ~allowed
+    return blocked.repeat_interleave(num_heads, dim=0)                              # (B*num_heads, N, N)
+
+
+class RadialAttentionDensityHead(nn.Module):
+    """Position-aware, locally-windowed self-attention density head
+    (density_head_type="radial_attention", 10.08 — "v2" of AttentionDensityHead).
+
+    Built directly from two findings, one from this project's own code/experiments,
+    one from literature, that independently converged on the SAME gap (plans and
+    summaries/9.08_uwaga_plan_TO.DO.md §4.4): the isolation matrix (Run K / isolate_a /
+    isolate_b) showed ``density_active`` stays at 0.0000 in EVERY real training run
+    with plain ``AttentionDensityHead`` ("attention") — regardless of the windowed E9
+    loss — implicating the ARCHITECTURE, not an interaction. RadialFormer (iris
+    recognition — near-identical polar geometry to otolith rings) independently names
+    the same missing capability: plain self-attention has no notion of WHERE a patch
+    sits (radius/angle relative to the nucleus), only what it looks like.
+
+    Two fixes, both applied at once (see the two module-level helpers above for the
+    geometry, factored out so they're independently unit-testable):
+
+    1. **Explicit polar positional encoding** — a fixed Fourier embedding of each
+       patch's (t, θ) is projected and ADDED to its content embedding before
+       attention, mirroring RadialFormer's Learnable Polar Position Encoding (LPPE),
+       minus the "learnable" part for this first version.
+    2. **Local (not global) attention** — instead of every one of ~1369 patches
+       attending to all the others at once (a real, live symptom observed on
+       ``isolate_a``: output collapsing into one diffuse, undifferentiated blob rather
+       than distinct peaks), attention is restricted to a local radius×angle window,
+       mirroring RadialFormer's Radial Stripe Window Attention.
+
+    Always called on a STOP-GRADIENT input (``patches.detach()`` in
+    ``OtolithModel.forward()``) — inherits that safety automatically, identically to
+    every other density head; nothing in this module touches that boundary.
+
+    Gracefully degrades to the equivalent of plain global ``AttentionDensityHead``
+    behaviour (no positional encoding, no masking) when ``polar_t``/``polar_theta``
+    are not supplied at all — lets old call sites that don't thread polar data through
+    (a handful of pre-09.08 diagnostic scripts, deliberately left unchanged — see
+    ``plans and summaries/9.08_uwaga_plan_TO.DO.md`` §5) keep working, just without
+    this head's two new mechanisms.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int,
+        dropout: float,
+        num_heads: int = 4,
+        num_layers: int = 1,
+        num_angle_freqs: int = 4,
+        num_radius_freqs: int = 4,
+        n_radial_bins: int = 12,
+        window_deg: float = 45.0,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_angle_freqs = num_angle_freqs
+        self.num_radius_freqs = num_radius_freqs
+        self.n_radial_bins = n_radial_bins
+        self.window_deg = window_deg
+
+        pos_dim = polar_positional_feature_dim(num_angle_freqs, num_radius_freqs)
+        self.pos_proj = nn.Linear(pos_dim, embed_dim)
+
+        self.input_norm = nn.LayerNorm(embed_dim)
+        layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers, enable_nested_tensor=False)
+        self.out_head = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        patches: Tensor,
+        polar_t: Optional[Tensor] = None,
+        polar_theta: Optional[Tensor] = None,
+        polar_valid: Optional[Tensor] = None,
+    ) -> Tensor:
+        """(B, N, D) [+ optional (B, N) polar tensors] -> (B, N, 1)."""
+        x = self.input_norm(patches)
+
+        if polar_t is not None and polar_theta is not None:
+            pos_feats = polar_fourier_features(
+                polar_t, polar_theta, self.num_angle_freqs, self.num_radius_freqs
+            )                                                     # (B, N, pos_dim)
+            x = x + self.pos_proj(pos_feats)
+
+        attn_mask = None
+        if polar_t is not None and polar_theta is not None and polar_valid is not None:
+            attn_mask = radial_local_attention_mask(
+                polar_t, polar_theta, polar_valid,
+                n_radial_bins=self.n_radial_bins,
+                window_deg=self.window_deg,
+                num_heads=self.num_heads,
+            )
+
+        x = self.encoder(x, mask=attn_mask)
         return self.out_head(x)
 
 
@@ -409,6 +638,11 @@ class OtolithModel(nn.Module):
         self.use_density_head = bool(getattr(cfg.model, "use_density_head", False))
         if self.use_density_head:
             density_head_type = getattr(cfg.model, "density_head_type", "mlp")
+            # Stored (not just a local var) so forward() can decide, without re-reading
+            # cfg, whether density_head accepts the polar_t/theta/valid kwargs — the
+            # "mlp" branch is a bare nn.Sequential (deliberately, for state-dict-key
+            # backward compatibility, see below) and would TypeError on unknown kwargs.
+            self.density_head_type = density_head_type
             if density_head_type == "attention":
                 # Cross-patch self-attention (see AttentionDensityHead above) — opt-in,
                 # off by default. Kept as a SEPARATE branch (not a wrapper around the
@@ -423,6 +657,23 @@ class OtolithModel(nn.Module):
                     dropout=cfg.model.dropout,
                     num_heads=getattr(cfg.model, "density_attn_num_heads", 4),
                     num_layers=getattr(cfg.model, "density_attn_num_layers", 1),
+                )
+            elif density_head_type == "radial_attention":
+                # v2 (10.08) — positional encoding + locally-windowed attention, see
+                # RadialAttentionDensityHead above for the full rationale. Same
+                # byte-identical-state-dict-key reasoning as the "attention" branch:
+                # a SEPARATE branch, not a wrapper, so "mlp"/"attention" checkpoints
+                # are untouched by this option existing.
+                self.density_head = RadialAttentionDensityHead(
+                    embed_dim=embed_dim,
+                    hidden_dim=cfg.model.mil_hidden_dim,
+                    dropout=cfg.model.dropout,
+                    num_heads=getattr(cfg.model, "density_attn_num_heads", 4),
+                    num_layers=getattr(cfg.model, "density_attn_num_layers", 1),
+                    num_angle_freqs=getattr(cfg.model, "density_attn_num_angle_freqs", 4),
+                    num_radius_freqs=getattr(cfg.model, "density_attn_num_radius_freqs", 4),
+                    n_radial_bins=getattr(cfg.model, "density_attn_radial_bins", 12),
+                    window_deg=getattr(cfg.model, "density_attn_window_deg", 45.0),
                 )
             else:
                 # LayerNorm first: `_reg` backbones flatten the patch-token norm
@@ -444,9 +695,22 @@ class OtolithModel(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(
-        self, image: Tensor, metadata: Optional[Tensor] = None
+        self,
+        image: Tensor,
+        metadata: Optional[Tensor] = None,
+        polar_t: Optional[Tensor] = None,
+        polar_theta: Optional[Tensor] = None,
+        polar_valid: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
-        """Return a dict of head outputs. Patches participate in autograd."""
+        """Return a dict of head outputs. Patches participate in autograd.
+
+        ``polar_t``/``polar_theta``/``polar_valid`` (10.08, all optional, all ``None``
+        by default): per-patch polar coordinates from ``otolith_axis.compute_polar_grid``,
+        flattened to (B, N) — same tensors already computed for the E9 concentricity
+        loss (``OtolithDataset._need_polar``), now ALSO forwarded into the density head
+        itself when it is ``RadialAttentionDensityHead``. Every other head type ignores
+        them (see their ``forward`` signatures) — passing them is always safe.
+        """
         # NOTE: forward_features WITHOUT torch.no_grad — patches must
         # backpropagate when the MIL head is active.
         feats = self.backbone.forward_features(image)
@@ -470,7 +734,15 @@ class OtolithModel(nn.Module):
         if self.use_density_head:
             # STOP-GRADIENT: detach patch tokens so the density loss updates only the
             # density head, never the shared backbone (age head stays safe by design).
-            dens_logits = self.density_head(patches.detach()).squeeze(-1)   # (B, N)
+            detached = patches.detach()
+            if self.density_head_type == "mlp":
+                # Bare nn.Sequential (see __init__) — takes ONLY the tensor, no kwargs.
+                dens_logits = self.density_head(detached).squeeze(-1)       # (B, N)
+            else:
+                dens_logits = self.density_head(
+                    detached, polar_t=polar_t, polar_theta=polar_theta,
+                    polar_valid=polar_valid,
+                ).squeeze(-1)                                               # (B, N)
             density = torch.sigmoid(dens_logits)                            # (B, N) ∈ [0,1]
             out["density"] = density
             out["density_count"] = density.sum(dim=1)                       # (B,)
@@ -536,18 +808,35 @@ class OtolithModel(nn.Module):
         H_p = W_p = int(N ** 0.5)
         return probs.reshape(B, H_p, W_p)
 
-    def get_density_probs(self, image: Tensor) -> Tensor:
+    def get_density_probs(
+        self,
+        image: Tensor,
+        polar_t: Optional[Tensor] = None,
+        polar_theta: Optional[Tensor] = None,
+        polar_valid: Optional[Tensor] = None,
+    ) -> Tensor:
         """Decoupled density map as a spatial grid (B, H_p, W_p). No gradients.
 
         This is the Kierunek B localisation signal (integral ≈ age). Raises if the
         model was built without a density head.
+
+        ``polar_t``/``polar_theta``/``polar_valid`` (10.08, all optional): forwarded
+        straight to ``forward()`` — only consumed by ``density_head_type=
+        "radial_attention"`` (see there). Callers using that head type SHOULD supply
+        these (flattened (B, N) tensors from ``otolith_axis.compute_polar_grid``) to
+        match training-time behaviour; omitting them degrades gracefully to
+        unrestricted, non-positional attention for this call only (documented, not a
+        crash — see ``RadialAttentionDensityHead``'s docstring). Every other head type
+        ignores them regardless.
         """
         if not hasattr(self, "density_head"):
             raise RuntimeError(
                 "Model has no density head (model.use_density_head=false)"
             )
         with torch.no_grad():
-            out = self.forward(image)
+            out = self.forward(
+                image, polar_t=polar_t, polar_theta=polar_theta, polar_valid=polar_valid,
+            )
         density = out["density"]                       # (B, N)
         B, N = density.shape
         H_p = W_p = int(N ** 0.5)
