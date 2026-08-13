@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 460" font-family="DejaVu Sans, Arial, sans-serif" role="img" aria-label="Siatka kwadracików obrazu: tylko część leży na którymkolwiek promieniu, reszta nigdy nie wpływa na wynik.">
+  <rect x="0" y="0" width="640" height="460" fill="#ffffff"/>
+  <text x="20" y="30" font-size="17" font-weight="700" fill="#1b2430">Odkrycie: promienie „widzą” tylko część obrazu</text>
+  <g transform="translate(0,30)">
+  <polygon points="320.0,59.2 335.2,56.4 350.7,55.9 366.1,57.8 381.1,62.1 395.3,68.5 408.4,76.8 420.4,86.6 431.1,97.6 440.5,109.5 448.8,121.9 456.2,134.6 462.7,147.6 468.7,160.7 474.1,173.9 479.1,187.4 483.5,201.2 487.3,215.4 490.3,230.0 492.1,245.1 492.3,260.4 490.5,275.7 486.2,290.5 478.9,304.1 468.5,315.7 455.1,324.6 439.3,330.1 422.5,332.5 406.0,332.5 391.0,331.4 378.3,330.9 367.6,332.1 358.2,335.1 349.3,339.3 340.1,343.7 330.3,347.3 320.0,349.2 309.5,349.5 299.1,348.3 288.9,346.2 278.7,343.4 268.6,340.2 258.5,336.5 248.3,332.3 238.2,327.4 228.4,321.6 219.0,314.7 210.4,306.7 202.9,297.6 196.8,287.5 192.2,276.5 189.3,265.0 188.1,253.3 188.5,241.5 190.4,230.0 193.5,218.9 197.5,208.4 202.2,198.4 207.2,188.9 212.3,179.8 217.4,170.8 222.4,161.7 227.4,152.3 232.6,142.6 238.1,132.4 244.2,121.8 251.3,111.0 259.4,100.1 268.9,89.6 279.8,79.9 292.0,71.3 305.5,64.3"
+    fill="none" stroke="#9aa5ab" stroke-width="1.8" stroke-dasharray="3 3" opacity="0.7"/>
+  <g stroke="none">
+    <rect x="215" y="250" width="24" height="24" fill="#1f7a72"/>
+    <rect x="245" y="160" width="24" height="24" fill="#1f7a72"/>
+    <rect x="245" y="190" width="24" height="24" fill="#1f7a72"/>
+    <rect x="245" y="280" width="24" height="24" fill="#1f7a72"/>
+    <rect x="275" y="190" width="24" height="24" fill="#1f7a72"/>
+    <rect x="275" y="250" width="24" height="24" fill="#1f7a72"/>
+    <rect x="275" y="280" width="24" height="24" fill="#1f7a72"/>
+    <rect x="305" y="70" width="24" height="24" fill="#1f7a72"/>
+    <rect x="305" y="100" width="24" height="24" fill="#1f7a72"/>
+    <rect x="305" y="130" width="24" height="24" fill="#1f7a72"/>
+    <rect x="305" y="160" width="24" height="24" fill="#1f7a72"/>
+    <rect x="305" y="190" width="24" height="24" fill="#1f7a72"/>
+    <rect x="305" y="220" width="24" height="24" fill="#1f7a72"/>
+    <rect x="305" y="250" width="24" height="24" fill="#1f7a72"/>
+    <rect x="305" y="280" width="24" height="24" fill="#1f7a72"/>
+    <rect x="305" y="310" width="24" height="24" fill="#1f7a72"/>
+    <rect x="335" y="190" width="24" height="24" fill="#1f7a72"/>
+    <rect x="335" y="250" width="24" height="24" fill="#1f7a72"/>
+    <rect x="335" y="280" width="24" height="24" fill="#1f7a72"/>
+    <rect x="365" y="70" width="24" height="24" fill="#1f7a72"/>
+    <rect x="365" y="160" width="24" height="24" fill="#1f7a72"/>
+    <rect x="365" y="190" width="24" height="24" fill="#1f7a72"/>
+    <rect x="365" y="280" width="24" height="24" fill="#1f7a72"/>
+    <rect x="395" y="130" width="24" height="24" fill="#1f7a72"/>
+    <rect x="395" y="250" width="24" height="24" fill="#1f7a72"/>
+    <rect x="395" y="310" width="24" height="24" fill="#1f7a72"/>
+    <rect x="455" y="280" width="24" height="24" fill="#1f7a72"/>
+
+    <rect x="185" y="220" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="185" y="250" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="215" y="160" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="215" y="190" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="215" y="220" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="215" y="280" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="245" y="100" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="245" y="130" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="245" y="220" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="245" y="250" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="245" y="310" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="275" y="70" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="275" y="100" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="275" y="130" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="275" y="160" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="275" y="220" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="275" y="310" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="335" y="70" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="335" y="100" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="335" y="130" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="335" y="160" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="335" y="220" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="335" y="310" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="365" y="100" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="365" y="130" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="365" y="220" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="365" y="250" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="365" y="310" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="395" y="100" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="395" y="160" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="395" y="190" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="395" y="220" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="395" y="280" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="425" y="130" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="425" y="160" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="425" y="190" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="425" y="220" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="425" y="250" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="425" y="280" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="455" y="190" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="455" y="220" width="24" height="24" fill="#e4e8ea"/>
+    <rect x="455" y="250" width="24" height="24" fill="#e4e8ea"/>
+  </g>
+  <circle cx="320" cy="230" r="4" fill="#1b2430"/>
+  </g>
+  <g font-size="13">
+    <rect x="20" y="380" width="14" height="14" fill="#1f7a72"/>
+    <text x="40" y="391" fill="#4c5c62">kwadracik na promieniu — wpływa na wynik</text>
+    <rect x="20" y="404" width="14" height="14" fill="#e4e8ea" stroke="#c7ced1"/>
+    <text x="40" y="415" fill="#4c5c62">kwadracik poza promieniami — nigdy nie brany pod uwagę</text>
+  </g>
+  <text x="20" y="445" font-size="12.5" font-weight="700" fill="#c9581f">W pełnej analizie (48 promieni): ok. 30% kwadracików zaznaczonych, ok. 70% nigdy nietkniętych.</text>
+</svg>

@@ -317,10 +317,25 @@ class SegmentationConfig(BaseModel):
     # growth is asymmetric). NOT a segment_otolith kwarg — excluded in as_params(),
     # consumed directly by detect_axis(nucleus_method=...).
     nucleus_method: Literal["geometric", "intensity"] = "geometric"
+    # Axis TERMINUS (opposite end from the nucleus). "ring_richness" (13.08, NOW DEFAULT) is
+    # otolith_axis.find_reading_edge: picks the direction with the most visible ring peaks,
+    # within a cone opposite the tail, instead of the geometrically farthest point. Promoted
+    # to default after validation against real expert annotations (ZEGAR dataset, see
+    # plans and summaries/12.08_ZEGAR_ANOTACJE_TO_DO.md §11): the old "farthest" heuristic
+    # (otolith_axis.find_farthest_edge, the original ICES-derived "farthest contour point"
+    # convention) pointed at the otolith's ring-free tail/spur in 42/42 samples, confirmed on
+    # production photos too; switching gave a 25x/6x real-ground-truth localization
+    # improvement on two independent checkpoints. Only affects reporting/candidate-extraction,
+    # NOT training (otolith_axis.compute_polar_grid, which actually feeds the density head
+    # and E9 loss, normalises per-angle and never depends on this choice) — so the switch is
+    # safe to make retroactively; it does not invalidate or require retraining any existing
+    # checkpoint. "farthest" kept available for comparison/rollback. NOT a segment_otolith
+    # kwarg — excluded in as_params(), consumed directly by detect_axis(axis_method=...).
+    axis_method: Literal["farthest", "ring_richness"] = "ring_richness"
 
     def as_params(self) -> dict:
         """Kwargs for ``segment_otolith`` / ``detect_axis(seg_params=...)``."""
-        return self.model_dump(exclude={"nucleus_method"})
+        return self.model_dump(exclude={"nucleus_method", "axis_method"})
 
 
 class DemoConfig(BaseModel):

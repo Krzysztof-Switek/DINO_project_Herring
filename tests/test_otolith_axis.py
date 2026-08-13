@@ -14,6 +14,7 @@ from src.otolith_axis import (
     find_centroid,
     find_farthest_edge,
     find_intensity_centroid,
+    find_reading_edge,
     get_or_compute_mask,
     load_mask,
     mask_bbox,
@@ -242,6 +243,104 @@ def test_farthest_point_along_major_axis():
     # Major axis is vertical → far point should be ≈ (400, 100) or (400, 500)
     assert abs(far_x - 400) <= 15
     assert abs(far_y - 100) <= 25 or abs(far_y - 500) <= 25
+
+
+# ---------------------------------------------------------------------------
+# find_reading_edge — 13.08, ring-richness axis heuristic (ZEGAR finding)
+# ---------------------------------------------------------------------------
+
+def _make_ringed_blob_with_spur(
+    center: tuple[int, int] = (400, 300), radius: int = 120,
+    spur_len: int = 220, spur_width: int = 30,
+) -> np.ndarray:
+    """A round, dark otolith-like body with concentric alternating light/dark RINGS in
+    its upper half, plus a plain (featureless) rectangular spur protruding DOWN from the
+    body — the spur tip is the geometrically farthest point, but has zero ring texture,
+    mirroring the real "tail vs ringed body" shape found in ZEGAR/production otoliths.
+    """
+    H, W = 700, 800
+    img = np.full((H, W, 3), 255, dtype=np.uint8)
+    cx, cy = center
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    d = np.hypot(xx - cx, yy - cy)
+    gray = np.full((H, W), 255, dtype=np.float32)
+    inside = d <= radius
+    # Concentric alternating bands (rings) — clearly multi-peaked along ANY ray through
+    # the body, not just the upper half, but that's fine: the spur (below) still has
+    # zero texture, so the body direction still wins on peak count vs the spur direction.
+    band = (d[inside] / 14.0).astype(np.int64)
+    gray[inside] = np.where(band % 2 == 0, 60.0, 140.0)
+    # Plain, uniform-intensity spur below the body — no ring texture at all.
+    spur = ((xx >= cx - spur_width) & (xx <= cx + spur_width)
+            & (yy >= cy) & (yy <= cy + spur_len))
+    gray[spur] = 60.0
+    img = np.stack([gray] * 3, axis=2).astype(np.uint8)
+    return img
+
+
+def test_find_reading_edge_prefers_ring_rich_direction_over_farthest_point():
+    """The spur (down) is geometrically farthest but featureless; the ringed body (up)
+    should win on ring-peak count instead."""
+    img = _make_ringed_blob_with_spur()
+    mask = segment_otolith(img, method="threshold")
+    assert mask is not None
+    centroid = find_centroid(mask)
+    assert centroid is not None
+
+    farthest = find_farthest_edge(mask, centroid, direction="any")
+    reading = find_reading_edge(img, mask, centroid)
+    assert reading is not None
+    assert farthest[1] > centroid[1], "sanity: farthest point should be down, in the spur"
+    assert reading[1] < centroid[1], "ring-richness should point UP, away from the spur"
+    assert reading != farthest
+
+
+def test_find_reading_edge_falls_back_when_no_rings_detected():
+    """Plain ellipse with zero ring texture anywhere → same result as find_farthest_edge."""
+    img = _make_dark_ellipse(center=(400, 300), axes=(100, 200))
+    mask = segment_otolith(img)
+    centroid = find_centroid(mask)
+    reading = find_reading_edge(img, mask, centroid)
+    farthest = find_farthest_edge(mask, centroid, direction="down")
+    assert reading == farthest
+
+
+def test_find_reading_edge_returns_none_for_empty_mask():
+    empty_mask = np.zeros((100, 100), dtype=np.uint8)
+    img = np.zeros((100, 100, 3), dtype=np.uint8)
+    assert find_reading_edge(img, empty_mask, (50, 50)) is None
+
+
+def test_detect_axis_ring_richness_method_differs_from_farthest():
+    img = _make_ringed_blob_with_spur()
+    info_farthest = detect_axis(img, seg_params={"method": "threshold"}, axis_method="farthest")
+    info_ring = detect_axis(img, seg_params={"method": "threshold"}, axis_method="ring_richness")
+    assert info_farthest is not None and info_ring is not None
+    assert info_farthest["far_edge"] != info_ring["far_edge"]
+
+
+def test_detect_axis_defaults_to_ring_richness():
+    """13.08: ring_richness is now the default axis_method (promoted after ZEGAR
+    validation) — calling detect_axis() without axis_method must match calling it with
+    axis_method="ring_richness" explicitly, not the older "farthest" behaviour."""
+    img = _make_ringed_blob_with_spur()
+    info_default = detect_axis(img, seg_params={"method": "threshold"})
+    info_ring = detect_axis(img, seg_params={"method": "threshold"}, axis_method="ring_richness")
+    assert info_default is not None and info_ring is not None
+    assert info_default["far_edge"] == info_ring["far_edge"]
+
+
+def test_segmentation_config_as_params_excludes_axis_method():
+    """axis_method is consumed by detect_axis(), NOT a segment_otolith() kwarg —
+    as_params() must exclude it or segment_otolith(**params) raises TypeError."""
+    from src.config import SegmentationConfig
+
+    cfg = SegmentationConfig()
+    assert cfg.axis_method == "ring_richness"      # 13.08: new default, post-ZEGAR fix
+    params = cfg.as_params()
+    assert "axis_method" not in params
+    img = _make_dark_ellipse()
+    assert segment_otolith(img, **params) is not None   # would TypeError if leaked
 
 
 # ---------------------------------------------------------------------------

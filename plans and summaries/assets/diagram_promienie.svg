@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 460" font-family="DejaVu Sans, Arial, sans-serif" role="img" aria-label="Z jądra otolitu wychodzi kilkanaście promieni do brzegu; sygnał sprawdzany jest tylko wzdłuż tych linii.">
+  <rect x="0" y="0" width="640" height="460" fill="#ffffff"/>
+  <text x="20" y="30" font-size="17" font-weight="700" fill="#1b2430">Metoda promieni — jak dotąd szukaliśmy przyrostów</text>
+  <polygon points="320.0,59.2 335.2,56.4 350.7,55.9 366.1,57.8 381.1,62.1 395.3,68.5 408.4,76.8 420.4,86.6 431.1,97.6 440.5,109.5 448.8,121.9 456.2,134.6 462.7,147.6 468.7,160.7 474.1,173.9 479.1,187.4 483.5,201.2 487.3,215.4 490.3,230.0 492.1,245.1 492.3,260.4 490.5,275.7 486.2,290.5 478.9,304.1 468.5,315.7 455.1,324.6 439.3,330.1 422.5,332.5 406.0,332.5 391.0,331.4 378.3,330.9 367.6,332.1 358.2,335.1 349.3,339.3 340.1,343.7 330.3,347.3 320.0,349.2 309.5,349.5 299.1,348.3 288.9,346.2 278.7,343.4 268.6,340.2 258.5,336.5 248.3,332.3 238.2,327.4 228.4,321.6 219.0,314.7 210.4,306.7 202.9,297.6 196.8,287.5 192.2,276.5 189.3,265.0 188.1,253.3 188.5,241.5 190.4,230.0 193.5,218.9 197.5,208.4 202.2,198.4 207.2,188.9 212.3,179.8 217.4,170.8 222.4,161.7 227.4,152.3 232.6,142.6 238.1,132.4 244.2,121.8 251.3,111.0 259.4,100.1 268.9,89.6 279.8,79.9 292.0,71.3 305.5,64.3"
+    fill="none" stroke="#1f7a72" stroke-width="2.5" stroke-linejoin="round" transform="translate(0,40)"/>
+  <g stroke="#9aa5ab" stroke-width="1" opacity="0.7" transform="translate(0,40)">
+    <line x1="320" y1="230" x2="320.0" y2="69.5"/>
+    <line x1="320" y1="230" x2="433.3" y2="116.7"/>
+    <line x1="320" y1="230" x2="480.1" y2="230.0"/>
+    <line x1="320" y1="230" x2="416.3" y2="326.3"/>
+    <line x1="320" y1="230" x2="320.0" y2="342.1"/>
+    <line x1="320" y1="230" x2="233.9" y2="316.1"/>
+    <line x1="320" y1="230" x2="198.2" y2="230.0"/>
+    <line x1="320" y1="230" x2="237.8" y2="147.8"/>
+  </g>
+  <g stroke="#c9581f" stroke-width="1.8" transform="translate(0,40)">
+    <line x1="320" y1="230" x2="384.2" y2="75.0"/>
+    <line x1="320" y1="230" x2="473.2" y2="293.4"/>
+    <line x1="320" y1="230" x2="201.8" y2="279.0"/>
+  </g>
+  <g fill="#c9581f" transform="translate(0,40)">
+    <circle cx="347.0" cy="164.9" r="5"/>
+    <circle cx="367.5" cy="115.3" r="5"/>
+    <circle cx="360.5" cy="270.5" r="5"/>
+    <circle cx="391.3" cy="301.3" r="5"/>
+    <circle cx="270.4" cy="250.6" r="5"/>
+    <circle cx="232.5" cy="266.2" r="5"/>
+  </g>
+  <circle cx="320" cy="270" r="5.5" fill="#1b2430"/>
+  <text x="320" y="296" text-anchor="middle" font-size="13" fill="#4c5c62">jądro</text>
+  <g font-size="13">
+    <line x1="20" y1="375" x2="40" y2="375" stroke="#1f7a72" stroke-width="2.5"/>
+    <text x="48" y="380" fill="#4c5c62">kontur otolitu (jądro → brzeg)</text>
+    <line x1="20" y1="399" x2="40" y2="399" stroke="#c9581f" stroke-width="2"/>
+    <text x="48" y="404" fill="#4c5c62">promień z wykrytym szczytem sygnału</text>
+  </g>
+  <text x="20" y="440" font-size="12.5" fill="#4c5c62">W praktyce: 48 promieni. Tu dla czytelności 16 — sygnał sprawdzany jest wyłącznie wzdłuż tych wąskich linii.</text>
+</svg>

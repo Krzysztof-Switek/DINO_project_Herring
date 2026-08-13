@@ -1,0 +1,153 @@
+# 13.08 — Zmiana A v2 + Zmiana B: E9 (okienkowa strata koncentryczności) DOŁĄCZONA
+# na wierzch już potwierdzonej architektury radial_attention (Run N).
+#
+# Kontekst: Run N (`configs/config_radial_attention.yaml`, `outputs/11.08_radial_attention`)
+# miał Zmianę B celowo WYŁĄCZONĄ, żeby najpierw ocenić samą nową architekturę uwagi
+# (density_head_type=radial_attention) w izolacji. Wynik: density po raz pierwszy w 4
+# biegach (K/L/M/N) naprawdę ożyła (density_active ~3,7-4,7 od epoki 28), a po naprawie
+# błędu osi pomiarowej (13.08, patrz plans and summaries/12.08_ZEGAR_ANOTACJE_TO_DO.md §11
+# i 6.08_PODSUMOWANIE_PROCESU.md Etap 23) okazało się, że density z Run N jest NAPRAWDĘ
+# dokładniejsza niż klasyka na prawdziwym ground truth (ZEGAR): 22,8px vs 122,1px — pierwszy
+# raz w historii projektu. To POTWIERDZA, że sam scoring jest teraz wiarygodny — więc to
+# pierwszy eksperyment w całej serii, którego wyniki będzie można od razu zaufać, bez
+# póżniejszego przeliczania.
+#
+# Ten bieg: JEDYNA zmiana względem config_radial_attention.yaml to włączenie Zmiany B
+# (density_concentricity_weight: 0.0 → 1.0, ta sama wartość co w run L/isolate_b i
+# config_e9_w1.0.yaml — środkowy punkt wcześniejszego bracketingu wag E9). Pytanie
+# badawcze: czy okienkowa strata koncentryczności POMAGA jeszcze bardziej, gdy głowica
+# uwagi już strukturalnie wymusza lokalność (radial_attention), czy jest teraz zbędna
+# (redundant z tym, co już wymusza sama architektura)?
+#
+# `segmentation.axis_method: ring_richness` jest już domyślne w kodzie (src/config.py,
+# 13.08) — ustawione tu jawnie tylko dla czytelności/dokumentacji tego konkretnego biegu.
+#
+# Osobny plik od config_radial_attention.yaml — nie nadpisuje Run N.
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # niezmienione względem całej serii izolacyjnej
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  head_type: both                 # coral | mil | both
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  density_conc_weight: 1.0        # UWAGA: to jest WEWNĘTRZNY człon top-k w density_count_loss,
+                                  # NIE to samo co density_concentricity_weight niżej (E9/Zmiana B)
+                                  # — dwie różne, niebezpiecznie podobne nazwy, patrz 08.08 code-review.
+  density_tv_weight: 0.03
+
+  # ------------------------------------------------------------------------
+  # ZMIANA A v2 (niezmieniona względem Run N) — patrz src/model.py::RadialAttentionDensityHead.
+  density_head_type: radial_attention   # mlp | attention (v1, martwa) | radial_attention (v2)
+  density_attn_num_heads: 4       # jak w poprzednich biegach z uwagą
+  density_attn_num_layers: 1
+  # Liczba harmonik Fouriera (sin/cos) dla kodowania kąta/promienia — JAWNIE
+  # NIEZWERYFIKOWANY punkt startowy, ten sam status co inner_margin=0.20 niżej.
+  density_attn_num_angle_freqs: 4
+  density_attn_num_radius_freqs: 4
+  # Lokalne okno uwagi (promień×kąt) — CELOWO osobne pola od density_concentricity_
+  # bins/window_deg (Zmiana B) niżej: to definiuje co MECHANIZM UWAGI strukturalnie
+  # widzi, nie co STRATA E9 karze za niezgodność — mechanizmy niezależne.
+  density_attn_radial_bins: 12
+  density_attn_window_deg: 45.0
+
+  # ------------------------------------------------------------------------
+  # ZMIANA B (13.08) — WŁĄCZONA, jedyna zmiana względem Run N. Ta sama waga i geometria
+  # co w run L (isolate_b) / config_e9_w1.0.yaml.
+  density_concentricity_weight: 1.0
+  density_concentricity_bins: 12
+  density_concentricity_window_deg: 45.0
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  # WYMAGANE dla radial_attention: OtolithDataset._load_image_with_polar liczy
+  # maskę/centroid (a więc i siatkę biegunową) TYLKO gdy mask_background=true — bez
+  # tego głowica dostawałaby same zerowe/nieważne tensory polarne mimo _need_polar=True.
+  mask_background: true
+  mask_cache_dir: null
+
+  # Zmiana C WYŁĄCZONA — spójne z resztą serii izolacyjnej (isolate_a/isolate_b/Run N).
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  # density_gate_max_wait_epochs: nie ustawione = domyślne (08.08 fix) — bramka podda się
+  # po tylu epokach bez poprawy WIEKU ile early_stopping_patience (8); jeśli density i
+  # tak się nie obudzi, bieg NIE zjada pełnych 50 epok na próżno.
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  density_image_size: 728
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8
+  axis_method: ring_richness   # 13.08: jawnie, choć to już domyślne w kodzie — patrz nagłówek

@@ -332,6 +332,7 @@ def _compute_axis_data_for_samples(
         compute_polar_grid,
         detect_axis,
         find_farthest_edge,
+        find_reading_edge,
         load_mask,
         mask_bbox,
         resolve_centroid,
@@ -418,7 +419,10 @@ def _compute_axis_data_for_samples(
         mask_arr = load_mask(mask_path)
         if mask_arr is not None:
             cent = resolve_centroid(orig_rgb, mask_arr, cfg.segmentation.nucleus_method)
-            far = find_farthest_edge(mask_arr, cent) if cent else None
+            if cent and cfg.segmentation.axis_method == "ring_richness":
+                far = find_reading_edge(orig_rgb, mask_arr, cent)
+            else:
+                far = find_farthest_edge(mask_arr, cent) if cent else None
             if cent and far:
                 contours, _ = cv2.findContours(mask_arr, cv2.RETR_EXTERNAL,
                                                 cv2.CHAIN_APPROX_NONE)
@@ -434,7 +438,8 @@ def _compute_axis_data_for_samples(
                     }
         if axis_info is None:
             axis_info = detect_axis(orig_rgb, seg_params=cfg.segmentation.as_params(),
-                                    nucleus_method=cfg.segmentation.nucleus_method)
+                                    nucleus_method=cfg.segmentation.nucleus_method,
+                                    axis_method=cfg.segmentation.axis_method)
             if axis_info is not None:
                 mask_arr = axis_info["mask"]
                 save_mask(mask_arr, mask_path)

@@ -1,9 +1,25 @@
 """Otolith segmentation and biological measurement-axis detection.
 
-The measurement axis follows the ICES protocol convention:
-  - origin   : geometric centroid of the segmented otolith (≈ nucleus / primordium)
-  - terminus : the farthest point on the otolith contour from the centroid
-               (the post-rostral tip in most herring otoliths)
+The measurement axis origin is always the geometric centroid of the segmented otolith
+(≈ nucleus / primordium). Two conventions for the TERMINUS (``axis_method``, see
+``SegmentationConfig``):
+
+  - ``"ring_richness"`` (13.08, DEFAULT since 13.08, see ``find_reading_edge``): the
+    contour point, within a cone opposite the tail, whose intensity profile shows the
+    most candidate ring peaks. Promoted to default after validation: real expert ring
+    annotations (project's first — "ZEGAR", 42 otoliths, two independent readers) showed
+    the older ``"farthest"`` heuristic pointing at the ring-FREE tail/spur in 42/42
+    samples, opposite where both readers actually counted rings — confirmed on real
+    production photos too, not just that one dataset. Switching gave a 25x/6x real-
+    ground-truth localization improvement on two independent checkpoints (see
+    ``plans and summaries/12.08_ZEGAR_ANOTACJE_TO_DO.md`` §11 and
+    ``plans and summaries/6.08_PODSUMOWANIE_PROCESU.md`` Etap 23). Only affects this
+    module's reporting/candidate-extraction output, never training (see
+    ``compute_polar_grid``'s own docstring below) — so promoting it retroactively doesn't
+    invalidate or require retraining any existing checkpoint.
+  - ``"farthest"`` (original ICES-protocol-derived convention, kept for comparison/
+    rollback): the farthest point on the otolith contour from the centroid (nominally
+    the post-rostral tip) — see ``find_farthest_edge``.
 
 Used by ``src/candidates.py`` to draw biologically meaningful overlays and to
 sample the DINOv2 patch-importance grid along the actual otolith axis instead
@@ -21,6 +37,7 @@ from typing import Optional
 import cv2
 import numpy as np
 from PIL import Image as PILImage
+from scipy.signal import find_peaks
 
 
 # ---------------------------------------------------------------------------
@@ -407,6 +424,104 @@ def find_farthest_edge(
     return int(round(fx)), int(round(fy))
 
 
+def find_reading_edge(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    centroid: tuple[int, int],
+    cone_deg: float = 60.0,
+    n_angles: int = 41,
+    n_samples: int = 96,
+    min_distance: int = 2,
+    prominence: float = 0.03,
+    fallback_direction: str = "down",
+) -> Optional[tuple[int, int]]:
+    """Contour point, near-opposite the tail, with the richest visible ring structure.
+
+    ``find_farthest_edge``'s pure-geometry heuristic reliably locks onto a thin,
+    ring-free spur/tail rather than the broad, ringed body — see the module docstring
+    for how this was found (13.08, real expert annotations, "ZEGAR"). That same ground
+    truth gave a SECOND, independent, tight empirical fact used here: across all 42
+    real samples, the true reading direction sits on average only ~6° from being
+    EXACTLY opposite the tail through the centroid (median 4°, max ~43°) — far
+    tighter than the full circle. An unrestricted 360° ring-peak search was tried
+    first and DISCARDED: on a multi-lobed otolith with rings visible in more than one
+    lobe (common — these are typically two-lobed), it can lock onto a different,
+    also ring-rich lobe 90°+ away from where readers actually work (confirmed on
+    sample Z01, dataset in ``12.08_ZEGAR_ANOTACJE_TO_DO.md``).
+
+    So: first locate the tail via :func:`find_farthest_edge`, then search only within
+    ``cone_deg`` of the direction exactly opposite it, scoring each candidate ray by
+    how many intensity peaks (candidate growth rings) its profile shows — the
+    ring-richness signal still matters for picking the precise angle within that
+    cone, just no longer has to disambiguate between unrelated lobes. Ties broken by
+    total peak prominence, then by ray length.
+
+    Falls back to ``find_farthest_edge(mask, centroid, direction=fallback_direction)``
+    when the contour/tail can't be found or every candidate ray is featureless (e.g. a
+    uniform synthetic test image) — never raises.
+    """
+    contour = _largest_contour(mask)
+    if contour is None:
+        return None
+    pts = contour.squeeze(axis=1).astype(np.float32)
+    if pts.ndim != 2 or len(pts) == 0:
+        return find_farthest_edge(mask, centroid, direction=fallback_direction)
+
+    tail = find_farthest_edge(mask, centroid, direction="any")
+    if tail is None:
+        return find_farthest_edge(mask, centroid, direction=fallback_direction)
+
+    gray = rgb.mean(axis=2).astype(np.float32) if rgb.ndim == 3 else rgb.astype(np.float32)
+    H, W = gray.shape[:2]
+    cx, cy = centroid
+    contour_angles = np.arctan2(pts[:, 1] - cy, pts[:, 0] - cx)
+    center_angle = np.arctan2(tail[1] - cy, tail[0] - cx) + np.pi     # opposite the tail
+    cone = np.radians(cone_deg)
+
+    best_edge: Optional[tuple[int, int]] = None
+    best_score = -1
+    best_prominence = -1.0
+    best_length = -1.0
+    for a in np.linspace(center_angle - cone, center_angle + cone, n_angles):
+        # Nearest contour point to this ray's angle (contour is not evenly sampled by
+        # angle, so pick the closest match rather than assuming an index correspondence).
+        angular_gap = np.abs(np.angle(np.exp(1j * (contour_angles - a))))
+        idx = int(np.argmin(angular_gap))
+        if angular_gap[idx] > (2.0 * cone / max(1, n_angles - 1)):
+            continue
+        ex, ey = float(pts[idx, 0]), float(pts[idx, 1])
+        length = float(np.hypot(ex - cx, ey - cy))
+        if length < 3.0:
+            continue
+
+        ts = np.linspace(0.0, 1.0, n_samples)
+        xs = np.clip((cx + ts * (ex - cx)).astype(np.int64), 0, W - 1)
+        ys = np.clip((cy + ts * (ey - cy)).astype(np.int64), 0, H - 1)
+        profile = gray[ys, xs]
+        rng = float(profile.max() - profile.min())
+        if rng < 1e-6:
+            continue
+        norm = (profile - profile.min()) / rng
+
+        peak_idx, props = find_peaks(norm, distance=max(1, min_distance), prominence=prominence)
+        score = int(len(peak_idx))
+        total_prominence = float(props["prominences"].sum()) if score else 0.0
+        better = (
+            score > best_score
+            or (score == best_score and total_prominence > best_prominence)
+            or (score == best_score and total_prominence == best_prominence and length > best_length)
+        )
+        if better:
+            best_edge = (int(round(ex)), int(round(ey)))
+            best_score = score
+            best_prominence = total_prominence
+            best_length = length
+
+    if best_edge is None or best_score <= 0:
+        return find_farthest_edge(mask, centroid, direction=fallback_direction)
+    return best_edge
+
+
 def mask_bbox(mask: np.ndarray, pad_frac: float = 0.05) -> tuple[int, int, int, int]:
     """Bounding box of the mask's non-zero pixels, padded and clamped to the image.
 
@@ -460,8 +575,9 @@ def shift_axis_info(axis_info: dict, dx: int, dy: int) -> dict:
 
 def detect_axis(
     rgb: np.ndarray, seg_params: Optional[dict] = None, nucleus_method: str = "geometric",
+    axis_method: str = "ring_richness",
 ) -> Optional[dict]:
-    """Run full pipeline: segment → centroid → farthest edge.
+    """Run full pipeline: segment → centroid → axis terminus.
 
     ``seg_params`` (optional): keyword overrides forwarded to ``segment_otolith``
     (e.g. ``{"method": "radial", "frac": 0.2}``). Typically built from
@@ -470,6 +586,10 @@ def detect_axis(
     ``nucleus_method``: ``"geometric"`` (default, unchanged behaviour) uses the mask's
     geometric centroid; ``"intensity"`` uses :func:`find_intensity_centroid` — see
     ``SegmentationConfig.nucleus_method``.
+
+    ``axis_method``: ``"ring_richness"`` (default since 13.08) uses :func:`find_reading_edge`;
+    ``"farthest"`` uses the older :func:`find_farthest_edge` — see module docstring and
+    ``SegmentationConfig.axis_method``.
 
     Returns:
         dict with keys:
@@ -489,7 +609,10 @@ def detect_axis(
     contour = _largest_contour(mask)
     if contour is None:
         return None
-    far_edge = find_farthest_edge(mask, centroid)
+    if axis_method == "ring_richness":
+        far_edge = find_reading_edge(rgb, mask, centroid)
+    else:
+        far_edge = find_farthest_edge(mask, centroid)
     if far_edge is None:
         return None
     cx, cy = centroid
