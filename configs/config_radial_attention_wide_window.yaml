@@ -1,0 +1,164 @@
+# 15.08 — Zmiana A v2, strojenie hiperparametru: szersze lokalne okno uwagi
+# (density_attn_window_deg: 45° → 90°).
+#
+# Kontekst: Run N (`config_radial_attention.yaml`, `outputs/11.08_radial_attention`) potwierdził
+# architekturę radial_attention — density realnie się uczy, bije klasykę na prawdziwym ground
+# truth (ZEGAR): 22,8 px. Zmiana B (E9 na wierzchu) okazała się zbędna (`radial_attention_b`,
+# 22,1 px — różnica w granicach szumu, Etap 24 w 6.08_PODSUMOWANIE_PROCESU.md). Ten config jest
+# nowym punktem odniesienia — Zmiana B WYŁĄCZONA, tak jak w Run N.
+#
+# 15.08: dwie tanie diagnostyki PRZED tym biegiem (bez treningu):
+#   1. Hipoteza artefaktu wysokonormowych neuronów backbone'u — WYKLUCZONA. Korelacja
+#      między normą tokenów patchy a gorącymi punktami density: ~0 (-0,057 średnio, 42 próbki
+#      ZEGAR). Normy patchy jednorodne (max/mean ~1,1×) — backbone `_reg` działa jak powinien,
+#      wysokie normy występują tylko w TLE (poza maską otolitu), nie mają nic wspólnego z tym,
+#      gdzie density stawia swoje punkty.
+#   2. Sweep rozdzielczości `candidates.density_image_size` PRZY WNIOSKOWANIU (bez treningu,
+#      istniejący checkpoint Run N): 728px→22,8px, 966px→20,9px, 1288px→22,1px. Słaby,
+#      niemonotoniczny sygnał (~8% przy 966px, potem gorzej) — NIE uzasadnia poświęcenia
+#      jedynego w tym tygodniu slotu treningowego na eksperyment z rozdzielczością, zwłaszcza
+#      że pełna rozdzielczość treningowa już raz dała regresję wieku (Etap 12, run I, 966px,
+#      MAE 0,824). `density_image_size: 966` ustawiony tu jako "darmowy" zysk (wpływa TYLKO na
+#      generowanie kart/raportu, nie na trening — sprawdzone w kodzie, zero ryzyka).
+#
+# TEN bieg testuje inną, dotąd niesprawdzoną hipotezę: `density_attn_window_deg` (lokalne okno
+# uwagi promień×kąt w RadialAttentionDensityHead) jest oznaczone w kodzie jako "jawnie
+# niezweryfikowany punkt startowy" (45°, ta sama wartość co E9/Zmiana B, przeniesiona bez
+# uzasadnienia). Motywacja: we WSZYSTKICH dotychczasowych nakładkach (Run N, radial_attention_b)
+# gorące punkty density są EKSTREMALNIE małe/punktowe (pojedyncze piksele, nie gładkie, spójne
+# obszary odpowiadające szerokości pierścienia) — może to być objaw okna ZBYT WĄSKIEGO, przez co
+# każdy patch efektywnie widzi głównie samego siebie zamiast integrować sygnał z sąsiednich
+# patchy wzdłuż tego samego pierścienia. Test: podwojenie okna (45°→90°), reszta configu
+# NIEZMIENIONA względem Run N — izolowana zmiana JEDNEJ zmiennej, zgodnie z dyscypliną
+# eksperymentalną projektu (macierz izolacji A/B/C).
+#
+# Zobacz: plans and summaries/15.08_radial_attention_b_PODSUMOWANIE_I_PLAN.md (pełny kontekst
+# decyzji), src/model.py::RadialAttentionDensityHead, src/model.py::radial_local_attention_mask.
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # niezmienione względem całej serii izolacyjnej
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  head_type: both                 # coral | mil | both
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  density_conc_weight: 1.0        # UWAGA: to jest WEWNĘTRZNY człon top-k w density_count_loss,
+                                  # NIE to samo co density_concentricity_weight niżej (E9/Zmiana B)
+                                  # — dwie różne, niebezpiecznie podobne nazwy, patrz 08.08 code-review.
+  density_tv_weight: 0.03
+
+  # ------------------------------------------------------------------------
+  # ZMIANA A v2 (niezmieniona względem Run N poza JEDNĄ linią niżej).
+  density_head_type: radial_attention   # mlp | attention (v1, martwa) | radial_attention (v2)
+  density_attn_num_heads: 4       # jak w poprzednich biegach z uwagą
+  density_attn_num_layers: 1
+  # Liczba harmonik Fouriera (sin/cos) dla kodowania kąta/promienia — NIEZMIENIONE względem
+  # Run N w tym biegu (izolujemy tylko window_deg); nadal jawnie niezweryfikowany punkt startowy,
+  # kandydat na kolejne strojenie, jeśli window_deg okaże się mieć znaczenie.
+  density_attn_num_angle_freqs: 4
+  density_attn_num_radius_freqs: 4
+  density_attn_radial_bins: 12    # NIEZMIENIONE względem Run N — izolujemy tylko window_deg.
+  # ------------------------------------------------------------------------
+  # JEDYNA ZMIANA względem Run N (15.08): 45° → 90°, patrz nagłówek pliku.
+  density_attn_window_deg: 90.0
+
+  # Zmiana B WYŁĄCZONA — spójnie z Run N (zbędna, patrz nagłówek pliku).
+  density_concentricity_weight: 0.0
+  density_concentricity_bins: 12
+  density_concentricity_window_deg: 45.0   # nieużywane przy wadze 0,0, zostawione dla spójności
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  # WYMAGANE dla radial_attention: OtolithDataset._load_image_with_polar liczy
+  # maskę/centroid (a więc i siatkę biegunową) TYLKO gdy mask_background=true — bez
+  # tego głowica dostawałaby same zerowe/nieważne tensory polarne mimo _need_polar=True.
+  mask_background: true
+  mask_cache_dir: null
+
+  # Zmiana C WYŁĄCZONA — spójne z resztą serii izolacyjnej (isolate_a/isolate_b/Run N).
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  # density_gate_max_wait_epochs: nie ustawione = domyślne (08.08 fix) — bramka podda się
+  # po tylu epokach bez poprawy WIEKU ile early_stopping_patience (8); jeśli density i
+  # tak się nie obudzi, bieg NIE zjada pełnych 50 epok na próżno.
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  # 966 zamiast 728 (Run N) — "darmowy" zysk ze sweep'a 15.08 (patrz nagłówek pliku), wpływa
+  # TYLKO na karty/raport, nie na trening.
+  density_image_size: 966
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8
+  axis_method: ring_richness   # domyślne w kodzie od 13.08 — jawnie dla czytelności
