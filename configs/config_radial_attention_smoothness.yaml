@@ -1,0 +1,166 @@
+# 17.08 — strojenie straty density: osłabić wymuszaną punktowość (density_conc_weight,
+# density_tv_weight), zamiast dalszego strojenia architektury radial_attention.
+#
+# Kontekst: dwa ostatnie biegi na architekturze radial_attention (Zmiana B/E9 lokalne, 13-14.08,
+# outputs/13.08_radial_attention_b; density_attn_window_deg 45°→90°, 15-17.08,
+# outputs/15.08_radial_attention_wide_window) dały DWA z rzędu negatywne wyniki na prawdziwym
+# ground truth (ZEGAR): 22,1px i 23,68px, oba nierozróżnialne od Run N (22,8px) w granicach szumu
+# — patrz Etap 26, plans and summaries/6.08_PODSUMOWANIE_PROCESU.md. We wszystkich dotychczasowych
+# nakładkach (K/L/M/N i warianty) gorące punkty density są ekstremalnie punktowe (pojedyncze
+# piksele), nie gładkie obszary odpowiadające szerokości pierścienia — a strojenie SAMEJ
+# ARCHITEKTURY (okno uwagi) tego nie naprawiło, mimo dwóch prób.
+#
+# Nowa hipoteza, tym razem ze strony STRATY, nie architektury: `density_count_loss`
+# (src/model.py:116) ma dwa człony — `l_count` (suma density ≈ wiek, niezależny od poniższego) i
+# `l_conc` — człon który DOSŁOWNIE każe wypchnąć dokładnie ⌈age⌉ komórek do 1,0, a WSZYSTKIE
+# pozostałe do 0,0 ((1-d)² na top-k, d² na resztę). To jest matematyczna definicja punktowości.
+# `density_conc_weight` = 1,0 w KAŻDYM biegu w historii projektu, nigdy nie zmieniane.
+# Przeciwwaga, `density_tv_weight` (total variation — prior przestrzennej gładkości na siatce
+# Hp×Wp), siedzi na małej wartości 0,03 od sesji 22.07 (diagnoza artefaktu, wprowadzenie TV),
+# też nigdy niestrojona. Te dwa człony są w bezpośrednim przeciągu liny w TEJ SAMEJ stracie —
+# dotąd zawsze w tej samej proporcji.
+#
+# TEN bieg: pierwsza w historii projektu ablacja tych dwóch pól. `density_conc_weight: 1,0→0,3`
+# (≈3× słabsza presja na sztywną top-k ostrość), `density_tv_weight: 0,03→0,3` (10× silniejszy
+# prior gładkości). Świadomie razem, nie osobno — to dwa krańce jednej pary sił, testowanie tylko
+# jednego ryzykuje zbyt słaby sygnał, żeby przeważyć drugą, niezmienioną siłę. Bezpieczne dla
+# `l_count` (suma≈wiek działa niezależnie od `conc_weight`) i dla wieku (cała strata na
+# stop-gradiencie, jak zawsze). WSZYSTKO INNE niezmienione względem Run N
+# (configs/config_radial_attention.yaml) — świadomie NIE łączone z architekturą
+# (density_attn_window_deg zostaje na potwierdzonych 45°, radial_bins/num_layers niezmienione),
+# żeby nowy sygnał nie utonął w tej samej niepewności co dwie ostatnie negatywne ablacje.
+#
+# Backbone (większy DINOv2) świadomie ODŁOŻONY na ten cykl — hipoteza artefaktu wysokonormowych
+# neuronów już wykluczona (Etap 25), a punktowość powtarza się identycznie na tym samym backbonie
+# przez cztery różne architektury głowicy — wzorzec zgodny ze strukturalną przyczyną w stracie
+# (patrz wyżej), nie z ograniczeniem jakości cech wejściowych.
+#
+# Zobacz: src/model.py::density_count_loss (l_count/l_conc), configs/config_radial_attention.yaml
+# (bazowy config, Run N), plans and summaries/6.08_PODSUMOWANIE_PROCESU.md Etap 26/27.
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # niezmienione — patrz nagłówek pliku, backbone odłożony
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  head_type: both                 # coral | mil | both
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  # ------------------------------------------------------------------------
+  # JEDYNA ZMIANA tego biegu (17.08) — patrz nagłówek pliku dla pełnego uzasadnienia.
+  # UWAGA: density_conc_weight to WEWNĘTRZNY człon top-k w density_count_loss, NIE to samo co
+  # density_concentricity_weight niżej (E9/Zmiana B) — dwie różne, niebezpiecznie podobne nazwy,
+  # patrz 08.08 code-review.
+  density_conc_weight: 0.3        # było 1.0 w KAŻDYM dotychczasowym biegu
+  density_tv_weight: 0.3          # było 0.03 od sesji 22.07
+  # ------------------------------------------------------------------------
+
+  # ZMIANA A v2 (radial_attention) — NIEZMIENIONA względem Run N, patrz nagłówek pliku.
+  density_head_type: radial_attention   # mlp | attention (v1, martwa) | radial_attention (v2)
+  density_attn_num_heads: 4
+  density_attn_num_layers: 1
+  density_attn_num_angle_freqs: 4
+  density_attn_num_radius_freqs: 4
+  density_attn_radial_bins: 12
+  density_attn_window_deg: 45.0   # potwierdzona wartość Run N — NIE 90° (wide_window, negatywny)
+
+  # Zmiana B WYŁĄCZONA — potwierdzona zbędność (Etap 24, radial_attention_b).
+  density_concentricity_weight: 0.0
+  density_concentricity_bins: 12
+  density_concentricity_window_deg: 45.0   # nieużywane przy wadze 0,0, zostawione dla spójności
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  # WYMAGANE dla radial_attention: OtolithDataset._load_image_with_polar liczy
+  # maskę/centroid (a więc i siatkę biegunową) TYLKO gdy mask_background=true — bez
+  # tego głowica dostawałaby same zerowe/nieważne tensory polarne mimo _need_polar=True.
+  mask_background: true
+  mask_cache_dir: null
+
+  # Zmiana C WYŁĄCZONA — spójne z resztą serii izolacyjnej.
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  # density_gate_max_wait_epochs: nie ustawione = domyślne (08.08 fix). UWAGA: osłabiony
+  # density_conc_weight może spowolnić/obniżyć dojrzewanie density_active (mniejsza presja na
+  # wartości bliskie 1,0) — jeśli bramka nigdy się nie otworzy, to sam w sobie wynik warty
+  # odnotowania przy analizie, nie błąd configu.
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  # 966 zamiast 728 (Run N) — "darmowy" zysk ze sweep'a 15.08 (Etap 25), przyjęty jako nowy
+  # domyślny punkt startowy odtąd; wpływa TYLKO na generowanie kart/raportu, nie na trening.
+  density_image_size: 966
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8
+  axis_method: ring_richness   # domyślne w kodzie od 13.08 — jawnie dla czytelności
