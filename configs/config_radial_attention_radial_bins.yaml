@@ -1,0 +1,165 @@
+# 19.08 — strojenie OSTATNIEJ nieprzetestowanej dźwigni architektury radial_attention:
+# rozdzielczość promieniowa lokalnego okna (`density_attn_radial_bins`) i rozdzielczość
+# kodowania pozycyjnego Fouriera (`density_attn_num_angle_freqs`/`num_radius_freqs`).
+#
+# Kontekst: TRZY kolejne biegi na architekturze/stracie radial_attention dały TRZY z rzędu
+# negatywne wyniki na prawdziwym ground truth (ZEGAR): Zmiana B/E9 lokalne (13-14.08, 22,1px),
+# `density_attn_window_deg` 45°→90° (15-17.08, `wide_window`, 23,68px), `density_conc_weight`/
+# `density_tv_weight` (17-18.08, `smoothness`, 23,79px) — wszystkie nierozróżnialne od Run N
+# (22,8px) w granicach szumu. Patrz plans and summaries/6.08_PODSUMOWANIE_PROCESU.md i
+# outputs/DINO_proces.md sekcja 7/8. We wszystkich dotychczasowych nakładkach gorące punkty
+# density są ekstremalnie punktowe (pojedyncze piksele), nie gładkie obszary odpowiadające
+# szerokości pierścienia.
+#
+# Dwie ostatnie nietknięte dźwignie architektury `RadialAttentionDensityHead`
+# (`src/model.py::radial_local_attention_mask`, `polar_fourier_features`), oznaczone w kodzie
+# jako "jawnie niezweryfikowany punkt startowy" od 10.08, zero ablacji do tej pory:
+#
+# 1. `density_attn_radial_bins` (domyślnie 12) — `radial_local_attention_mask` pozwala patchowi
+#    widzieć TYLKO inne patche w DOKŁADNIE tym samym biegunowym binie promienia (zero tolerancji
+#    sąsiedztwa) ORAZ w oknie kątowym `window_deg`. Więcej binów = WĘŻSZY bin = WĘŻSZE lokalne
+#    sąsiedztwo promieniowe — przeciwny kierunek niż to, co testowaliśmy dotąd (`wide_window`
+#    poszerzał okno KĄTOWE, nigdy promieniowe). Ten bieg: 12→6 — dwa razy szerszy bin
+#    promieniowy, pierwszy test poszerzenia lokalności na OSI PROMIENIA zamiast kąta;
+#    bezpośrednio celuje w "punkty zamiast pasm", ale inną drogą niż `wide_window` (przegrany).
+#
+# 2. `density_attn_num_angle_freqs`/`density_attn_num_radius_freqs` (domyślnie 4/4) — liczba
+#    harmonik Fouriera w kodowaniu pozycyjnym (`polar_fourier_features`). Argument z literatury
+#    NeRF/positional-encoding: WIĘCEJ harmonik = wyższa dostępna częstotliwość = sieci łatwiej
+#    wyrazić OSTRE, szybko zmieniające się funkcje pozycji; MNIEJ harmonik ogranicza dostępne
+#    pasmo częstotliwości, z natury faworyzując GŁADSZE funkcje wyjściowe. Ten bieg: 4→2 na obu
+#    gałęziach — celowo w kierunku gładszym, komplementarnie do (1) i innym mechanizmem niż
+#    wszystkie trzy dotychczasowe negatywne próby.
+#
+# Świadomie RAZEM w jednym biegu (nie osobno) — jak `smoothness` (17.08): to dwie niezależne,
+# ale współkierunkowe dźwignie ("szersze sąsiedztwo" + "gładsza dostępna funkcja pozycji"),
+# każda z osobna ryzykuje zbyt słaby sygnał na tle szumu (~1px w tej serii). WSZYSTKO INNE
+# przywrócone do potwierdzonych wartości Run N: `density_attn_window_deg=45°` (NIE 90°,
+# `wide_window` przegrał), `density_conc_weight=1.0`/`density_tv_weight=0.03` (NIE 0.3/0.3,
+# `smoothness` przegrał), Zmiana B wyłączona (`density_concentricity_weight=0.0`, potwierdzona
+# zbędność, Etap 24).
+#
+# Backbone nadal odłożony — bez zmian od 17.08, patrz config_radial_attention_smoothness.yaml.
+#
+# Zobacz: src/model.py::radial_local_attention_mask, polar_fourier_features,
+# configs/config_radial_attention.yaml (bazowy config, Run N), outputs/DINO_proces.md sekcja 7/8/9.
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # niezmienione — backbone odłożony, patrz nagłówek
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  head_type: both                 # coral | mil | both
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  # Strata density z powrotem na potwierdzonych wartościach Run N (NIE `smoothness`, przegrany).
+  density_conc_weight: 1.0
+  density_tv_weight: 0.03
+
+  # ZMIANA A v2 (radial_attention). density_attn_radial_bins/num_*_freqs — JEDYNE zmiany tego
+  # biegu, patrz nagłówek pliku dla pełnego uzasadnienia.
+  density_head_type: radial_attention   # mlp | attention (v1, martwa) | radial_attention (v2)
+  density_attn_num_heads: 4
+  density_attn_num_layers: 1
+  # ------------------------------------------------------------------------
+  density_attn_num_angle_freqs: 2   # było 4 w KAŻDYM dotychczasowym biegu radial_attention
+  density_attn_num_radius_freqs: 2  # było 4 w KAŻDYM dotychczasowym biegu radial_attention
+  density_attn_radial_bins: 6       # było 12 w KAŻDYM dotychczasowym biegu radial_attention
+  # ------------------------------------------------------------------------
+  density_attn_window_deg: 45.0   # potwierdzona wartość Run N — NIE 90° (wide_window, negatywny)
+
+  # Zmiana B WYŁĄCZONA — potwierdzona zbędność (Etap 24, radial_attention_b).
+  density_concentricity_weight: 0.0
+  density_concentricity_bins: 12
+  density_concentricity_window_deg: 45.0   # nieużywane przy wadze 0,0, zostawione dla spójności
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  # WYMAGANE dla radial_attention: OtolithDataset._load_image_with_polar liczy
+  # maskę/centroid (a więc i siatkę biegunową) TYLKO gdy mask_background=true — bez
+  # tego głowica dostawałaby same zerowe/nieważne tensory polarne mimo _need_polar=True.
+  mask_background: true
+  mask_cache_dir: null
+
+  # Zmiana C WYŁĄCZONA — spójne z resztą serii izolacyjnej.
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  # density_gate_max_wait_epochs: nie ustawione = domyślne (08.08 fix).
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  density_image_size: 966
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8
+  axis_method: ring_richness   # domyślne w kodzie od 13.08 — jawnie dla czytelności
