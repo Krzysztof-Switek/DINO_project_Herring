@@ -46,11 +46,13 @@ class _MockDinoBackbone(nn.Module):
 
 class _SyntheticDataset(Dataset):
     def __init__(self, n: int = 8, num_age_classes: int = 10, image_size: int = 56,
-                with_polar: bool = False):
+                with_polar: bool = False, with_zegar: bool = False, zegar_every: int = 2):
         self.n = n
         self.num_age_classes = num_age_classes
         self.image_size = image_size
         self.with_polar = with_polar
+        self.with_zegar = with_zegar
+        self.zegar_every = zegar_every   # every Nth sample carries a real target
 
     def __len__(self) -> int:
         return self.n
@@ -67,6 +69,16 @@ class _SyntheticDataset(Dataset):
             h_p = w_p = self.image_size // 14
             item["polar_grid"] = torch.rand(h_p, w_p)
             item["polar_valid"] = torch.ones(h_p, w_p, dtype=torch.bool)
+        if self.with_zegar:
+            h_p = w_p = self.image_size // 14
+            # zegar_every<=0 is the sentinel for "never" — idx % N == 0 is always
+            # True at idx=0 for any N>0, so that can't itself express "no sample".
+            has_target = self.zegar_every > 0 and (idx % self.zegar_every == 0)
+            heat = torch.zeros(h_p, w_p)
+            if has_target:
+                heat[0, 0] = 1.0
+            item["zegar_heatmap"] = heat
+            item["has_zegar_target"] = torch.tensor(has_target, dtype=torch.bool)
         return item
 
 
@@ -91,8 +103,10 @@ def _make_cfg(tmp_path: Path, epochs: int = 2, freeze_epochs: int = 0,
     return cfg
 
 
-def _make_loader(n: int = 8, batch_size: int = 4, with_polar: bool = False) -> DataLoader:
-    ds = _SyntheticDataset(n=n, num_age_classes=10, image_size=56, with_polar=with_polar)
+def _make_loader(n: int = 8, batch_size: int = 4, with_polar: bool = False,
+                 with_zegar: bool = False) -> DataLoader:
+    ds = _SyntheticDataset(n=n, num_age_classes=10, image_size=56, with_polar=with_polar,
+                           with_zegar=with_zegar)
     return DataLoader(ds, batch_size=batch_size, shuffle=False)
 
 
@@ -676,6 +690,83 @@ def test_loss_parts_omits_density_concentricity_when_weight_zero(tmp_path):
     trainer = Trainer(cfg, model, _make_loader(with_polar=True), _make_loader(with_polar=True))
     trainer.validate()
     assert "density_conc_loss" not in trainer.last_val_metrics
+
+
+def test_loss_parts_includes_zegar_position_when_enabled_and_present(tmp_path):
+    """26.08 Opcja A: with zegar_position_weight>0 and a batch where SOME samples
+    carry a real zegar_heatmap target, _loss_parts must add a 'zegar_position'
+    component and train_one_epoch/validate must run end-to-end without the caller
+    doing anything special (loader-provided keys flow through, same as polar_grid)."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path, epochs=1)
+    cfg.model.use_density_head = True
+    cfg.model.zegar_position_weight = 0.5
+    model = _make_model(cfg)
+    train_loader = _make_loader(n=8, with_zegar=True)
+    val_loader = _make_loader(n=4, with_zegar=True)
+    trainer = Trainer(cfg, model, train_loader, val_loader)
+
+    trainer.train_one_epoch()
+    trainer.validate()
+    assert "zegar_position_loss" in trainer.last_val_metrics
+
+
+def test_loss_parts_omits_zegar_position_when_weight_zero(tmp_path):
+    """Default weight (0.0): even with zegar_heatmap/has_zegar_target present in the
+    batch, the term must not appear — matches every other density_*/zegar_* weight's
+    "0 = off" convention in this codebase."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path, epochs=1)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+    trainer = Trainer(cfg, model, _make_loader(with_zegar=True), _make_loader(with_zegar=True))
+    trainer.validate()
+    assert "zegar_position_loss" not in trainer.last_val_metrics
+
+
+def test_loss_parts_omits_zegar_position_when_no_sample_has_target(tmp_path):
+    """weight>0 but every has_zegar_target in the batch is False (the overwhelming
+    common case — only ~0.2% of real epochs ever see a ZEGAR sample) — the term must
+    still not appear, not silently compute a loss against an all-zero target."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path, epochs=1)
+    cfg.model.use_density_head = True
+    cfg.model.zegar_position_weight = 0.5
+    model = _make_model(cfg)
+    # zegar_every=0 is the sentinel for "never" -> has_zegar_target False for every sample.
+    ds = _SyntheticDataset(n=4, num_age_classes=10, image_size=56, with_zegar=True, zegar_every=0)
+    loader = DataLoader(ds, batch_size=4, shuffle=False)
+    trainer = Trainer(cfg, model, loader, loader)
+    trainer.validate()
+    assert "zegar_position_loss" not in trainer.last_val_metrics
+
+
+def test_zegar_position_weight_does_not_change_age_predictions(tmp_path):
+    """Stop-gradient isolation, end-to-end through the trainer (not just the loss
+    function in isolation, test_stage3_model.py's version): two trainers, identical
+    seed/data/model init, differing ONLY in zegar_position_weight, must produce
+    BIT-IDENTICAL CORAL logits after one training step — the established pattern this
+    project uses to verify a density-head-only change can't touch the age head
+    (e.g. the wide_window/smoothness checkpoint comparison, 19.08)."""
+    from src.trainer import Trainer
+
+    def _run(weight: float):
+        torch.manual_seed(0)
+        cfg = _make_cfg(tmp_path / f"w{weight}", epochs=1)
+        cfg.model.use_density_head = True
+        cfg.model.zegar_position_weight = weight
+        model = _make_model(cfg)
+        loader = _make_loader(n=8, with_zegar=True)
+        trainer = Trainer(cfg, model, loader, loader)
+        trainer.train_one_epoch()
+        with torch.no_grad():
+            probe = torch.randn(2, 3, 56, 56)
+        return trainer.model(probe)["coral_logits"]
+
+    logits_off = _run(0.0)
+    logits_on = _run(0.5)
+    assert torch.allclose(logits_off, logits_on, atol=1e-6), \
+        "zegar_position_weight changed age (CORAL) predictions — stop-gradient isolation broken"
 
 
 def test_fit_ema_selection_runs_and_saves_best(tmp_path):

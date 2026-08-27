@@ -95,11 +95,23 @@ def inspect_annotation_file(path: Path) -> None:
 def load_expert_annotations() -> pd.DataFrame:
     """Long-format DataFrame: [image_id, annotator, Sample, x, y, age, quality].
 
-    One row per annotated INCREMENT. Two non-increment landmark rows are dropped for every
-    sample: "core" (the nucleus) and "edge" (the otolith's outer physical boundary, present in
-    all 42 samples in both files) — neither is a growth ring, so keeping them would inflate ring
-    counts and bias position agreement (the boundary is a fixed anatomical point both readers
-    click almost identically, unlike an actual annual ring judgement call).
+    One row per annotated INCREMENT. Three non-increment/non-visual rows are dropped for every
+    (sample, reader): "core" (the nucleus), "edge" (the otolith's outer physical boundary,
+    present in all 42 samples in both files) — neither is a growth ring — and (21.08, user
+    decision after a code audit) the LAST numbered ring (highest "I" for that sample+reader).
+
+    Why the last ring is dropped too (not a bug fix — a methodology decision): an audit (21.08)
+    matched every reader's last-ring (x, y) against their own "edge" row and found near-zero
+    distance in ALL 84 (sample, reader) pairs (median 0px, max 4.5px) — readers place the last
+    ring essentially AT the true physical edge. Separately, `segment_otolith` (a purely visual,
+    intensity-fade-based contour) stops short of that same point in 83/84 cases (median ~8px,
+    max ~32px) — i.e. there is no detectable visual transition there for ANY image-based method
+    (this project's model, the classical OpenCV baseline, or a hypothetical better model) to
+    find. The user confirmed this matches known reader practice: the last increment is often
+    placed from calendar/season knowledge at time of capture ("we're in this part of the year,
+    so a ring should be starting here"), not from a directly visible feature on the photo — i.e.
+    it is fundamentally unmodelable from pixels alone, and keeping it in ground truth penalizes
+    every method equally for something none of them can see.
     """
     frames = []
     for reader, path in ANNOTATION_FILES.items():
@@ -109,6 +121,9 @@ def load_expert_annotations() -> pd.DataFrame:
         raw = raw[~raw["I"].isin(["core", "edge"])].copy()
         raw["annotator"] = reader
         raw["image_id"] = raw["Sample"].astype(str) + ".jpg"
+        raw["_i_num"] = raw["I"].astype(int)
+        is_last = raw["_i_num"] == raw.groupby("Sample")["_i_num"].transform("max")
+        raw = raw[~is_last].copy()
         frames.append(raw[["image_id", "Sample", "annotator", "X", "Y", "Age", "Quality"]])
     df = pd.concat(frames, ignore_index=True)
     df = df.rename(columns={"X": "x", "Y": "y", "Age": "age", "Quality": "quality"})

@@ -117,11 +117,15 @@ class OtolithDataset(Dataset):
     """PyTorch Dataset for otolith images.
 
     Returns per sample:
-        image       : FloatTensor (3, H, W)  — normalized
-        age_ordinal : FloatTensor (K-1,)     — ordinal binary target
-        age         : LongTensor ()          — raw integer age
-        image_id    : str
-        metadata    : FloatTensor (M,)       — only if use_metadata=True
+        image            : FloatTensor (3, H, W)  — normalized
+        age_ordinal      : FloatTensor (K-1,)     — ordinal binary target
+        age              : LongTensor ()          — raw integer age
+        image_id         : str
+        zegar_heatmap    : FloatTensor (Hp, Wp)   — semi-weak-supervision target
+                           (26.08); zeros unless this sample is one of the 42
+                           ZEGAR-annotated images (see cfg.data.zegar_* fields)
+        has_zegar_target : BoolTensor ()          — True iff zegar_heatmap is real
+        metadata         : FloatTensor (M,)       — only if use_metadata=True
     """
 
     def __init__(
@@ -158,6 +162,31 @@ class OtolithDataset(Dataset):
         full_df = pd.read_csv(csv_path)
         self._validate_columns(full_df)
 
+        # Semi-weak supervision (26.08, "Opcja A"): the 42-image "ZEGAR" ground-truth set
+        # lives in its OWN small CSV/image dir, never in labels_csv/image_dir (which
+        # scripts/prepare_labels.py regenerates from Z:/Photo/... on every RESCAN=True run
+        # — writing ZEGAR rows directly into labels_csv would make them silently vanish on
+        # the next rescan). Concatenated BEFORE the split filter below, exactly like a
+        # normal extra chunk of labelled data — those rows only ever have split="train"
+        # (see scripts/prepare_zegar_semi_weak_data.py), so they never touch val/test.
+        self._zegar_extra_image_dir: Optional[Path] = None
+        self._zegar_image_ids: set = set()
+        self._zegar_targets: Dict[str, List[tuple]] = {}
+        self._zegar_sigma = cfg.data.zegar_gaussian_sigma_patches
+        if cfg.data.zegar_extra_labels_csv and cfg.data.zegar_extra_image_dir:
+            zegar_labels_path = root / cfg.data.zegar_extra_labels_csv
+            zegar_df = pd.read_csv(zegar_labels_path)
+            self._validate_columns(zegar_df)
+            full_df = pd.concat([full_df, zegar_df], ignore_index=True)
+            self._zegar_extra_image_dir = root / cfg.data.zegar_extra_image_dir
+            self._zegar_image_ids = set(zegar_df["image_id"].astype(str))
+            if cfg.data.zegar_targets_csv:
+                targets_df = pd.read_csv(root / cfg.data.zegar_targets_csv)
+                for image_id, group in targets_df.groupby("image_id"):
+                    self._zegar_targets[str(image_id)] = list(
+                        zip(group["x"].astype(float), group["y"].astype(float))
+                    )
+
         # Build population map from entire file for consistent encoding
         self._pop_map: Dict[str, int] = {}
         if "population" in full_df.columns:
@@ -183,9 +212,17 @@ class OtolithDataset(Dataset):
         # _load_image_with_polar(). Off by default: zero behaviour change for every
         # existing config (density_concentricity_weight=0.0 and density_head_type!=
         # "radial_attention" both being the defaults).
+        # (26.08) ZEGAR heatmap targets need the SAME explicit-flip synchronisation as
+        # the polar grid, for the same reason (Compose's built-in random flip can't be
+        # replayed on a second tensor) — so configuring ZEGAR data also routes every
+        # sample through _load_image_with_polar, regardless of density_head_type. In
+        # practice this is a no-op for the intended launch config (Run N's
+        # radial_attention already implies _need_polar=True); it's a correctness
+        # safety net for any other density_head_type this might be layered onto later.
         self._need_polar = bool(getattr(cfg.model, "use_density_head", False)) and (
             getattr(cfg.model, "density_concentricity_weight", 0.0) > 0.0
             or getattr(cfg.model, "density_head_type", "mlp") == "radial_attention"
+            or bool(self._zegar_image_ids)
         )
         self.transform = transform or build_transforms(
             cfg.data.image_size, split, include_flips=not self._need_polar)
@@ -266,10 +303,14 @@ class OtolithDataset(Dataset):
         age = self._effective_age(row, image_id, recorded_age)
 
         if self._need_polar:
-            image_tensor, polar_grid, polar_valid, polar_theta = self._load_image_with_polar(image_id)
+            (image_tensor, polar_grid, polar_valid, polar_theta,
+             zegar_heatmap, has_zegar_target) = self._load_image_with_polar(image_id)
         else:
             image_tensor = self._load_image(image_id)
             polar_grid = polar_valid = polar_theta = None
+            h_patches = w_patches = self.cfg.data.image_size // self.cfg.data.patch_size
+            zegar_heatmap = torch.zeros((h_patches, w_patches), dtype=torch.float32)
+            has_zegar_target = False
         age_ordinal = encode_age_ordinal(age, self.num_age_classes)
 
         sample: Dict = {
@@ -278,6 +319,14 @@ class OtolithDataset(Dataset):
             "age": torch.tensor(age, dtype=torch.long),
             "age_original": torch.tensor(recorded_age, dtype=torch.long),
             "image_id": image_id,
+            # Semi-weak supervision (26.08): ALWAYS present (zeros/False when this
+            # sample has no real ZEGAR annotation) — unlike polar_grid above, this
+            # can't be a conditionally-omitted key, because only a SUBSET of samples
+            # in any given batch have a target; default_collate requires every sample
+            # dict in a batch to have the same keys, so a mixed batch (some ZEGAR, some
+            # not) would fail to collate if the key were sometimes missing.
+            "zegar_heatmap": zegar_heatmap,
+            "has_zegar_target": torch.tensor(has_zegar_target, dtype=torch.bool),
         }
         if polar_grid is not None:
             sample["polar_grid"] = polar_grid
@@ -293,11 +342,47 @@ class OtolithDataset(Dataset):
     # Image loading
     # ------------------------------------------------------------------
 
+    def _image_dir_for(self, image_id: str) -> Path:
+        """(26.08) ZEGAR-derived rows live in a SEPARATE directory from every other
+        image (see __init__) — everything else resolves to the normal img_dir,
+        unchanged."""
+        if image_id in self._zegar_image_ids and self._zegar_extra_image_dir is not None:
+            return self._zegar_extra_image_dir
+        return self.img_dir
+
+    def _build_zegar_heatmap(self, image_id: str, crop_h: int, crop_w: int) -> tuple:
+        """(26.08) Soft Gaussian target for zegar_position_loss, in the SAME raw-crop-
+        pixel-to-patch-grid mapping convention as otolith_axis.compute_polar_grid
+        (row = y/crop_h*h_patches, col = x/crop_w*w_patches — algebraically identical
+        to "resize to image_size, then divide by patch_size" for a square target grid,
+        so this matches the polar grid's own convention exactly rather than introducing
+        a second, only-superficially-different mapping).
+
+        Returns (heatmap (h_patches, w_patches) float32 ndarray, has_target bool) — an
+        all-zero/False heatmap when image_id has no ZEGAR annotation (the overwhelming
+        majority of samples), matching this module's "never crash, degrade gracefully"
+        philosophy elsewhere (e.g. failed segmentation).
+        """
+        h_patches = w_patches = self.cfg.data.image_size // self.cfg.data.patch_size
+        points = self._zegar_targets.get(image_id)
+        if not points:
+            return np.zeros((h_patches, w_patches), dtype=np.float32), False
+        rr, cc = np.meshgrid(np.arange(h_patches), np.arange(w_patches), indexing="ij")
+        heat = np.zeros((h_patches, w_patches), dtype=np.float32)
+        sigma = self._zegar_sigma
+        for x, y in points:
+            row0 = y / crop_h * h_patches
+            col0 = x / crop_w * w_patches
+            g = np.exp(-((rr - row0) ** 2 + (cc - col0) ** 2) / (2.0 * sigma * sigma))
+            heat = np.maximum(heat, g.astype(np.float32))
+        return heat, True
+
     def _load_image(self, image_id: str) -> torch.Tensor:
-        path = self.img_dir / image_id
+        img_dir = self._image_dir_for(image_id)
+        path = img_dir / image_id
         if not path.exists():
             for ext in IMAGE_EXTENSIONS:
-                candidate = self.img_dir / (image_id + ext)
+                candidate = img_dir / (image_id + ext)
                 if candidate.exists():
                     path = candidate
                     break
@@ -314,22 +399,27 @@ class OtolithDataset(Dataset):
         ``include_flips`` docstring for why this can't just reuse the normal
         Compose-embedded random flips on the train split).
 
-        Returns (image_tensor, polar_t_grid, polar_valid_grid, polar_theta_grid); the
-        latter three are all-zero / all-False when segmentation fails, matching the
-        rest of this module's "never crash on a bad photo" fallback philosophy.
-        polar_theta_grid (05.08, windowed/"local" E9) carries a signed direction, so
-        unlike the other two it needs an actual VALUE transform (not just an array
-        reversal) under a flip — see the wrap_angle calls below.
+        Returns (image_tensor, polar_t_grid, polar_valid_grid, polar_theta_grid,
+        zegar_heatmap, has_zegar_target); the polar three are all-zero / all-False when
+        segmentation fails, matching the rest of this module's "never crash on a bad
+        photo" fallback philosophy. polar_theta_grid (05.08, windowed/"local" E9)
+        carries a signed direction, so unlike the other two it needs an actual VALUE
+        transform (not just an array reversal) under a flip — see the wrap_angle calls
+        below. zegar_heatmap (26.08) needs only the array-reversal treatment, like
+        t_grid/valid_grid — a Gaussian blob has no signed direction to correct.
         """
-        path = self.img_dir / image_id
+        img_dir = self._image_dir_for(image_id)
+        path = img_dir / image_id
         if not path.exists():
             for ext in IMAGE_EXTENSIONS:
-                candidate = self.img_dir / (image_id + ext)
+                candidate = img_dir / (image_id + ext)
                 if candidate.exists():
                     path = candidate
                     break
         image = Image.open(path).convert("RGB")
         rgb = np.array(image, dtype=np.uint8)
+        crop_h, crop_w = rgb.shape[:2]
+        zegar_heat, has_zegar_target = self._build_zegar_heatmap(image_id, crop_h, crop_w)
 
         mask = None
         centroid = None
@@ -363,12 +453,14 @@ class OtolithDataset(Dataset):
                 # right (as t_grid/valid_grid do) would silently attach each patch a
                 # pre-flip direction that no longer matches its post-flip geometry.
                 theta_grid = _wrap_angle(np.pi - theta_grid[:, ::-1])
+                zegar_heat = np.ascontiguousarray(zegar_heat[:, ::-1])
             if do_vflip:
                 pil_img = pil_img.transpose(Image.FLIP_TOP_BOTTOM)
                 t_grid = np.ascontiguousarray(t_grid[::-1, :])
                 valid_grid = np.ascontiguousarray(valid_grid[::-1, :])
                 # Mirrors negate dy instead: atan2(-dy,dx) = wrap(-atan2(dy,dx)).
                 theta_grid = _wrap_angle(-theta_grid[::-1, :])
+                zegar_heat = np.ascontiguousarray(zegar_heat[::-1, :])
 
         image_tensor = self.transform(pil_img)
         return (
@@ -376,6 +468,8 @@ class OtolithDataset(Dataset):
             torch.from_numpy(t_grid.copy()),
             torch.from_numpy(valid_grid.copy()),
             torch.from_numpy(np.ascontiguousarray(theta_grid).copy()),
+            torch.from_numpy(np.ascontiguousarray(zegar_heat).copy()),
+            has_zegar_target,
         )
 
     def _decide_flip(self) -> tuple:

@@ -278,6 +278,55 @@ def density_concentricity_loss(
     return sq_dev.sum() / denom
 
 
+def zegar_position_loss(
+    density: Tensor,
+    target_heatmap: Tensor,
+    alpha: float = 2.0,
+    beta: float = 4.0,
+    eps: float = 1e-6,
+) -> Tensor:
+    """Semi-weak-supervision loss (26.08, "Opcja A"): pulls the density head's output
+    toward REAL human-annotated ring positions, for the small subset of batch samples
+    that have them (the 42-image "ZEGAR" ground-truth set — see ``OtolithDataset``'s
+    ``zegar_heatmap``/``has_zegar_target`` fields). Every other sample in the ~18,700-
+    image dataset keeps using the purely weak (age-count-only) supervision in
+    ``density_count_loss`` unchanged — this is an ADDITIONAL term, applied only to the
+    caller-selected subset, never a replacement.
+
+    Standard CornerNet/CenterNet penalty-reduced pixel-wise focal loss: ``target_heatmap``
+    is a soft Gaussian heatmap (peak=1.0 at an annotated ring, CenterNet "max of
+    Gaussians" convention for overlapping peaks). Pixels near a peak (target close to
+    but not exactly 1) get a reduced negative penalty via ``(1-target)**beta``, so the
+    loss doesn't punish high predictions immediately adjacent to a true peak. Formula
+    and default alpha/beta match ``scripts/diagnostics/train_zegar_localization_head.py
+    ::centernet_focal_loss`` verbatim — already validated numerically in that script
+    (well-behaved, smoothly decreasing training loss); that script's negative result was
+    a generalisation/data-scale problem (a from-scratch head trained on only 42 images),
+    not a defect in this loss formula, so it is reused as-is here rather than redesigned.
+
+    Args:
+        density        : (B_masked, N) per-patch density ∈ [0, 1] — the SAME stop-
+                         gradient tensor fed to ``density_count_loss``, pre-filtered by
+                         the caller to only the rows with a real ZEGAR target (this
+                         function does no masking itself, so the loss is never silently
+                         diluted by non-ZEGAR rows averaging in as all-zero targets).
+        target_heatmap : (B_masked, N) soft Gaussian target, same shape as ``density``.
+
+    Returns scalar loss, normalised by the number of positive (near-peak) pixels in
+    this masked mini-batch — NOT by the full batch size, so per-epoch dilution (only
+    ~0.2% of samples ever have a ZEGAR target) is the only dilution; there is no
+    additional per-batch dilution on top of it.
+    """
+    pred = density.clamp(eps, 1.0 - eps)
+    pos_mask = (target_heatmap >= 0.999).float()
+    neg_mask = 1.0 - pos_mask
+    neg_weight = (1.0 - target_heatmap).pow(beta)
+    pos_loss = -(1 - pred).pow(alpha) * torch.log(pred) * pos_mask
+    neg_loss = -neg_weight * pred.pow(alpha) * torch.log(1 - pred) * neg_mask
+    num_pos = pos_mask.sum().clamp(min=1.0)
+    return (pos_loss.sum() + neg_loss.sum()) / num_pos
+
+
 class AttentionDensityHead(nn.Module):
     """Cross-patch self-attention density head (density_head_type="attention").
 

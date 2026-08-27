@@ -664,3 +664,155 @@ def test_labels_sample_csv_schema():
         assert col in df.columns
     assert len(df) >= 5
     assert df["age"].ge(0).all()
+
+
+# ---------------------------------------------------------------------------
+# Semi-weak supervision (26.08, "Opcja A"): zegar_heatmap / has_zegar_target
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def zegar_semi_weak_data(tmp_path):
+    """A main (non-ZEGAR) dataset of 2 dummy images, plus a SEPARATE ZEGAR extra
+    labels/targets CSV and image dir with 1 annotated sample — mirrors exactly what
+    scripts/prepare_zegar_semi_weak_data.py produces, at unit-test scale. The ZEGAR
+    image doesn't need to be segmentable (unlike ellipse_data above) since
+    _build_zegar_heatmap never depends on segmentation succeeding."""
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    for i in range(2):
+        Image.new("RGB", (64, 64), color=(i * 40, 100, 200)).save(img_dir / f"img_{i}.png")
+    csv_path = tmp_path / "labels.csv"
+    pd.DataFrame([
+        {"image_id": "img_0.png", "age": 5, "split": "train"},
+        {"image_id": "img_1.png", "age": 6, "split": "train"},
+    ]).to_csv(csv_path, index=False)
+
+    zegar_img_dir = tmp_path / "zegar_processed"
+    zegar_img_dir.mkdir()
+    # Crop is 140x196 (H x W) so a non-square crop exercises the row/col scale
+    # factors independently — a bug that swapped them would still pass on a square
+    # crop by coincidence.
+    Image.new("RGB", (196, 140), color=(10, 10, 10)).save(zegar_img_dir / "ZEGAR_T01.jpg")
+    zegar_labels_csv = tmp_path / "zegar_labels.csv"
+    pd.DataFrame([{"image_id": "ZEGAR_T01.jpg", "age": 4, "split": "train"}]).to_csv(
+        zegar_labels_csv, index=False)
+    zegar_targets_csv = tmp_path / "zegar_targets.csv"
+    # Two annotated points near the crop's bottom-right corner (x close to W=196,
+    # y close to H=140) — deliberately off-center so a flip visibly relocates them.
+    pd.DataFrame([
+        {"image_id": "ZEGAR_T01.jpg", "x": 176.0, "y": 126.0},
+        {"image_id": "ZEGAR_T01.jpg", "x": 168.0, "y": 112.0},
+    ]).to_csv(zegar_targets_csv, index=False)
+
+    return {
+        "csv_path": csv_path, "img_dir": img_dir,
+        "zegar_labels_csv": zegar_labels_csv, "zegar_img_dir": zegar_img_dir,
+        "zegar_targets_csv": zegar_targets_csv,
+    }
+
+
+def _zegar_cfg(data, tmp_path, image_size: int = 196):
+    cfg = _make_cfg()
+    cfg.data.image_size = image_size   # 196 = 14*14, divisible by patch_size
+    cfg.data.mask_background = True
+    cfg.data.mask_cache_dir = str(tmp_path / "masks_cache")
+    cfg.model.use_density_head = True
+    cfg.data.zegar_extra_labels_csv = str(data["zegar_labels_csv"])
+    cfg.data.zegar_extra_image_dir = str(data["zegar_img_dir"])
+    cfg.data.zegar_targets_csv = str(data["zegar_targets_csv"])
+    return cfg
+
+
+def test_zegar_heatmap_absent_by_default(zegar_semi_weak_data):
+    """No zegar_extra_* configured (default None) → zero behaviour change: every
+    sample still gets zegar_heatmap/has_zegar_target, but always zero/False."""
+    from src.dataset import OtolithDataset
+    data = zegar_semi_weak_data
+    cfg = _make_cfg()
+    ds = OtolithDataset(cfg, "train", labels_csv=str(data["csv_path"]), image_dir=str(data["img_dir"]))
+    item = ds[0]
+    assert item["has_zegar_target"].item() is False
+    assert item["zegar_heatmap"].max().item() == 0.0
+
+
+def test_zegar_extra_rows_merged_into_train_split(zegar_semi_weak_data, tmp_path):
+    """The ZEGAR-extra CSV's rows must appear in the dataset alongside the main
+    CSV's rows (concatenated before the split filter, src/dataset.py __init__)."""
+    from src.dataset import OtolithDataset
+    data = zegar_semi_weak_data
+    cfg = _zegar_cfg(data, tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(data["csv_path"]), image_dir=str(data["img_dir"]))
+    assert len(ds) == 3   # 2 main + 1 zegar
+    assert "ZEGAR_T01.jpg" in set(ds.df["image_id"])
+    assert "ZEGAR_T01.jpg" in ds._zegar_image_ids
+
+
+def test_zegar_heatmap_present_for_annotated_sample(zegar_semi_weak_data, tmp_path):
+    from src.dataset import OtolithDataset
+    data = zegar_semi_weak_data
+    cfg = _zegar_cfg(data, tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(data["csv_path"]), image_dir=str(data["img_dir"]))
+    idx = ds.df.index[ds.df["image_id"] == "ZEGAR_T01.jpg"][0]
+    item = ds[idx]
+    h_p = w_p = cfg.data.image_size // cfg.data.patch_size
+    assert item["has_zegar_target"].item() is True
+    assert item["zegar_heatmap"].shape == (h_p, w_p)
+    assert item["zegar_heatmap"].max().item() > 0.9   # a real peak, not a flat/near-zero map
+
+
+def test_zegar_heatmap_zero_for_non_zegar_sample_in_mixed_dataset(zegar_semi_weak_data, tmp_path):
+    """A normal, non-ZEGAR sample sitting in the SAME dataset/batch as a ZEGAR one
+    must still get an all-zero heatmap and has_zegar_target=False — this is exactly
+    the per-sample masking the trainer's loss gating relies on."""
+    from src.dataset import OtolithDataset
+    data = zegar_semi_weak_data
+    cfg = _zegar_cfg(data, tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(data["csv_path"]), image_dir=str(data["img_dir"]))
+    idx = ds.df.index[ds.df["image_id"] == "img_0.png"][0]
+    item = ds[idx]
+    assert item["has_zegar_target"].item() is False
+    assert item["zegar_heatmap"].max().item() == 0.0
+
+
+def test_zegar_image_dir_dispatch(zegar_semi_weak_data, tmp_path):
+    """ZEGAR-derived rows must load from zegar_extra_image_dir, NOT the main
+    image_dir (which doesn't even contain a file with that name)."""
+    from src.dataset import OtolithDataset
+    data = zegar_semi_weak_data
+    cfg = _zegar_cfg(data, tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(data["csv_path"]), image_dir=str(data["img_dir"]))
+    assert not (data["img_dir"] / "ZEGAR_T01.jpg").exists()
+    idx = ds.df.index[ds.df["image_id"] == "ZEGAR_T01.jpg"][0]
+    item = ds[idx]   # must not raise (would FileNotFoundError if dispatch were wrong)
+    assert item["image"].shape == (3, cfg.data.image_size, cfg.data.image_size)
+
+
+def test_zegar_heatmap_flip_synced_with_image(zegar_semi_weak_data, tmp_path, monkeypatch):
+    """Same requirement as polar_grid (test_polar_grid_flip_synced_with_image above):
+    the shared explicit flip decision must relocate the heatmap's peak in lockstep
+    with the image, not leave it pointing at the pre-flip position."""
+    import numpy as np
+    import torchvision.transforms as T
+    from src.dataset import OtolithDataset
+    data = zegar_semi_weak_data
+
+    monkeypatch.setattr(T.ColorJitter, "forward", lambda self, img: img)
+    cfg = _zegar_cfg(data, tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(data["csv_path"]), image_dir=str(data["img_dir"]))
+    idx = ds.df.index[ds.df["image_id"] == "ZEGAR_T01.jpg"][0]
+
+    monkeypatch.setattr(ds, "_decide_flip", lambda: (False, False))
+    baseline = ds[idx]
+    monkeypatch.setattr(ds, "_decide_flip", lambda: (True, False))
+    hflipped = ds[idx]
+    monkeypatch.setattr(ds, "_decide_flip", lambda: (False, True))
+    vflipped = ds[idx]
+
+    assert torch.allclose(hflipped["image"], torch.flip(baseline["image"], dims=[2]), atol=1e-5)
+    expected_h = np.fliplr(baseline["zegar_heatmap"].numpy())
+    assert np.allclose(hflipped["zegar_heatmap"].numpy(), expected_h, atol=1e-4)
+    expected_v = np.flipud(baseline["zegar_heatmap"].numpy())
+    assert np.allclose(vflipped["zegar_heatmap"].numpy(), expected_v, atol=1e-4)
+    # And explicitly NOT unchanged — pins down that some real transform happened,
+    # not a no-op that would trivially "match" a wrong expectation.
+    assert not np.allclose(hflipped["zegar_heatmap"].numpy(), baseline["zegar_heatmap"].numpy())

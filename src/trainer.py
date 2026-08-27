@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from src.config import OtolithConfig
 from src.dataset import decode_age_ordinal
 from src.model import (OtolithModel, density_concentricity_loss, density_count_loss,
-                       mil_count_loss, ordinal_loss)
+                       mil_count_loss, ordinal_loss, zegar_position_loss)
 from src.utils import resolve_device  # re-exported for backwards compat
 
 
@@ -56,6 +56,8 @@ class Trainer:
         # Change B (05.08): angle-windowed/"local" E9 — None = old global behaviour.
         self.density_concentricity_window_deg = getattr(
             cfg.model, "density_concentricity_window_deg", None)
+        # Semi-weak supervision (26.08, "Opcja A") — 0.0 weight = off (default).
+        self.zegar_position_w = getattr(cfg.model, "zegar_position_weight", 0.0)
         self.last_val_metrics: dict = {}   # Section-B diagnostics from validate()
 
         self.optimizer = self._build_optimizer()
@@ -131,7 +133,9 @@ class Trainer:
     def _loss_parts(self, out: dict, targets: torch.Tensor, ages: torch.Tensor,
                     polar_grid: Optional[torch.Tensor] = None,
                     polar_valid: Optional[torch.Tensor] = None,
-                    polar_theta: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
+                    polar_theta: Optional[torch.Tensor] = None,
+                    zegar_heatmap: Optional[torch.Tensor] = None,
+                    has_zegar_target: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
         """Weighted CORAL / MIL components + their sum, keyed by name.
 
         Returned so the trainer can log the head losses separately (report
@@ -159,6 +163,18 @@ class Trainer:
                         polar_theta=polar_theta.reshape(B, N) if polar_theta is not None else None,
                         window_deg=self.density_concentricity_window_deg,
                     )
+            # Semi-weak supervision (26.08, "Opcja A") — same stop-gradient density
+            # tensor as above, so this can never leak into the backbone/CORAL/MIL
+            # either. Masked BEFORE the loss (not after), so this term is never
+            # further diluted at the per-batch level on top of the expected per-epoch
+            # ~0.2% dilution (only ~30/18,700 images ever carry a real target).
+            if (self.zegar_position_w > 0.0 and has_zegar_target is not None
+                    and bool(has_zegar_target.any())):
+                B, N = out["density"].shape
+                parts["zegar_position"] = self.zegar_position_w * zegar_position_loss(
+                    out["density"][has_zegar_target],
+                    zegar_heatmap.reshape(B, N)[has_zegar_target],
+                )
         if not parts:
             raise RuntimeError("Model produced no recognised head outputs")
         parts["total"] = torch.stack(list(parts.values())).sum()
@@ -167,9 +183,12 @@ class Trainer:
     def _combined_loss(self, out: dict, targets: torch.Tensor, ages: torch.Tensor,
                        polar_grid: Optional[torch.Tensor] = None,
                        polar_valid: Optional[torch.Tensor] = None,
-                       polar_theta: Optional[torch.Tensor] = None) -> torch.Tensor:
+                       polar_theta: Optional[torch.Tensor] = None,
+                       zegar_heatmap: Optional[torch.Tensor] = None,
+                       has_zegar_target: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Combined CORAL + MIL loss (the scalar we optimise)."""
-        return self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta)["total"]
+        return self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta,
+                                 zegar_heatmap, has_zegar_target)["total"]
 
     @staticmethod
     def _predict_age(out: dict) -> torch.Tensor:
@@ -209,11 +228,21 @@ class Trainer:
                 polar_valid = polar_valid.to(self.device).reshape(B_, -1)
                 polar_theta = (polar_theta.to(self.device).reshape(B_, -1)
                                if polar_theta is not None else None)
+            # Semi-weak supervision (26.08) — always present in the batch dict (see
+            # OtolithDataset.__getitem__), reshaped (B,Hp,Wp)->(B,N) once, same
+            # pattern as polar_grid above; kept UN-reshaped only inside _loss_parts's
+            # own flatten call, mirroring how polar tensors are handled.
+            zegar_heatmap = batch.get("zegar_heatmap")
+            has_zegar_target = batch.get("has_zegar_target")
+            if zegar_heatmap is not None:
+                zegar_heatmap = zegar_heatmap.to(self.device)
+                has_zegar_target = has_zegar_target.to(self.device)
 
             self.optimizer.zero_grad()
             out = self.model(images, metadata=metadata, polar_t=polar_grid,
                               polar_theta=polar_theta, polar_valid=polar_valid)
-            loss = self._combined_loss(out, targets, ages, polar_grid, polar_valid, polar_theta)
+            loss = self._combined_loss(out, targets, ages, polar_grid, polar_valid, polar_theta,
+                                        zegar_heatmap, has_zegar_target)
             loss.backward()
             self.optimizer.step()
 
@@ -244,7 +273,8 @@ class Trainer:
         density_sum = 0.0
         density_active_sum = 0.0
         density_conc_sum = 0.0
-        has_coral = has_mil = has_density = has_density_conc = False
+        zegar_position_sum = 0.0
+        has_coral = has_mil = has_density = has_density_conc = has_zegar_position = False
         n = 0
         with torch.no_grad():
             for batch in self.val_loader:
@@ -264,10 +294,16 @@ class Trainer:
                     polar_valid = polar_valid.to(self.device).reshape(B_, -1)
                     polar_theta = (polar_theta.to(self.device).reshape(B_, -1)
                                    if polar_theta is not None else None)
+                zegar_heatmap = batch.get("zegar_heatmap")
+                has_zegar_target = batch.get("has_zegar_target")
+                if zegar_heatmap is not None:
+                    zegar_heatmap = zegar_heatmap.to(self.device)
+                    has_zegar_target = has_zegar_target.to(self.device)
 
                 out = self.model(images, metadata=metadata, polar_t=polar_grid,
                                   polar_theta=polar_theta, polar_valid=polar_valid)
-                parts = self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta)
+                parts = self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta,
+                                          zegar_heatmap, has_zegar_target)
                 pred_ages = self._predict_age(out)
 
                 bs = images.size(0)
@@ -284,6 +320,9 @@ class Trainer:
                 if "density_concentricity" in parts:
                     density_conc_sum += parts["density_concentricity"].item() * bs
                     has_density_conc = True
+                if "zegar_position" in parts:
+                    zegar_position_sum += parts["zegar_position"].item() * bs
+                    has_zegar_position = True
                 age_sum += ages.float().sum().item()
                 n += bs
 
@@ -300,6 +339,8 @@ class Trainer:
             self.last_val_metrics["mean_age"] = age_sum / denom
         if has_density_conc:
             self.last_val_metrics["density_conc_loss"] = density_conc_sum / denom
+        if has_zegar_position:
+            self.last_val_metrics["zegar_position_loss"] = zegar_position_sum / denom
         return total_loss / denom, total_mae / denom
 
     # ------------------------------------------------------------------

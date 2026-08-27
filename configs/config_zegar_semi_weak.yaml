@@ -1,0 +1,147 @@
+# 26.08 — Opcja A: semi-slaby nadzor. Dodatkowy czlon straty (zegar_position_loss,
+# src/model.py) ciagnie glowice density w strone PRAWDZIWYCH pozycji pierscieni,
+# WYLACZNIE dla ~30 obrazow ZEGAR (data/zegar_semi_weak_*.csv, wygenerowane przez
+# scripts/prepare_zegar_semi_weak_data.py), gdy trafia do batcha. Reszta ~18 700
+# obrazow bez zmian — czysto slaby nadzor (age-count-only), jak zawsze.
+#
+# Kontekst: cztery niezalezne proby dolozenia kolejnego czlonu straty do TEJ SAMEJ
+# glowicy density (Zmiana B/E9, density_conc_weight/tv_weight, radial_bins/harmoniki
+# — plans and summaries/6.08_PODSUMOWANIE_PROCESU.md Etapy 24/26/28/29) dały
+# zero-albo-negatywny efekt. Opcja B (zamrozony backbone + mala glowica trenowana
+# WYLACZNIE na 42 obrazach ZEGAR, Etap 31) tez dala wynik negatywny — nawet po
+# kanonizacji osi ledwo dobila do poziomu losowego zgadywania (337,7px vs kontrola
+# losowa 241,5px, wobec Run N 27,88px). To piata proba, na PIATEJ dzwigni: silny,
+# ale rozcienczony (~0,2% danych/epoke) prawdziwy sygnal pozycji, wpleciony w JUZ
+# dzialajaca architekture (nie head trenowany od zera jak w Opcji B).
+#
+# Kopia config_radial_attention.yaml (Run N) — WSZYSTKIE potwierdzone wartosci bez
+# zmian (density_attn_window_deg=45°, radial_bins=12, harmoniki 4/4, Zmiana B
+# wylaczona). Jedyne nowe pola: zegar_position_weight + cztery data.zegar_* ponizej.
+#
+# zegar_position_weight=1.0 — JAWNIE NIEZWERYFIKOWANY punkt startowy, ten sam status
+# co inner_margin=0.20/density_attn_window_deg przy pierwszym uzyciu.
+#
+# Zobacz: plans and summaries/6.08_PODSUMOWANIE_PROCESU.md Etap 32,
+# src/model.py::zegar_position_loss, src/dataset.py (zegar_heatmap/has_zegar_target).
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg
+  use_metadata: false
+  target_type: ordinal
+  num_age_classes: 17
+  dropout: 0.1
+  head_type: both
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  density_conc_weight: 1.0
+  density_tv_weight: 0.03
+
+  density_head_type: radial_attention
+  density_attn_num_heads: 4
+  density_attn_num_layers: 1
+  density_attn_num_angle_freqs: 4
+  density_attn_num_radius_freqs: 4
+  density_attn_radial_bins: 12
+  density_attn_window_deg: 45.0
+
+  density_concentricity_weight: 0.0
+  density_concentricity_bins: 12
+  density_concentricity_window_deg: 45.0
+
+  # ------------------------------------------------------------------------
+  # OPCJA A (26.08) — JEDYNA nowa zmiana tego configu. Patrz naglowek pliku.
+  zegar_position_weight: 1.0
+  # ------------------------------------------------------------------------
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  mask_background: true
+  mask_cache_dir: null
+
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+  # ------------------------------------------------------------------------
+  # OPCJA A (26.08) — cztery nowe pola, wygenerowane przez
+  # scripts/prepare_zegar_semi_weak_data.py. Sciezki wzgledem katalogu projektu.
+  zegar_extra_labels_csv: data/zegar_semi_weak_labels.csv
+  zegar_extra_image_dir: data/ZEGAR/Processed
+  zegar_targets_csv: data/zegar_semi_weak_targets.csv
+  zegar_gaussian_sigma_patches: 1.2
+  # ------------------------------------------------------------------------
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  density_image_size: 728
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8

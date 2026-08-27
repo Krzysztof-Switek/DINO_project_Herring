@@ -1,0 +1,7 @@
+image_id,age,split
+fish_0.png,1,train
+fish_1.png,2,train
+fish_2.png,3,train
+fish_3.png,4,train
+fish_4.png,1,val
+fish_5.png,2,val

@@ -986,3 +986,51 @@ def test_density_concentricity_loss_wraparound_0_360():
         "with correct wraparound the two patches ARE each other's neighbour "
         "(2deg apart) — a broken wraparound would silently return 0.0 instead"
     )
+
+
+# ---------------------------------------------------------------------------
+# Semi-weak supervision (26.08, "Opcja A"): zegar_position_loss
+# ---------------------------------------------------------------------------
+
+def test_zegar_position_loss_pulls_prediction_toward_peak():
+    from src.model import zegar_position_loss
+    target = torch.zeros(1, 9)
+    target[0, 4] = 1.0   # single peak, centre cell of a 3x3 grid
+    far = torch.full((1, 9), 0.5, requires_grad=True)
+    loss_far = zegar_position_loss(far, target)
+    near = torch.full((1, 9), 0.5)
+    near = near.clone()
+    near[0, 4] = 0.9
+    near.requires_grad_(True)
+    loss_near = zegar_position_loss(near, target)
+    assert float(loss_near.detach()) < float(loss_far.detach()), \
+        "a prediction already close to the true peak must score a lower loss"
+    assert loss_far.requires_grad
+
+
+def test_zegar_position_loss_zero_for_perfect_match():
+    from src.model import zegar_position_loss
+    target = torch.zeros(1, 4)
+    target[0, 0] = 1.0
+    pred = target.clone()
+    loss = zegar_position_loss(pred, target)
+    assert float(loss) == pytest.approx(0.0, abs=1e-4)
+
+
+def test_zegar_position_loss_stop_gradient_blocks_backbone():
+    """CRITICAL: same guarantee as every other density-head loss — must not update
+    the backbone (age head stays safe by construction)."""
+    from src.model import zegar_position_loss
+    model = _make_density_model()
+    out = model(torch.randn(2, 3, 56, 56))
+    target = torch.zeros_like(out["density"])
+    target[:, 0] = 1.0
+    loss = zegar_position_loss(out["density"], target)
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in model.backbone.parameters())
+    dh_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in model.density_head.parameters())
+    assert not bb_grad, "zegar_position_loss leaked gradient into the backbone"
+    assert dh_grad, "density head received no gradient"
