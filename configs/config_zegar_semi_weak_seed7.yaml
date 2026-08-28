@@ -1,0 +1,150 @@
+# 28.08 — Opcja A, powtorka z INNYM SEEDEM (jedyna zmiana: project.seed 42→7).
+#
+# Kontekst: pierwszy bieg Opcji A (config_zegar_semi_weak.yaml, seed=42) dal wynik NA MEDIANIE
+# remis z Run N (20,66px vs 21,11px na 12 obrazach held-out), ale NA SREDNIEJ gorszy o ~4,4px
+# (31,45 vs 27,04px) — napedzany niemal wylacznie przez DWA katastrofalne pojedyncze obrazy
+# (Z05: +30px, Z38: +55px). Wizualna diagnoza (plans and summaries/28.08_zegar_semi_weak_wyniki.md,
+# artefakt "Run N vs Opcja A") pokazala, ze na obu obrazach takze KLASYKA (metoda niezalezna od
+# treningu) radzi sobie gorzej niz przecietnie, a na Z38 sami eksperci (KK/SS) nie zgadzaja sie ze
+# soba az o 14,4px (~3,5x typowa wartosc) — silny sygnal, ze to obiektywnie trudne obrazy, NIE
+# koniecznie specyficzna wada Opcji A. Jeden bieg to za malo, zeby to rozstrzygnac (ta sama lekcja
+# co kazda inna pojedyncza ablacja w historii tego projektu, np. Etap 6/8) — stad ta powtorka.
+#
+# CO SIE ZMIENIA: WYLACZNIE project.seed (42→7). Wszystko inne — architektura, wagi strat,
+# zegar_position_weight=1.0, DANE (te same 30 obrazow treningowych / 12 held-out z
+# data/zegar_semi_weak_*.csv, NIE regenerowane — scripts/prepare_zegar_semi_weak_data.py ma WLASNY,
+# osobny, niezmieniony seed=42 dla podzialu train/held-out, wiec zestaw 12 obrazow held-out zostaje
+# DOKLADNIE ten sam, co jest wymagane dla uczciwego porownania z pierwszym biegiem) — bez zmian.
+#
+# project.seed steruje: seed_everything() w scripts/run_pipeline.py (inicjalizacja wag glowicy
+# density/CORAL/MIL, kolejnosc shufflowania batchy, losowe decyzje flip augmentacji) — realnie
+# rozny przebieg treningu, ta sama architektura i te same dane.
+#
+# Interpretacja po biegu: jesli Z05/Z38 ZNOWU wypadaja wyraznie gorzej niz Run N — to mocny sygnal,
+# ze to powtarzalna wlasciwosc mechanizmu Opcji A na tych konkretnych obrazach, nie przypadek
+# jednego treningu. Jesli NIE — potwierdza, ze byla to stochastyka pojedynczego biegu, a mediana
+# remisu jest bardziej reprezentatywnym wynikiem Opcji A.
+#
+# Zobacz: plans and summaries/6.08_PODSUMOWANIE_PROCESU.md Etap 33,
+# plans and summaries/28.08_zegar_semi_weak_wyniki.md.
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 7
+
+model:
+  backbone: dinov2_vits14_reg
+  use_metadata: false
+  target_type: ordinal
+  num_age_classes: 17
+  dropout: 0.1
+  head_type: both
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  density_conc_weight: 1.0
+  density_tv_weight: 0.03
+
+  density_head_type: radial_attention
+  density_attn_num_heads: 4
+  density_attn_num_layers: 1
+  density_attn_num_angle_freqs: 4
+  density_attn_num_radius_freqs: 4
+  density_attn_radial_bins: 12
+  density_attn_window_deg: 45.0
+
+  density_concentricity_weight: 0.0
+  density_concentricity_bins: 12
+  density_concentricity_window_deg: 45.0
+
+  # ------------------------------------------------------------------------
+  # OPCJA A — niezmienione wzgledem pierwszego biegu (seed=42). Patrz naglowek pliku.
+  zegar_position_weight: 1.0
+  # ------------------------------------------------------------------------
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  mask_background: true
+  mask_cache_dir: null
+
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+  # ------------------------------------------------------------------------
+  # Te same pliki co w pierwszym biegu — NIE regenerowane, ten sam podzial 30/12.
+  zegar_extra_labels_csv: data/zegar_semi_weak_labels.csv
+  zegar_extra_image_dir: data/ZEGAR/Processed
+  zegar_targets_csv: data/zegar_semi_weak_targets.csv
+  zegar_gaussian_sigma_patches: 1.2
+  # ------------------------------------------------------------------------
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  density_image_size: 728
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8
