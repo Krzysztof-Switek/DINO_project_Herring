@@ -1,0 +1,149 @@
+# 02.09 — Eksperyment "pasek dendrologiczny" (Track A, wariant dwugałęziowy): głowica wieku
+# (CORAL+MIL) trenuje WYŁĄCZNIE na pełnym kwadratowym obrazie, dokładnie jak w Run N
+# (config_radial_attention.yaml) — zero zmian. Głowica density czyta z OSOBNEGO przejścia
+# backbone'u na wyprostowanym pasku wzdłuż osi jądro→brzeg (data.dual_branch_density=true,
+# src/strip_extraction.py) — inspirowane pracą Poláček i in. 2023 o wykrywaniu słojów drzewa
+# (rdzeń przyrostowy = dokładny odpowiednik naszej osi odczytu, geometrycznie promień).
+#
+# Pełny opis decyzji projektowych: plans and summaries/02.09_wycinki_plan.md.
+#
+# Jedna izolowana zmienna względem Run N: geometria wejścia głowicy density. Wszystko inne —
+# backbone, receptura CORAL+MIL, splity, augmentacje, harmonogram treningu — identyczne, żeby
+# wynik był wprost porównywalny (wiek: pipeline_summary.json vs Run N 0,8498 MAE; lokalizacja:
+# scripts/diagnostics/expert_annotation_eval_strip.py vs Run N 22,8px na 42 obrazach ZEGAR).
+#
+# Konsekwencja zmiany geometrii: RadialAttentionDensityHead (kodowanie polarne, Run N) nie ma
+# sensu dla paska (brak kąta θ) — zastąpiona istniejącą, prostszą density_head_type=mlp (ocenia
+# patche niezależnie, zero nowego kodu głowicy). Cały blok density_attn_*/E9 (Zmiana B) pominięty
+# — nieużywany przez mlp, więc OtolithDataset._need_polar zostaje False (żadnego dodatkowego
+# kosztu liczenia siatki polarnej). density_tv_weight ustawione JAWNIE na 0,0 (nie skopiowane z
+# Run N — u Run N i tak martwe przez hp_wp_square guard dla niekwadratowej siatki paska).
+#
+# UWAGA (ryzyko udokumentowane w planie): karty raportu (_compute_axis_data_for_samples,
+# scripts/run_pipeline.py) NIE są świadome gałęzi paska — panele density/kandydaci w report.html
+# z tego biegu są bez sensu (nie crashują, ale nic nie mówią o realnej lokalizacji tego modelu).
+# Ufać wyłącznie predictions.csv/pipeline_summary.json (wiek) oraz dedykowanemu
+# expert_annotation_eval_strip.py (lokalizacja).
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # niezmienione względem Run N
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  head_type: both                 # coral | mil | both — MIL nadal sprzężony z backbone jak w Run N
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  density_conc_weight: 1.0        # wewnętrzny człon top-k w density_count_loss (NIE E9/Zmiana B)
+  # Jawnie 0,0 (nie kopiowane z Run N=0,03) — u Run N to i tak martwe przez hp_wp_square guard dla
+  # niekwadratowej siatki; zero dla paska to jednocześnie zgodny z zasadą "jedna zmienna naraz"
+  # domyślny stan (TV był już osobno ablowany bez efektu, 17.08_radial_attention_smoothness).
+  density_tv_weight: 0.0
+
+  # ZMIANA GEOMETRII (02.09) — gałąź density czyta pasek, nie kwadrat. RadialAttentionDensityHead
+  # (Run N) nie ma zastosowania (brak kąta θ dla wyprostowanego paska) — stąd mlp, nie
+  # radial_attention. Cały blok density_attn_*/density_concentricity_* Run N celowo POMINIĘTY
+  # (nieużywany przez mlp; wartości domyślne = 0,0/off i tak by się zastosowały).
+  density_head_type: mlp          # było radial_attention w Run N
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  # WYMAGANE: gałąź paska buduje się z maskowanego obrazu (apply_background_mask PRZED
+  # warpAffine) — wymuszone też przez OtolithConfig walidator, gdy dual_branch_density=true.
+  mask_background: true
+  mask_cache_dir: null
+
+  # Dendrochronology-strip experiment (02.09) — WŁĄCZONA, jedyna deklarowana zmiana względem
+  # Run N. strip_length_px NIE jest zgadywane — wyznaczone empirycznie z realnych odstępów
+  # między przyrostami w danych ZEGAR (scripts/diagnostics/analyze_zegar_ring_spacing.py,
+  # 335 par, percentyl p1), tak żeby nawet niemal-najciaśniejsza para w całym zbiorze miała
+  # >=2 patche odstępu — wynik: outputs/02.09_zegar_ring_spacing/ring_spacing_summary.json.
+  # strip_width_px zostaje celowo skromne (7 patchy) — patrz plan, sekcja "Rozdzielczości".
+  dual_branch_density: true
+  strip_length_px: 1330           # 95 patchy — wynik Kroku 0 (p1), nie domysł
+  strip_width_px: 98              # 7 patchy
+  strips_cache_dir: null
+
+  # Zmiana C WYŁĄCZONA — spójne z Run N.
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  # UWAGA: te pola sterują ścieżką kart raportu (_compute_axis_data_for_samples), która NIE jest
+  # świadoma gałęzi paska — zostawione identyczne z Run N dla spójności configu, ale ich wyjście
+  # dla tego biegu jest bez znaczenia (patrz nagłówek pliku). Nie próbować "naprawiać" ich tutaj —
+  # prawdziwa lokalizacja tego modelu liczona jest przez expert_annotation_eval_strip.py.
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  density_image_size: 728
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8

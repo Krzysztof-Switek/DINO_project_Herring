@@ -237,10 +237,18 @@ class Trainer:
             if zegar_heatmap is not None:
                 zegar_heatmap = zegar_heatmap.to(self.device)
                 has_zegar_target = has_zegar_target.to(self.device)
+            # Dendrochronology-strip experiment (02.09) — only present when
+            # cfg.data.dual_branch_density=True (OtolithDataset.__getitem__). None
+            # otherwise, reproducing today's single-pass density behaviour exactly
+            # (see OtolithModel.forward's density_image param).
+            image_strip = batch.get("image_strip")
+            if image_strip is not None:
+                image_strip = image_strip.to(self.device)
 
             self.optimizer.zero_grad()
             out = self.model(images, metadata=metadata, polar_t=polar_grid,
-                              polar_theta=polar_theta, polar_valid=polar_valid)
+                              polar_theta=polar_theta, polar_valid=polar_valid,
+                              density_image=image_strip)
             loss = self._combined_loss(out, targets, ages, polar_grid, polar_valid, polar_theta,
                                         zegar_heatmap, has_zegar_target)
             loss.backward()
@@ -299,9 +307,13 @@ class Trainer:
                 if zegar_heatmap is not None:
                     zegar_heatmap = zegar_heatmap.to(self.device)
                     has_zegar_target = has_zegar_target.to(self.device)
+                image_strip = batch.get("image_strip")
+                if image_strip is not None:
+                    image_strip = image_strip.to(self.device)
 
                 out = self.model(images, metadata=metadata, polar_t=polar_grid,
-                                  polar_theta=polar_theta, polar_valid=polar_valid)
+                                  polar_theta=polar_theta, polar_valid=polar_valid,
+                                  density_image=image_strip)
                 parts = self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta,
                                           zegar_heatmap, has_zegar_target)
                 pred_ages = self._predict_age(out)

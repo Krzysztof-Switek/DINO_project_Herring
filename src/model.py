@@ -170,6 +170,31 @@ def hp_wp_square(n: int) -> bool:
     return r * r == n
 
 
+def _resolve_patch_grid(n: int, patch_grid: Optional[Tuple[int, int]]) -> Tuple[int, int]:
+    """Resolve the (H_p, W_p) spatial shape of a flat ``(B, n)``/``(B, n, D)`` patch tensor.
+
+    ``patch_grid=None`` (default) reproduces the historical ``H_p = W_p = int(n ** 0.5)``
+    square-inference behaviour EXACTLY — every existing caller (``get_patch_tokens``/
+    ``get_cls_and_patches``/``get_patch_probs``/``get_density_probs`` below) keeps working
+    byte-for-byte, since none of them pass this new kwarg. Pass an explicit ``(H_p, W_p)``
+    for a non-square patch grid (e.g. the dendrochronology-strip experiment's rectangular
+    density branch, 02.09, plans and summaries/02.09_wycinki_plan.md) — validated against
+    ``n`` here with a clear error instead of letting a mismatched reshape fail downstream
+    with an opaque torch shape-mismatch message, or (worse, for an N that happens to be a
+    perfect square by coincidence) silently reshape into the wrong spatial layout.
+    """
+    if patch_grid is not None:
+        h_p, w_p = patch_grid
+        if h_p * w_p != n:
+            raise ValueError(
+                f"patch_grid {patch_grid} (H_p*W_p={h_p * w_p}) does not match the patch "
+                f"count N={n}"
+            )
+        return h_p, w_p
+    h_p = w_p = int(n ** 0.5)
+    return h_p, w_p
+
+
 def density_concentricity_loss(
     density: Tensor,
     polar_t: Tensor,
@@ -750,6 +775,7 @@ class OtolithModel(nn.Module):
         polar_t: Optional[Tensor] = None,
         polar_theta: Optional[Tensor] = None,
         polar_valid: Optional[Tensor] = None,
+        density_image: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         """Return a dict of head outputs. Patches participate in autograd.
 
@@ -759,6 +785,22 @@ class OtolithModel(nn.Module):
         loss (``OtolithDataset._need_polar``), now ALSO forwarded into the density head
         itself when it is ``RadialAttentionDensityHead``. Every other head type ignores
         them (see their ``forward`` signatures) — passing them is always safe.
+
+        ``density_image`` (optional, 02.09 — dendrochronology-strip experiment, plans
+        and summaries/02.09_wycinki_plan.md): when given, the density head reads patch
+        tokens from a SEPARATE backbone forward pass on THIS tensor instead of
+        ``image``'s own patches. That second pass runs under ``torch.no_grad()`` — not
+        just ``.detach()``'d like the ``None`` path below, but with no backward graph
+        built for it at all, since nothing downstream needs a gradient into it (the
+        density head's own parameters still get gradient starting fresh from the
+        no-grad tensor). This is the SAME no-grad pattern ``get_patch_tokens`` already
+        uses, not a new one. ``None`` (default) reproduces today's behaviour EXACTLY —
+        density reads ``patches.detach()`` from the same pass as CORAL/MIL, byte-
+        identical for every existing caller in the repo. The CORAL/MIL heads above
+        never see ``density_image`` — only the age heads' own ``image`` input matters
+        for them, which is the whole point of this parameter: it lets a caller (e.g.
+        ``OtolithDataset``'s strip branch) feed the density head a totally different
+        crop without the age heads' training dynamics changing at all.
         """
         # NOTE: forward_features WITHOUT torch.no_grad — patches must
         # backpropagate when the MIL head is active.
@@ -781,9 +823,19 @@ class OtolithModel(nn.Module):
             out["patch_count"] = patch_probs.sum(dim=1)           # (B,)
 
         if self.use_density_head:
-            # STOP-GRADIENT: detach patch tokens so the density loss updates only the
-            # density head, never the shared backbone (age head stays safe by design).
-            detached = patches.detach()
+            if density_image is not None:
+                # Dual-branch (02.09): a totally separate forward pass, no backward
+                # graph built at all — cheaper than .detach() (which still builds and
+                # discards a graph up to the detach point) since nothing downstream
+                # needs gradient into this pass in the first place.
+                with torch.no_grad():
+                    density_feats = self.backbone.forward_features(density_image)
+                detached = density_feats["x_norm_patchtokens"]
+            else:
+                # STOP-GRADIENT: detach patch tokens so the density loss updates only
+                # the density head, never the shared backbone (age head stays safe by
+                # design).
+                detached = patches.detach()
             if self.density_head_type == "mlp":
                 # Bare nn.Sequential (see __init__) — takes ONLY the tensor, no kwargs.
                 dens_logits = self.density_head(detached).squeeze(-1)       # (B, N)
@@ -817,34 +869,48 @@ class OtolithModel(nn.Module):
     # Patch access (interpretation / inference)
     # ------------------------------------------------------------------
 
-    def get_patch_tokens(self, image: Tensor) -> Tensor:
+    def get_patch_tokens(
+        self, image: Tensor, patch_grid: Optional[Tuple[int, int]] = None,
+    ) -> Tensor:
         """Return patch tokens as spatial grid (B, H_p, W_p, embed_dim).
 
         No gradient tracking — for L2-norm interpretation of the CORAL-only
         variant. The MIL pathway uses get_patch_probs() instead.
+
+        ``patch_grid`` (optional, 02.09): explicit ``(H_p, W_p)`` for a non-square
+        patch grid — see ``_resolve_patch_grid``. ``None`` (default) infers a square
+        grid from ``N``, exactly as before.
         """
         with torch.no_grad():
             feats = self.backbone.forward_features(image)
         patch_tokens = feats["x_norm_patchtokens"]
         B, N, D = patch_tokens.shape
-        H_p = W_p = int(N ** 0.5)
+        H_p, W_p = _resolve_patch_grid(N, patch_grid)
         return patch_tokens.reshape(B, H_p, W_p, D)
 
-    def get_cls_and_patches(self, image: Tensor) -> Tuple[Tensor, Tensor]:
-        """Return (cls_token, patch_grid) without gradient tracking."""
+    def get_cls_and_patches(
+        self, image: Tensor, patch_grid: Optional[Tuple[int, int]] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Return (cls_token, patch_grid) without gradient tracking.
+
+        ``patch_grid``: see ``get_patch_tokens``.
+        """
         with torch.no_grad():
             feats = self.backbone.forward_features(image)
         cls = feats["x_norm_clstoken"]
         patch_tokens = feats["x_norm_patchtokens"]
         B, N, D = patch_tokens.shape
-        H_p = W_p = int(N ** 0.5)
+        H_p, W_p = _resolve_patch_grid(N, patch_grid)
         return cls, patch_tokens.reshape(B, H_p, W_p, D)
 
-    def get_patch_probs(self, image: Tensor) -> Tensor:
+    def get_patch_probs(
+        self, image: Tensor, patch_grid: Optional[Tuple[int, int]] = None,
+    ) -> Tensor:
         """MIL patch probabilities as a spatial grid (B, H_p, W_p).
 
         Bez gradientów — używane przez interpretacji i candidates.
-        Raises if model wasn't built with a MIL head.
+        Raises if model wasn't built with a MIL head. ``patch_grid``: see
+        ``get_patch_tokens``.
         """
         if not hasattr(self, "patch_head"):
             raise RuntimeError(
@@ -854,7 +920,7 @@ class OtolithModel(nn.Module):
             out = self.forward(image)
         probs = out["patch_probs"]                     # (B, N)
         B, N = probs.shape
-        H_p = W_p = int(N ** 0.5)
+        H_p, W_p = _resolve_patch_grid(N, patch_grid)
         return probs.reshape(B, H_p, W_p)
 
     def get_density_probs(
@@ -863,6 +929,7 @@ class OtolithModel(nn.Module):
         polar_t: Optional[Tensor] = None,
         polar_theta: Optional[Tensor] = None,
         polar_valid: Optional[Tensor] = None,
+        patch_grid: Optional[Tuple[int, int]] = None,
     ) -> Tensor:
         """Decoupled density map as a spatial grid (B, H_p, W_p). No gradients.
 
@@ -877,6 +944,12 @@ class OtolithModel(nn.Module):
         unrestricted, non-positional attention for this call only (documented, not a
         crash — see ``RadialAttentionDensityHead``'s docstring). Every other head type
         ignores them regardless.
+
+        ``patch_grid`` (optional, 02.09): explicit ``(H_p, W_p)`` — REQUIRED for a
+        non-square density branch (e.g. the dendrochronology-strip experiment's
+        rectangular strip, where ``N`` is generally not a perfect square) since the
+        old square-inference would either crash or, worse, silently reshape into the
+        wrong spatial layout. See ``_resolve_patch_grid``.
         """
         if not hasattr(self, "density_head"):
             raise RuntimeError(
@@ -888,7 +961,7 @@ class OtolithModel(nn.Module):
             )
         density = out["density"]                       # (B, N)
         B, N = density.shape
-        H_p = W_p = int(N ** 0.5)
+        H_p, W_p = _resolve_patch_grid(N, patch_grid)
         return density.reshape(B, H_p, W_p)
 
     # ------------------------------------------------------------------

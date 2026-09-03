@@ -575,7 +575,7 @@ def shift_axis_info(axis_info: dict, dx: int, dy: int) -> dict:
 
 def detect_axis(
     rgb: np.ndarray, seg_params: Optional[dict] = None, nucleus_method: str = "geometric",
-    axis_method: str = "ring_richness",
+    axis_method: str = "ring_richness", mask: Optional[np.ndarray] = None,
 ) -> Optional[dict]:
     """Run full pipeline: segment → centroid → axis terminus.
 
@@ -591,6 +591,12 @@ def detect_axis(
     ``"farthest"`` uses the older :func:`find_farthest_edge` — see module docstring and
     ``SegmentationConfig.axis_method``.
 
+    ``mask`` (optional, 02.09 — added for the strip-extraction path, ``src/strip_extraction.py``):
+    when given, skips ``segment_otolith`` entirely and uses this mask directly (e.g. one already
+    computed and cached by ``OtolithDataset`` via ``get_or_compute_mask``), avoiding a redundant
+    second segmentation pass over the same image. ``None`` (default) reproduces today's behaviour
+    exactly — every existing caller is unaffected.
+
     Returns:
         dict with keys:
           - ``mask``      : (H, W) uint8 mask
@@ -600,7 +606,8 @@ def detect_axis(
           - ``length_px`` : Euclidean axis length in pixels
         or ``None`` if any stage fails.
     """
-    mask = segment_otolith(rgb, **(seg_params or {}))
+    if mask is None:
+        mask = segment_otolith(rgb, **(seg_params or {}))
     if mask is None:
         return None
     centroid = resolve_centroid(rgb, mask, nucleus_method)

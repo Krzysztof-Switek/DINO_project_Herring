@@ -52,7 +52,6 @@ if str(DIAG_DIR) not in sys.path:
     sys.path.insert(0, str(DIAG_DIR))
 
 import json
-import math
 from typing import Optional
 
 import cv2
@@ -64,6 +63,7 @@ from PIL import Image as PILImage
 import expert_annotation_eval as ev
 import train_zegar_localization_head as base
 from src.otolith_axis import detect_axis, apply_background_mask
+from src.strip_extraction import canonicalizing_matrix as _canonicalizing_matrix
 from src.inference import load_model_from_checkpoint
 from src.model import EMBED_DIMS
 from scripts.run_pipeline import load_merged_config
@@ -73,13 +73,10 @@ OUTPUT_DIR = base.PROJECT_ROOT / "outputs" / "26.08_zegar_localization_head_cano
 # Only identity + vertical flip -- see module docstring for why horizontal flip is dropped here.
 _AUGMENTATIONS = [(False, False), (False, True)]
 
-
-def _canonicalizing_matrix(centroid: tuple[float, float], far_edge: tuple[float, float]) -> np.ndarray:
-    """2x3 affine that rotates around ``centroid`` so (far_edge - centroid) points along +x."""
-    cx, cy = centroid
-    fx, fy = far_edge
-    angle_deg = math.degrees(math.atan2(fy - cy, fx - cx))
-    return cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
+# _canonicalizing_matrix (02.09): promoted, formula unchanged, to src.strip_extraction.
+# canonicalizing_matrix — reused there by the dendrochronology-strip experiment instead of
+# duplicated. Imported above under the original private name so every call site below is
+# untouched.
 
 
 def build_dataset_canonical(model, ann: pd.DataFrame, seg_params: dict) -> dict:

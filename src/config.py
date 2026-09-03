@@ -142,6 +142,32 @@ class DataConfig(BaseModel):
     zegar_targets_csv: Optional[str] = None         # image_id,x,y — one row per annotated ring
     zegar_gaussian_sigma_patches: float = Field(1.2, gt=0.0)  # matches the diagnostic scripts' value
 
+    # Dendrochronology-strip localization experiment (02.09, plans and summaries/
+    # 02.09_wycinki_plan.md) — dual-branch input geometry. The age heads (CORAL/MIL) always
+    # keep reading the ordinary square `image` tensor above, UNCHANGED; when this is True the
+    # dataset ADDITIONALLY builds a second tensor (`image_strip`, src/strip_extraction.py) — a
+    # straightened rectangular crop along the (nucleus -> far_edge) reading axis, read by a
+    # SEPARATE backbone forward pass (see OtolithModel.forward's `density_image` param) that
+    # only the density head ever sees. False (default) = zero behaviour change: no second
+    # tensor is built, no extra segmentation/axis-finding cost. See the plan for the full
+    # rationale (isolating "does the strip geometry help localization" from "does it hurt age").
+    dual_branch_density: bool = False
+    # Length (nucleus->far_edge axis) and width (perpendicular, FIXED native pixels, never
+    # rescaled — the constant-diameter-drill-bit analogy) of the strip, in pixels; both must be
+    # divisible by patch_size when dual_branch_density=True (validated below / at OtolithConfig
+    # level). strip_length_px default (1330 = 95 patches) is NOT a guess: derived from real
+    # ZEGAR inter-ring spacing (scripts/diagnostics/analyze_zegar_ring_spacing.py, 02.09, p1
+    # percentile of 335 measured gaps) so that even a near-worst-case real pair of consecutive
+    # rings lands on separate patches — see outputs/02.09_zegar_ring_spacing/ for the raw data.
+    strip_length_px: int = Field(1330, ge=14)
+    strip_width_px: int = Field(98, ge=14)
+    # None -> "<project_root>/data/strips_cache/{strip_length_px}x{strip_width_px}" (see
+    # src/dataset.py's strip-branch loading path). Dimension-specific subdirectory, not just a
+    # filename, so changing strip_length_px/strip_width_px between configs can never silently
+    # serve a stale, wrong-shape cached strip — same lesson as the documented mask-cache
+    # collision bug (scripts/diagnostics/expert_annotation_eval.py, 12.08).
+    strips_cache_dir: Optional[str] = None
+
     @field_validator("image_size")
     @classmethod
     def image_size_divisible(cls, v: int) -> int:
@@ -158,6 +184,25 @@ class DataConfig(BaseModel):
                 f"image_size ({self.image_size}) must be divisible by "
                 f"patch_size ({self.patch_size})"
             )
+        # Strip dimensions only need to be patch-divisible when the strip branch is actually
+        # in use — inert otherwise (dual_branch_density=False), matching image_size's own
+        # "only checked when it matters" precedent above.
+        if self.dual_branch_density:
+            if self.strip_length_px % self.patch_size != 0:
+                raise ValueError(
+                    f"strip_length_px ({self.strip_length_px}) must be divisible by "
+                    f"patch_size ({self.patch_size})"
+                )
+            if self.strip_width_px % self.patch_size != 0:
+                raise ValueError(
+                    f"strip_width_px ({self.strip_width_px}) must be divisible by "
+                    f"patch_size ({self.patch_size})"
+                )
+            if not self.mask_background:
+                raise ValueError(
+                    "data.dual_branch_density=True requires data.mask_background=True "
+                    "(the strip is built from the masked image — see src/strip_extraction.py)"
+                )
         return self
 
 
@@ -390,6 +435,19 @@ class OtolithConfig(BaseModel):
             raise ValueError(
                 f"candidates.density_image_size ({size}) must be divisible by "
                 f"data.patch_size ({self.data.patch_size})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def dual_branch_density_requires_density_head(self) -> "OtolithConfig":
+        # data.dual_branch_density=True builds a second (strip) tensor purely to feed the
+        # density head (OtolithModel.forward's density_image param) — meaningless without one.
+        # Cross-config (data + model), so it lives here rather than inside DataConfig's own
+        # validator, mirroring density_image_size_divisible's precedent above.
+        if self.data.dual_branch_density and not self.model.use_density_head:
+            raise ValueError(
+                "data.dual_branch_density=True requires model.use_density_head=True "
+                "(the strip branch exists only to feed the density head)"
             )
         return self
 

@@ -309,6 +309,57 @@ def test_get_cls_and_patches_shapes():
 
 
 # ---------------------------------------------------------------------------
+# Explicit patch_grid (02.09, dendrochronology-strip experiment) — non-square inputs
+# ---------------------------------------------------------------------------
+
+def test_get_patch_tokens_explicit_patch_grid_non_square():
+    model = _make_model()
+    images = torch.randn(2, 3, 28, 56)   # H_p=2, W_p=4, N=8 — not a perfect square
+    patches = model.get_patch_tokens(images, patch_grid=(2, 4))
+    assert patches.shape == (2, 2, 4, 64)
+
+
+def test_get_patch_tokens_omitted_patch_grid_unchanged_for_square_input():
+    """Backward-compat pin: calling without patch_grid on a square-N input reproduces
+    today's inferred-square behaviour exactly."""
+    model = _make_model()
+    images = torch.randn(2, 3, 56, 56)
+    a = model.get_patch_tokens(images)
+    b = model.get_patch_tokens(images, patch_grid=None)
+    assert torch.equal(a, b)
+    assert a.shape == (2, 4, 4, 64)
+
+
+def test_get_patch_tokens_non_square_without_patch_grid_raises_or_wrong_today():
+    """Regression pin for the PRE-FIX crash this new param exists to fix: a genuinely
+    non-square, non-perfect-square N with no explicit patch_grid crashes on reshape
+    (int(8**0.5)=2, 2*2=4 != 8) — keeps the fix's necessity visible in the suite."""
+    model = _make_model()
+    images = torch.randn(2, 3, 28, 56)   # N=8, not a perfect square
+    with pytest.raises(RuntimeError):
+        model.get_patch_tokens(images)
+
+
+def test_get_cls_and_patches_explicit_patch_grid_non_square():
+    model = _make_model()
+    images = torch.randn(2, 3, 28, 56)
+    cls, patches = model.get_cls_and_patches(images, patch_grid=(2, 4))
+    assert cls.shape == (2, 64)
+    assert patches.shape == (2, 2, 4, 64)
+
+
+def test_resolve_patch_grid_mismatch_raises_clear_error():
+    from src.model import _resolve_patch_grid
+    with pytest.raises(ValueError):
+        _resolve_patch_grid(8, (3, 3))   # 3*3=9 != 8
+
+
+def test_resolve_patch_grid_none_infers_square():
+    from src.model import _resolve_patch_grid
+    assert _resolve_patch_grid(16, None) == (4, 4)
+
+
+# ---------------------------------------------------------------------------
 # MIL head (weakly supervised localisation)
 # ---------------------------------------------------------------------------
 
@@ -416,6 +467,13 @@ def test_get_patch_probs_shape():
     assert ((probs >= 0) & (probs <= 1)).all()
 
 
+def test_get_patch_probs_explicit_patch_grid_non_square():
+    model = _make_model_with_head("mil")
+    images = torch.randn(1, 3, 28, 56)   # N=8, not a perfect square
+    probs = model.get_patch_probs(images, patch_grid=(2, 4))
+    assert probs.shape == (1, 2, 4)
+
+
 # ---------------------------------------------------------------------------
 # Kierunek B — decoupled density-map head (13.07)
 # ---------------------------------------------------------------------------
@@ -494,6 +552,59 @@ def test_density_head_stop_gradient_blocks_backbone():
                   for p in model.density_head.parameters())
     assert not bb_grad, "density loss leaked gradient into the backbone (stop-gradient broken)"
     assert dh_grad, "density head received no gradient"
+
+
+# ---------------------------------------------------------------------------
+# Dual-branch forward (02.09, dendrochronology-strip experiment) — density_image
+# ---------------------------------------------------------------------------
+
+def test_forward_density_image_none_bit_identical_to_default():
+    """Regression pin: omitting density_image vs explicitly passing None must be
+    identical, and both reproduce today's single-pass (.detach()) behaviour — the
+    "zero behaviour change for every existing caller" guarantee this param depends on.
+    """
+    model = _make_density_model()
+    images = torch.randn(2, 3, 56, 56)
+    out_default = model(images)
+    out_explicit_none = model(images, density_image=None)
+    assert torch.equal(out_default["density"], out_explicit_none["density"])
+    assert torch.equal(out_default["coral_logits"], out_explicit_none["coral_logits"])
+
+
+def test_forward_density_image_reads_separate_pass():
+    """density_image (when given) must shape the density output by ITS OWN patch
+    count, not image's — proof the density head reads a genuinely separate backbone
+    forward pass, not the age heads' own patches."""
+    model = _make_density_model()
+    images = torch.randn(2, 3, 56, 56)           # N = 4*4 = 16
+    density_images = torch.randn(2, 3, 28, 70)   # N = 2*5 = 10, strip-shaped (not square)
+    out = model(images, density_image=density_images)
+    assert out["density"].shape == (2, 10)
+
+
+def test_forward_density_image_path_blocks_backbone_gradient_entirely():
+    """CRITICAL (02.09, dual-branch): the density_image forward pass runs under
+    torch.no_grad() — no backward graph is built for it at all, a stronger guarantee
+    than the .detach() path above. Backbone must receive ZERO gradient."""
+    model = _make_density_model()
+    images = torch.randn(2, 3, 56, 56)
+    density_images = torch.randn(2, 3, 28, 70)
+    out = model(images, density_image=density_images)
+    model.zero_grad(set_to_none=True)
+    out["density"].sum().backward()
+    bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in model.backbone.parameters())
+    dh_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in model.density_head.parameters())
+    assert not bb_grad, "density_image path leaked gradient into the backbone"
+    assert dh_grad, "density head received no gradient"
+
+
+def test_get_density_probs_explicit_patch_grid_non_square():
+    model = _make_density_model()
+    images = torch.randn(2, 3, 28, 70)   # N=10, not a perfect square
+    density = model.get_density_probs(images, patch_grid=(2, 5))
+    assert density.shape == (2, 2, 5)
 
 
 def test_density_tv_prior_executes_and_nonnegative():
@@ -896,22 +1007,34 @@ def test_density_concentricity_loss_zero_when_no_valid_patches():
 
 def test_density_concentricity_loss_stop_gradient_safe():
     """CRITICAL: like density_count_loss, this must never update the backbone —
-    it is computed on the same STOP-GRADIENT density tensor."""
+    it is computed on the same STOP-GRADIENT density tensor.
+
+    Wrapped in _isolated_rng + a pinned seed (02.09): this test was observed flaky
+    (~2/5 runs, and ~half of a 20-seed sweep) without a fixed seed — depending on the
+    density_head's random init, the concentricity loss can legitimately land on a
+    zero-gradient configuration for this tiny mlp head (same degenerate-init failure
+    mode _isolated_rng's own docstring already documents for the attention/
+    radial_attention head variants, just never previously pinned down for this plain-
+    mlp one). seed=1 verified non-degenerate; _isolated_rng still wraps it so pinning
+    this test's RNG draws doesn't shift what any LATER test in the file gets.
+    """
     from src.model import density_concentricity_loss
 
-    model = _make_density_model()
-    out = model(torch.randn(2, 3, 56, 56))
-    polar_t = torch.rand(2, 16)
-    polar_valid = torch.ones(2, 16, dtype=torch.bool)
-    loss = density_concentricity_loss(out["density"], polar_t, polar_valid, n_radial_bins=4)
-    model.zero_grad(set_to_none=True)
-    loss.backward()
-    bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0
-                  for p in model.backbone.parameters())
-    dh_grad = any(p.grad is not None and p.grad.abs().sum() > 0
-                  for p in model.density_head.parameters())
-    assert not bb_grad, "concentricity loss leaked gradient into the backbone"
-    assert dh_grad, "density head received no gradient"
+    with _isolated_rng():
+        torch.manual_seed(1)
+        model = _make_density_model()
+        out = model(torch.randn(2, 3, 56, 56))
+        polar_t = torch.rand(2, 16)
+        polar_valid = torch.ones(2, 16, dtype=torch.bool)
+        loss = density_concentricity_loss(out["density"], polar_t, polar_valid, n_radial_bins=4)
+        model.zero_grad(set_to_none=True)
+        loss.backward()
+        bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                      for p in model.backbone.parameters())
+        dh_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                      for p in model.density_head.parameters())
+        assert not bb_grad, "concentricity loss leaked gradient into the backbone"
+        assert dh_grad, "density head received no gradient"
 
 
 # ---------------------------------------------------------------------------

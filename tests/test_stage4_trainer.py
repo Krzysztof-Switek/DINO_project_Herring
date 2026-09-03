@@ -46,13 +46,18 @@ class _MockDinoBackbone(nn.Module):
 
 class _SyntheticDataset(Dataset):
     def __init__(self, n: int = 8, num_age_classes: int = 10, image_size: int = 56,
-                with_polar: bool = False, with_zegar: bool = False, zegar_every: int = 2):
+                with_polar: bool = False, with_zegar: bool = False, zegar_every: int = 2,
+                with_strip: bool = False):
         self.n = n
         self.num_age_classes = num_age_classes
         self.image_size = image_size
         self.with_polar = with_polar
         self.with_zegar = with_zegar
         self.zegar_every = zegar_every   # every Nth sample carries a real target
+        # 02.09, dendrochronology-strip experiment: mirrors OtolithDataset's
+        # dual_branch_density="image_strip" key (non-square shape, on purpose — the
+        # whole point is it's NOT the same grid as "image").
+        self.with_strip = with_strip
 
     def __len__(self) -> int:
         return self.n
@@ -79,6 +84,8 @@ class _SyntheticDataset(Dataset):
                 heat[0, 0] = 1.0
             item["zegar_heatmap"] = heat
             item["has_zegar_target"] = torch.tensor(has_target, dtype=torch.bool)
+        if self.with_strip:
+            item["image_strip"] = torch.randn(3, 14, 28)   # deliberately non-square
         return item
 
 
@@ -104,9 +111,9 @@ def _make_cfg(tmp_path: Path, epochs: int = 2, freeze_epochs: int = 0,
 
 
 def _make_loader(n: int = 8, batch_size: int = 4, with_polar: bool = False,
-                 with_zegar: bool = False) -> DataLoader:
+                 with_zegar: bool = False, with_strip: bool = False) -> DataLoader:
     ds = _SyntheticDataset(n=n, num_age_classes=10, image_size=56, with_polar=with_polar,
-                           with_zegar=with_zegar)
+                           with_zegar=with_zegar, with_strip=with_strip)
     return DataLoader(ds, batch_size=batch_size, shuffle=False)
 
 
@@ -767,6 +774,80 @@ def test_zegar_position_weight_does_not_change_age_predictions(tmp_path):
     logits_on = _run(0.5)
     assert torch.allclose(logits_off, logits_on, atol=1e-6), \
         "zegar_position_weight changed age (CORAL) predictions — stop-gradient isolation broken"
+
+
+# ---------------------------------------------------------------------------
+# Dendrochronology-strip experiment (02.09) — image_strip -> density_image wiring
+# ---------------------------------------------------------------------------
+
+def test_train_one_epoch_routes_image_strip_to_density_image(tmp_path):
+    """batch["image_strip"] (only present when dual_branch_density=True) must reach
+    forward() as density_image during training."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+
+    captured = []
+    orig_forward = model.forward
+    def _spy_forward(*args, **kwargs):
+        captured.append(kwargs.get("density_image"))
+        return orig_forward(*args, **kwargs)
+    model.forward = _spy_forward
+
+    loader = _make_loader(n=4, with_strip=True)
+    trainer = Trainer(cfg, model, loader, None)
+    trainer.train_one_epoch()
+
+    assert len(captured) > 0
+    assert all(t is not None for t in captured)
+    assert all(t.shape[-2:] == (14, 28) for t in captured)
+
+
+def test_validate_routes_image_strip_to_density_image(tmp_path):
+    """Same wiring, validate() path."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+
+    captured = []
+    orig_forward = model.forward
+    def _spy_forward(*args, **kwargs):
+        captured.append(kwargs.get("density_image"))
+        return orig_forward(*args, **kwargs)
+    model.forward = _spy_forward
+
+    loader = _make_loader(n=4, with_strip=True)
+    trainer = Trainer(cfg, model, loader, loader)
+    trainer.validate()
+
+    assert len(captured) > 0
+    assert all(t is not None for t in captured)
+    assert all(t.shape[-2:] == (14, 28) for t in captured)
+
+
+def test_train_one_epoch_without_image_strip_passes_none(tmp_path):
+    """Regression pin: a batch with no "image_strip" key (dual_branch_density=False,
+    every existing config) must call forward() with density_image=None explicitly —
+    confirms .get() absence is handled, not silently mis-keyed."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    model = _make_model(cfg)
+
+    captured = []
+    orig_forward = model.forward
+    def _spy_forward(*args, **kwargs):
+        captured.append(kwargs.get("density_image"))
+        return orig_forward(*args, **kwargs)
+    model.forward = _spy_forward
+
+    loader = _make_loader(n=4)   # no with_strip
+    trainer = Trainer(cfg, model, loader, None)
+    trainer.train_one_epoch()
+
+    assert len(captured) > 0
+    assert all(t is None for t in captured)
 
 
 def test_fit_ema_selection_runs_and_saves_best(tmp_path):

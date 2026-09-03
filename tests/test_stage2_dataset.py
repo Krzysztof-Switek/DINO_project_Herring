@@ -816,3 +816,114 @@ def test_zegar_heatmap_flip_synced_with_image(zegar_semi_weak_data, tmp_path, mo
     # And explicitly NOT unchanged — pins down that some real transform happened,
     # not a no-op that would trivially "match" a wrong expectation.
     assert not np.allclose(hflipped["zegar_heatmap"].numpy(), baseline["zegar_heatmap"].numpy())
+
+
+# ---------------------------------------------------------------------------
+# Dendrochronology-strip experiment (02.09) — dual_branch_density
+# ---------------------------------------------------------------------------
+
+def _strip_cfg(tmp_path, strip_length_px: int = 140, strip_width_px: int = 42):
+    cfg = _make_cfg()
+    cfg.data.image_size = 56
+    cfg.data.mask_background = True
+    cfg.data.mask_cache_dir = str(tmp_path / "masks_cache")
+    cfg.data.dual_branch_density = True
+    cfg.data.strip_length_px = strip_length_px
+    cfg.data.strip_width_px = strip_width_px
+    cfg.data.strips_cache_dir = str(tmp_path / "strips_cache")
+    cfg.model.use_density_head = True
+    return cfg
+
+
+def test_dual_branch_density_off_leaves_image_untouched(ellipse_data, tmp_path):
+    """dual_branch_density=False (default) must be a complete no-op: no image_strip key,
+    "image" itself unaffected — pins the plan's "one isolated variable" guarantee."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _make_cfg()
+    cfg.data.image_size = 56
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert "image_strip" not in item
+    assert item["image"].shape == (3, 56, 56)
+
+
+def test_dual_branch_density_adds_correctly_shaped_strip(ellipse_data, tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _strip_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert item["image"].shape == (3, 56, 56)                 # square (age) branch untouched
+    assert item["image_strip"].shape == (3, 42, 140)           # (3, strip_width_px, strip_length_px)
+
+
+def test_dual_branch_density_gracefully_falls_back_for_unsegmentable_image(dummy_data, tmp_path):
+    """dummy_data's images are flat solid colour — no foreground to segment. The strip
+    branch must fall back to a plain resize, never crash the dataset (same philosophy
+    as test_mask_background_gracefully_skips_unsegmentable_image)."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = dummy_data
+    cfg = _strip_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert item["image_strip"].shape == (3, 42, 140)
+
+
+def test_dual_branch_density_strip_cache_reused_on_second_access(tmp_path, monkeypatch):
+    """Second access to the same image must hit the on-disk strip cache, not recompute
+    the axis/warp (mirrors test_mask_background_cache_reused_on_second_access).
+
+    Builds its own split="test" image (rather than the ellipse_data fixture, which is
+    split="train") deliberately — the "train" transform pipeline applies a random
+    vertical flip per call, which would make two accesses differ regardless of caching.
+    """
+    import cv2
+    import numpy as np
+    from src.dataset import OtolithDataset
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    arr = np.full((200, 160, 3), 255, dtype=np.uint8)
+    cv2.ellipse(arr, (80, 100), (50, 80), 0, 0, 360, (40, 40, 40), -1)
+    name = "fish_ellipse.png"
+    Image.fromarray(arr).save(img_dir / name)
+    csv_path = tmp_path / "labels.csv"
+    pd.DataFrame([{"image_id": name, "age": 4, "split": "test"}]).to_csv(csv_path, index=False)
+
+    cfg = _strip_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "test", labels_csv=str(csv_path), image_dir=str(img_dir))
+    first = ds[0]["image_strip"]
+
+    def _boom(*a, **kw):
+        raise AssertionError("detect_axis should NOT be called on a strip-cache hit")
+    monkeypatch.setattr("src.dataset.detect_axis", _boom)
+
+    second = ds[0]["image_strip"]
+    assert torch.allclose(first, second)
+
+
+def test_build_transforms_strip_drops_horizontal_flip_only():
+    from src.dataset import build_transforms
+    tf = build_transforms(140, "train", include_flips=True, strip=True)
+    op_types = [type(op).__name__ for op in tf.transforms]
+    assert "RandomHorizontalFlip" not in op_types
+    assert "RandomVerticalFlip" in op_types
+    assert "Resize" not in op_types
+
+
+def test_dual_branch_density_age_ordinal_unaffected(ellipse_data, tmp_path):
+    """The strip branch must never touch age encoding — same age, same ordinal vector,
+    with or without dual_branch_density."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+
+    cfg_plain = _make_cfg()
+    cfg_plain.data.image_size = 56
+    ds_plain = OtolithDataset(cfg_plain, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    cfg_strip = _strip_cfg(tmp_path)
+    ds_strip = OtolithDataset(cfg_strip, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    assert torch.equal(ds_plain[0]["age_ordinal"], ds_strip[0]["age_ordinal"])
+    assert ds_plain[0]["age"].item() == ds_strip[0]["age"].item()

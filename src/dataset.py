@@ -13,8 +13,9 @@ from torchvision import transforms
 
 from scripts.prepare_labels import extract_campaign_token
 from src.config import OtolithConfig
-from src.otolith_axis import (apply_background_mask, compute_polar_grid, get_or_compute_mask,
-                              mask_bbox, resolve_centroid)
+from src.otolith_axis import (apply_background_mask, compute_polar_grid, detect_axis,
+                              get_or_compute_mask, mask_bbox, resolve_centroid)
+from src.strip_extraction import get_or_compute_strip, load_strip
 
 REQUIRED_COLUMNS = {"image_id", "age", "split"}
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
@@ -68,25 +69,42 @@ def decode_age_ordinal(logits: torch.Tensor) -> torch.Tensor:
 # Transforms
 # ---------------------------------------------------------------------------
 
-def build_transforms(image_size: int, split: str, include_flips: bool = True) -> transforms.Compose:
+def build_transforms(
+    image_size: int, split: str, include_flips: bool = True, strip: bool = False,
+) -> transforms.Compose:
     """``include_flips=False`` drops RandomHorizontalFlip/RandomVerticalFlip from the
     train pipeline — used when a caller needs to apply an IDENTICAL random flip
     decision to a second, non-image tensor (e.g. the E9 polar-coordinate grid,
     ``OtolithDataset._load_image_with_polar``) that this Compose has no hook to
     synchronise with, since torchvision's random transforms make their own private
-    random choice with no way to inspect or replay it."""
+    random choice with no way to inspect or replay it.
+
+    ``strip=True`` (02.09, dendrochronology-strip experiment — see
+    ``OtolithDataset._load_strip_image``): the input is already the exact target size
+    (``src.strip_extraction.extract_strip``'s output), so ``Resize`` is skipped —
+    ``image_size`` is then unused. ``RandomHorizontalFlip`` is also unconditionally
+    dropped regardless of ``include_flips`` — flipping along the strip's length axis
+    would reverse the just-canonicalized (nucleus -> far_edge) reading direction, the
+    same problem (and fix) already documented in
+    ``scripts/diagnostics/train_zegar_localization_head_canonical.py``.
+    ``RandomVerticalFlip`` (mirrors across the width axis, meaning-preserving) is
+    unaffected by ``strip`` and needs no cross-tensor sync here (unlike the polar-grid
+    case above) — the strip branch has no second geometric tensor riding along with it.
+    """
+    resize_op = [] if strip else [transforms.Resize((image_size, image_size))]
     if split == "train":
-        ops = [transforms.Resize((image_size, image_size))]
+        ops = list(resize_op)
         if include_flips:
-            ops += [transforms.RandomHorizontalFlip(), transforms.RandomVerticalFlip()]
+            if not strip:
+                ops.append(transforms.RandomHorizontalFlip())
+            ops.append(transforms.RandomVerticalFlip())
         ops += [
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
             transforms.ToTensor(),
             transforms.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
         ]
         return transforms.Compose(ops)
-    return transforms.Compose([
-        transforms.Resize((image_size, image_size)),
+    return transforms.Compose(resize_op + [
         transforms.ToTensor(),
         transforms.Normalize(_IMAGENET_MEAN, _IMAGENET_STD),
     ])
@@ -126,6 +144,13 @@ class OtolithDataset(Dataset):
                            ZEGAR-annotated images (see cfg.data.zegar_* fields)
         has_zegar_target : BoolTensor ()          — True iff zegar_heatmap is real
         metadata         : FloatTensor (M,)       — only if use_metadata=True
+        image_strip      : FloatTensor (3, Wp, Lp) — straightened nucleus->far_edge
+                           crop (02.09, dendrochronology-strip experiment, see
+                           src/strip_extraction.py); only present when
+                           cfg.data.dual_branch_density=True. Fed to the density head
+                           via a SEPARATE backbone forward pass (OtolithModel.forward's
+                           density_image param) — the age (CORAL/MIL) heads never see
+                           this tensor, only the ordinary square "image" above.
     """
 
     def __init__(
@@ -226,6 +251,28 @@ class OtolithDataset(Dataset):
         )
         self.transform = transform or build_transforms(
             cfg.data.image_size, split, include_flips=not self._need_polar)
+
+        # Dendrochronology-strip experiment (02.09, plans and summaries/02.09_wycinki_plan.md):
+        # dual_branch_density builds a SECOND tensor per sample (image_strip) for the density
+        # head, via a straightened crop along the reading axis — the age heads keep reading
+        # "image" above, completely unaffected. False (default) = zero extra cost, mirrors
+        # every other opt-in field in this class.
+        self.dual_branch_density = cfg.data.dual_branch_density
+        self.strips_cache_dir: Optional[Path] = None
+        self.strip_transform: Optional[transforms.Compose] = None
+        if self.dual_branch_density:
+            base_strips_dir = (Path(cfg.data.strips_cache_dir) if cfg.data.strips_cache_dir
+                               else root / "data" / "strips_cache")
+            # Dimension-specific subdirectory (not just filename) so changing
+            # strip_length_px/strip_width_px between configs can never silently serve a
+            # stale, wrong-shape cached strip — same lesson as the documented mask-cache
+            # collision bug (scripts/diagnostics/expert_annotation_eval.py, 12.08).
+            self.strips_cache_dir = (
+                base_strips_dir / f"{cfg.data.strip_length_px}x{cfg.data.strip_width_px}"
+            )
+            self.strips_cache_dir.mkdir(parents=True, exist_ok=True)
+            self.strip_transform = build_transforms(
+                cfg.data.strip_length_px, split, include_flips=True, strip=True)
 
     # ------------------------------------------------------------------
     # Demo mode — limit dataset right at the source
@@ -335,6 +382,9 @@ class OtolithDataset(Dataset):
 
         if self.use_metadata and self.metadata_cols:
             sample["metadata"] = self._encode_metadata(row)
+
+        if self.dual_branch_density:
+            sample["image_strip"] = self._load_strip_image(image_id)
 
         return sample
 
@@ -491,6 +541,59 @@ class OtolithDataset(Dataset):
         if mask is None:
             return image
         return Image.fromarray(apply_background_mask(rgb, mask))
+
+    def _load_strip_image(self, image_id: str) -> torch.Tensor:
+        """Build the density branch's second input (02.09, dendrochronology-strip
+        experiment): a straightened rectangular crop along the (nucleus -> far_edge)
+        reading axis, ``src.strip_extraction.get_or_compute_strip``.
+
+        Checks the strip cache FIRST, before touching the raw photo at all — unlike
+        the mask cache (whose caller always needs the raw pixels regardless, to draw
+        the mask onto them), a cache-hit strip needs no raw-image load, no
+        segmentation, no axis-finding at all. Only on a cache miss does this load the
+        raw photo and pay the (documented, first-epoch-dominant) segmentation +
+        ``find_reading_edge`` cost. Degrades gracefully — a plain anisotropic resize of
+        the whole raw photo — when segmentation or axis-finding fails, the same "never
+        crash training on a bad photo" philosophy as ``_mask_background``/
+        ``_load_image_with_polar`` elsewhere in this module.
+        """
+        strip_length_px = self.cfg.data.strip_length_px
+        strip_width_px = self.cfg.data.strip_width_px
+        strip_cache_path = self.strips_cache_dir / f"{Path(image_id).stem}_strip.png"
+
+        cached = load_strip(strip_cache_path)
+        if cached is not None and cached.shape[:2] == (strip_width_px, strip_length_px):
+            return self.strip_transform(Image.fromarray(cached))
+
+        img_dir = self._image_dir_for(image_id)
+        path = img_dir / image_id
+        if not path.exists():
+            for ext in IMAGE_EXTENSIONS:
+                candidate = img_dir / (image_id + ext)
+                if candidate.exists():
+                    path = candidate
+                    break
+        image = Image.open(path).convert("RGB")
+        rgb = np.array(image, dtype=np.uint8)
+
+        mask_cache_path = self.mask_cache_dir / f"{Path(image_id).stem}_mask.png"
+        mask = get_or_compute_mask(rgb, mask_cache_path, seg_params=self.cfg.segmentation.as_params())
+        axis_info = None
+        if mask is not None:
+            axis_info = detect_axis(
+                rgb, seg_params=self.cfg.segmentation.as_params(),
+                nucleus_method=self.cfg.segmentation.nucleus_method,
+                axis_method=self.cfg.segmentation.axis_method,
+                mask=mask,
+            )
+        if mask is None or axis_info is None:
+            fallback = Image.fromarray(rgb).resize(
+                (strip_length_px, strip_width_px), Image.BILINEAR)
+            return self.strip_transform(fallback)
+
+        strip = get_or_compute_strip(
+            rgb, mask, axis_info, strip_cache_path, strip_length_px, strip_width_px)
+        return self.strip_transform(Image.fromarray(strip))
 
     # ------------------------------------------------------------------
     # Metadata encoding

@@ -68,6 +68,54 @@ def test_density_image_size_must_be_divisible_by_patch_size() -> None:
     OtolithConfig(candidates={"density_image_size": None})
 
 
+def test_dual_branch_density_default_is_off() -> None:
+    """02.09: dendrochronology-strip experiment — dual_branch_density defaults False, zero
+    behaviour change for every existing config."""
+    from src.config import get_default_config
+    cfg = get_default_config()
+    assert cfg.data.dual_branch_density is False
+
+
+def test_dual_branch_density_requires_mask_background() -> None:
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_density": True, "mask_background": False},
+                      model={"use_density_head": True})
+    # with mask_background=True it's valid (given use_density_head too)
+    OtolithConfig(data={"dual_branch_density": True, "mask_background": True},
+                  model={"use_density_head": True})
+
+
+def test_dual_branch_density_requires_density_head() -> None:
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_density": True, "mask_background": True},
+                      model={"use_density_head": False})
+
+
+def test_strip_dims_must_be_divisible_only_when_dual_branch_enabled() -> None:
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    # dual_branch_density=False: bad strip dims are inert, must NOT raise.
+    OtolithConfig(data={"dual_branch_density": False, "strip_length_px": 1331,
+                        "strip_width_px": 99})
+    # dual_branch_density=True: same bad dims now DO raise.
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_density": True, "mask_background": True,
+                            "strip_length_px": 1331, "strip_width_px": 98},
+                      model={"use_density_head": True})
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_density": True, "mask_background": True,
+                            "strip_length_px": 1330, "strip_width_px": 99},
+                      model={"use_density_head": True})
+    # divisible values succeed
+    OtolithConfig(data={"dual_branch_density": True, "mask_background": True,
+                        "strip_length_px": 1330, "strip_width_px": 98},
+                  model={"use_density_head": True})
+
+
 def test_entrypoint_info_mode(tmp_path) -> None:
     from src.entrypoint import run
     code = run(["--config", str(CONFIG_PATH), "--mode", "info"])

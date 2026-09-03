@@ -242,6 +242,29 @@ def match_t_values(t_a: list[float], t_b: list[float], max_gap: float):
     return pairs, unmatched_a, unmatched_b
 
 
+def axis_dist(t_x: list[float], t_gt: list[float], length_px: float) -> Optional[float]:
+    """Mean nearest-GT-``t`` distance, scaled to pixels along the axis.
+
+    For each position in ``t_x``, finds its closest match in ``t_gt`` (no matching/
+    pairing — plain nearest-neighbour, asymmetric, no penalty for a missed GT ring),
+    scales the gap by ``length_px``, and averages over ``t_x``. This is the exact
+    metric behind every headline localisation number this project has ever reported
+    (Run N 22.8px, the human noise floor, etc.).
+
+    Promoted (02.09) from a private closure inside ``main()`` — previously named
+    ``_axis_dist`` and closing over a per-image ``axis_info`` — to a plain function
+    taking ``length_px`` explicitly, so ``expert_annotation_eval_strip.py`` (the
+    dendrochronology-strip experiment's ZEGAR scoring script) can reuse the EXACT
+    same metric definition instead of re-implementing it a third time. Zero
+    behaviour change for this script's own ``main()``, which now just passes
+    ``axis_info["length_px"]`` explicitly at each call site.
+    """
+    if not t_x or not t_gt:
+        return None
+    d = np.abs(np.asarray(t_x)[:, None] - np.asarray(t_gt)[None, :]) * length_px
+    return float(d.min(axis=1).mean())
+
+
 def mean_nn_distance(pts_a: list[tuple[float, float]], pts_b: list[tuple[float, float]]) -> Optional[float]:
     """Mean nearest-neighbour distance from each point in ``pts_a`` to its closest point in
     ``pts_b`` — same definition as run_pipeline.py's ``_mean_dist`` closure (unimportable, it's
@@ -532,16 +555,10 @@ def main() -> None:
         t_model = [point_to_axis_t(x, y, axis_info) for x, y in final_pts]
         t_classical = [point_to_axis_t(x, y, axis_info) for x, y in classical_pts]
 
-        def _axis_dist(t_x, t_gt):
-            if not t_x or not t_gt:
-                return None
-            length = axis_info["length_px"]
-            d = np.abs(np.asarray(t_x)[:, None] - np.asarray(t_gt)[None, :]) * length
-            return float(d.min(axis=1).mean())
-
-        model_vs_gt_axis = _axis_dist(t_model, gt_t)
-        classical_vs_gt_axis = _axis_dist(t_classical, gt_t)
-        kk_vs_ss_axis = _axis_dist(t_kk, t_ss)
+        length_px = axis_info["length_px"]
+        model_vs_gt_axis = axis_dist(t_model, gt_t, length_px)
+        classical_vs_gt_axis = axis_dist(t_classical, gt_t, length_px)
+        kk_vs_ss_axis = axis_dist(t_kk, t_ss, length_px)
 
         model_vs_gt_raw = mean_nn_distance(final_pts, xy_kk + xy_ss) if final_pts else None
         kk_vs_ss_raw = mean_nn_distance(xy_kk, xy_ss)
