@@ -424,7 +424,7 @@ def find_farthest_edge(
     return int(round(fx)), int(round(fy))
 
 
-def find_reading_edge(
+def find_reading_edge_candidates(
     rgb: np.ndarray,
     mask: np.ndarray,
     centroid: tuple[int, int],
@@ -434,8 +434,12 @@ def find_reading_edge(
     min_distance: int = 2,
     prominence: float = 0.03,
     fallback_direction: str = "down",
-) -> Optional[tuple[int, int]]:
-    """Contour point, near-opposite the tail, with the richest visible ring structure.
+    k: int = 1,
+    min_angle_sep_deg: float = 8.0,
+) -> list[tuple[int, int]]:
+    """Up to ``k`` candidate reading-edge points, near-opposite the tail, ranked by
+    ring-richness (03.09, multi-wycinek experiment — plans and summaries/
+    03.09_multi_wycinek_plan.md).
 
     ``find_farthest_edge``'s pure-geometry heuristic reliably locks onto a thin,
     ring-free spur/tail rather than the broad, ringed body — see the module docstring
@@ -451,25 +455,34 @@ def find_reading_edge(
 
     So: first locate the tail via :func:`find_farthest_edge`, then search only within
     ``cone_deg`` of the direction exactly opposite it, scoring each candidate ray by
-    how many intensity peaks (candidate growth rings) its profile shows — the
-    ring-richness signal still matters for picking the precise angle within that
-    cone, just no longer has to disambiguate between unrelated lobes. Ties broken by
-    total peak prominence, then by ray length.
+    how many intensity peaks (candidate growth rings) its profile shows. Candidates
+    are ranked by (peak count, total peak prominence, ray length) — the same ordering
+    ``find_reading_edge`` used to pick a single winner — then selected greedily with a
+    minimum angular separation of ``min_angle_sep_deg`` between any two returned
+    points (non-max suppression, the same pattern already used by
+    ``train_zegar_localization_head.decode_topk_peaks``/``ring_extraction._cluster_by_
+    radius``). Without this, "k best" would in practice mean k near-identical rays a
+    few degrees apart rather than k meaningfully different directions.
 
-    Falls back to ``find_farthest_edge(mask, centroid, direction=fallback_direction)``
-    when the contour/tail can't be found or every candidate ray is featureless (e.g. a
-    uniform synthetic test image) — never raises.
+    Returns fewer than ``k`` points when fewer candidates clear the separation filter
+    or the contour is small. Falls back to a single-element list containing
+    ``find_farthest_edge(mask, centroid, direction=fallback_direction)`` when the
+    contour/tail can't be found or every candidate ray is featureless (e.g. a uniform
+    synthetic test image) — never raises. Returns ``[]`` only when even that fallback
+    fails (e.g. an empty mask).
     """
     contour = _largest_contour(mask)
     if contour is None:
-        return None
+        return []
     pts = contour.squeeze(axis=1).astype(np.float32)
     if pts.ndim != 2 or len(pts) == 0:
-        return find_farthest_edge(mask, centroid, direction=fallback_direction)
+        fb = find_farthest_edge(mask, centroid, direction=fallback_direction)
+        return [fb] if fb is not None else []
 
     tail = find_farthest_edge(mask, centroid, direction="any")
     if tail is None:
-        return find_farthest_edge(mask, centroid, direction=fallback_direction)
+        fb = find_farthest_edge(mask, centroid, direction=fallback_direction)
+        return [fb] if fb is not None else []
 
     gray = rgb.mean(axis=2).astype(np.float32) if rgb.ndim == 3 else rgb.astype(np.float32)
     H, W = gray.shape[:2]
@@ -478,10 +491,7 @@ def find_reading_edge(
     center_angle = np.arctan2(tail[1] - cy, tail[0] - cx) + np.pi     # opposite the tail
     cone = np.radians(cone_deg)
 
-    best_edge: Optional[tuple[int, int]] = None
-    best_score = -1
-    best_prominence = -1.0
-    best_length = -1.0
+    candidates: list[dict] = []
     for a in np.linspace(center_angle - cone, center_angle + cone, n_angles):
         # Nearest contour point to this ray's angle (contour is not evenly sampled by
         # angle, so pick the closest match rather than assuming an index correspondence).
@@ -505,21 +515,53 @@ def find_reading_edge(
 
         peak_idx, props = find_peaks(norm, distance=max(1, min_distance), prominence=prominence)
         score = int(len(peak_idx))
-        total_prominence = float(props["prominences"].sum()) if score else 0.0
-        better = (
-            score > best_score
-            or (score == best_score and total_prominence > best_prominence)
-            or (score == best_score and total_prominence == best_prominence and length > best_length)
-        )
-        if better:
-            best_edge = (int(round(ex)), int(round(ey)))
-            best_score = score
-            best_prominence = total_prominence
-            best_length = length
+        if score <= 0:
+            continue
+        total_prominence = float(props["prominences"].sum())
+        candidates.append({
+            "angle": float(a), "point": (int(round(ex)), int(round(ey))),
+            "score": score, "prominence": total_prominence, "length": length,
+        })
 
-    if best_edge is None or best_score <= 0:
-        return find_farthest_edge(mask, centroid, direction=fallback_direction)
-    return best_edge
+    if not candidates:
+        fb = find_farthest_edge(mask, centroid, direction=fallback_direction)
+        return [fb] if fb is not None else []
+
+    candidates.sort(key=lambda c: (c["score"], c["prominence"], c["length"]), reverse=True)
+
+    min_sep = np.radians(min_angle_sep_deg)
+    chosen: list[dict] = []
+    for c in candidates:
+        if all(abs(np.angle(np.exp(1j * (c["angle"] - o["angle"])))) >= min_sep for o in chosen):
+            chosen.append(c)
+        if len(chosen) >= k:
+            break
+
+    return [c["point"] for c in chosen]
+
+
+def find_reading_edge(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    centroid: tuple[int, int],
+    cone_deg: float = 60.0,
+    n_angles: int = 41,
+    n_samples: int = 96,
+    min_distance: int = 2,
+    prominence: float = 0.03,
+    fallback_direction: str = "down",
+) -> Optional[tuple[int, int]]:
+    """Single best reading-edge point — thin wrapper around
+    :func:`find_reading_edge_candidates` (``k=1``), kept as its own entry point since
+    it is the one every existing caller (``detect_axis`` and everything built on it)
+    uses. Behaviour is unchanged: same ranking, same fallback.
+    """
+    candidates = find_reading_edge_candidates(
+        rgb, mask, centroid, cone_deg=cone_deg, n_angles=n_angles, n_samples=n_samples,
+        min_distance=min_distance, prominence=prominence, fallback_direction=fallback_direction,
+        k=1, min_angle_sep_deg=0.0,
+    )
+    return candidates[0] if candidates else None
 
 
 def mask_bbox(mask: np.ndarray, pad_frac: float = 0.05) -> tuple[int, int, int, int]:
@@ -632,6 +674,61 @@ def detect_axis(
         "contour":   contour,
         "length_px": length,
     }
+
+
+def detect_axis_candidates(
+    rgb: np.ndarray, seg_params: Optional[dict] = None, nucleus_method: str = "geometric",
+    axis_method: str = "ring_richness", mask: Optional[np.ndarray] = None,
+    k: int = 1, min_angle_sep_deg: float = 8.0,
+) -> list[dict]:
+    """Like :func:`detect_axis`, but returns up to ``k`` candidate axis-info dicts
+    sharing the same ``mask``/``centroid``/``contour``, differing only in
+    ``far_edge``/``length_px`` — one per candidate reading direction from
+    :func:`find_reading_edge_candidates` (03.09, multi-wycinek experiment — see
+    ``plans and summaries/03.09_multi_wycinek_plan.md``).
+
+    Added as a genuinely NEW, separate function rather than folding ``k`` into
+    :func:`detect_axis` itself — that function is used extensively throughout the
+    codebase (dataset loading, report generation, every ZEGAR eval script) and this
+    keeps all of that surface area completely untouched.
+
+    ``axis_method="farthest"`` degenerates to a single candidate — the older
+    farthest-point heuristic has no multi-candidate variant; exploring several
+    directions is specifically the point of the ring-richness search.
+
+    Returns ``[]`` when segmentation/centroid resolution fails (mirrors
+    :func:`detect_axis` returning ``None`` on the same failures) — never raises.
+    """
+    if mask is None:
+        mask = segment_otolith(rgb, **(seg_params or {}))
+    if mask is None:
+        return []
+    centroid = resolve_centroid(rgb, mask, nucleus_method)
+    if centroid is None:
+        return []
+    contour = _largest_contour(mask)
+    if contour is None:
+        return []
+
+    if axis_method == "ring_richness":
+        edges = find_reading_edge_candidates(
+            rgb, mask, centroid, k=k, min_angle_sep_deg=min_angle_sep_deg,
+        )
+    else:
+        fb = find_farthest_edge(mask, centroid)
+        edges = [fb] if fb is not None else []
+    if not edges:
+        return []
+
+    cx, cy = centroid
+    out: list[dict] = []
+    for fx, fy in edges:
+        length = float(np.hypot(fx - cx, fy - cy))
+        out.append({
+            "mask": mask, "centroid": centroid, "far_edge": (fx, fy),
+            "contour": contour, "length_px": length,
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------

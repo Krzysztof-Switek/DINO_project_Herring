@@ -607,6 +607,89 @@ def test_get_density_probs_explicit_patch_grid_non_square():
     assert density.shape == (2, 2, 5)
 
 
+# ---------------------------------------------------------------------------
+# Multi-wycinek (03.09) — 5D density_image + select_density_candidate
+# ---------------------------------------------------------------------------
+
+def test_forward_multi_wycinek_5d_density_image_shape():
+    """density_image with an extra K dim (B,K,C,H,W) must produce density shaped
+    (B,K,N), not (B,N)."""
+    model = _make_density_model()
+    images = torch.randn(2, 3, 56, 56)
+    density_images = torch.randn(2, 4, 3, 28, 70)   # B=2, K=4, N=10 per candidate
+    out = model(images, density_image=density_images)
+    assert out["density"].shape == (2, 4, 10)
+    assert out["density_count"].shape == (2, 4)
+
+
+def test_forward_multi_wycinek_matches_per_candidate_single_pass():
+    """Batched 5D forward must give the SAME density values as calling forward()
+    once per candidate with a plain 4D density_image — confirms the flatten/
+    reshape round-trip doesn't scramble which output belongs to which candidate."""
+    model = _make_density_model()
+    model.eval()
+    images = torch.randn(2, 3, 56, 56)
+    k = 3
+    candidates = torch.randn(2, k, 3, 28, 70)
+
+    with torch.no_grad():
+        batched = model(images, density_image=candidates)["density"]      # (2,3,10)
+        for i in range(k):
+            single = model(images, density_image=candidates[:, i])["density"]  # (2,10)
+            assert torch.allclose(batched[:, i], single, atol=1e-6)
+
+
+def test_forward_multi_wycinek_blocks_backbone_gradient_entirely():
+    model = _make_density_model()
+    images = torch.randn(2, 3, 56, 56)
+    density_images = torch.randn(2, 3, 3, 28, 70)
+    out = model(images, density_image=density_images)
+    model.zero_grad(set_to_none=True)
+    out["density"].sum().backward()
+    bb_grad = any(p.grad is not None and p.grad.abs().sum() > 0
+                  for p in model.backbone.parameters())
+    assert not bb_grad, "multi-wycinek density_image path leaked gradient into the backbone"
+
+
+def test_forward_multi_wycinek_raises_for_non_mlp_head():
+    """5D density_image is only supported for density_head_type='mlp' — polar
+    tensors wouldn't broadcast across the K dimension for the other head types."""
+    with _isolated_rng():
+        model = _make_attention_density_model()
+        images = torch.randn(2, 3, 56, 56)
+        density_images = torch.randn(2, 3, 3, 56, 56)
+        with pytest.raises(NotImplementedError):
+            model(images, density_image=density_images)
+
+
+def test_select_density_candidate_picks_closest_count_match():
+    from src.model import select_density_candidate
+    # B=2, K=3, N=4. Candidate counts (sum over N): sample0 -> [1,2,3], sample1 -> [0,5,2]
+    density = torch.tensor([
+        [[0.25, 0.25, 0.25, 0.25],   # count=1.0
+         [0.5, 0.5, 0.5, 0.5],       # count=2.0
+         [0.75, 0.75, 0.75, 0.75]],  # count=3.0
+        [[0.0, 0.0, 0.0, 0.0],       # count=0.0
+         [1.0, 1.0, 1.5, 1.5],       # count=5.0
+         [0.5, 0.5, 0.5, 0.5]],      # count=2.0
+    ])
+    ages = torch.tensor([2.0, 2.0])
+    selected, idx = select_density_candidate(density, ages)
+    assert idx.tolist() == [1, 2]   # sample0: count=2 (idx1) closest to age=2; sample1: count=2 (idx2)
+    assert torch.equal(selected[0], density[0, 1])
+    assert torch.equal(selected[1], density[1, 2])
+
+
+def test_select_density_candidate_shapes():
+    from src.model import select_density_candidate
+    density = torch.rand(5, 4, 16)
+    ages = torch.randint(0, 10, (5,)).float()
+    selected, idx = select_density_candidate(density, ages)
+    assert selected.shape == (5, 16)
+    assert idx.shape == (5,)
+    assert idx.dtype == torch.long
+
+
 def test_density_tv_prior_executes_and_nonnegative():
     """P2: TV spatial-coherence prior path runs and only adds a non-negative term."""
     from src.model import density_count_loss

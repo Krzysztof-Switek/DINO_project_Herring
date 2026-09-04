@@ -927,3 +927,104 @@ def test_dual_branch_density_age_ordinal_unaffected(ellipse_data, tmp_path):
 
     assert torch.equal(ds_plain[0]["age_ordinal"], ds_strip[0]["age_ordinal"])
     assert ds_plain[0]["age"].item() == ds_strip[0]["age"].item()
+
+
+# ---------------------------------------------------------------------------
+# Multi-wycinek experiment (03.09) — multi_wycinek_k > 1
+# ---------------------------------------------------------------------------
+
+def _multi_strip_cfg(tmp_path, k: int, strip_length_px: int = 140, strip_width_px: int = 42):
+    cfg = _strip_cfg(tmp_path, strip_length_px=strip_length_px, strip_width_px=strip_width_px)
+    cfg.data.multi_wycinek_k = k
+    cfg.data.multi_wycinek_min_angle_sep_deg = 8.0
+    return cfg
+
+
+def test_multi_wycinek_k1_matches_single_strip_shape(ellipse_data, tmp_path):
+    """multi_wycinek_k=1 (default) must keep the single-wycinek (3, Wp, Lp) shape —
+    zero behaviour change relative to Track A."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _multi_strip_cfg(tmp_path, k=1)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert item["image_strip"].shape == (3, 42, 140)
+
+
+def test_multi_wycinek_k3_stacks_k_candidates(ellipse_data, tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _multi_strip_cfg(tmp_path, k=3)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert item["image_strip"].shape == (3, 3, 42, 140)   # (K, 3, Wp, Lp)
+
+
+def test_multi_wycinek_gracefully_falls_back_for_unsegmentable_image(dummy_data, tmp_path):
+    """dummy_data's images are flat solid colour — no candidates found. Must fall back
+    to K copies of the plain-resize fallback, never crash."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = dummy_data
+    cfg = _multi_strip_cfg(tmp_path, k=3)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert item["image_strip"].shape == (3, 3, 42, 140)
+
+
+def test_multi_wycinek_cache_reused_on_second_access(tmp_path, monkeypatch):
+    """Second access must hit the per-candidate strip cache, not recompute
+    detect_axis_candidates (mirrors the single-wycinek cache-reuse test)."""
+    import cv2
+    import numpy as np
+    from src.dataset import OtolithDataset
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    arr = np.full((200, 160, 3), 255, dtype=np.uint8)
+    cv2.ellipse(arr, (80, 100), (50, 80), 0, 0, 360, (40, 40, 40), -1)
+    name = "fish_ellipse.png"
+    Image.fromarray(arr).save(img_dir / name)
+    csv_path = tmp_path / "labels.csv"
+    pd.DataFrame([{"image_id": name, "age": 4, "split": "test"}]).to_csv(csv_path, index=False)
+
+    cfg = _multi_strip_cfg(tmp_path, k=3)
+    ds = OtolithDataset(cfg, "test", labels_csv=str(csv_path), image_dir=str(img_dir))
+    first = ds[0]["image_strip"]
+
+    def _boom(*a, **kw):
+        raise AssertionError("detect_axis_candidates should NOT be called on a cache hit")
+    monkeypatch.setattr("src.dataset.detect_axis_candidates", _boom)
+
+    second = ds[0]["image_strip"]
+    assert torch.allclose(first, second)
+
+
+def test_multi_wycinek_pads_by_repeating_best_when_fewer_candidates_found(ellipse_data, tmp_path, monkeypatch):
+    """When detect_axis_candidates returns fewer than K candidates, the stack must
+    still have shape (K, 3, Wp, Lp), padded by repeating the BEST (index 0) candidate.
+
+    ellipse_data's row is split="train", whose transform applies an independent
+    random vertical flip per candidate tensor — that would make two copies of the
+    same underlying strip compare unequal regardless of whether padding itself is
+    correct, so the dataset's strip_transform is swapped for a deterministic
+    (split="test") one after construction, purely for this equality check.
+    """
+    from src.dataset import OtolithDataset, build_transforms
+    import src.dataset as dataset_module
+
+    csv_path, img_dir = ellipse_data
+    cfg = _multi_strip_cfg(tmp_path, k=4)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    ds.strip_transform = build_transforms(cfg.data.strip_length_px, split="test", strip=True)
+
+    real = dataset_module.detect_axis_candidates
+    def _only_two(*a, **kw):
+        kw["k"] = 2
+        return real(*a, **kw)
+    monkeypatch.setattr(dataset_module, "detect_axis_candidates", _only_two)
+
+    item = ds[0]
+    assert item["image_strip"].shape == (4, 3, 42, 140)
+    # candidates 2 and 3 (0-indexed) should be padding copies of candidate 0
+    assert torch.equal(item["image_strip"][2], item["image_strip"][0])
+    assert torch.equal(item["image_strip"][3], item["image_strip"][0])

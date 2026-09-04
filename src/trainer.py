@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader
 from src.config import OtolithConfig
 from src.dataset import decode_age_ordinal
 from src.model import (OtolithModel, density_concentricity_loss, density_count_loss,
-                       mil_count_loss, ordinal_loss, zegar_position_loss)
+                       mil_count_loss, ordinal_loss, select_density_candidate,
+                       zegar_position_loss)
 from src.utils import resolve_device  # re-exported for backwards compat
 
 
@@ -191,6 +192,27 @@ class Trainer:
                                  zegar_heatmap, has_zegar_target)["total"]
 
     @staticmethod
+    def _select_multi_wycinek(out: dict, ages: torch.Tensor) -> dict:
+        """Multi-wycinek (03.09, plans and summaries/03.09_multi_wycinek_plan.md):
+        when ``density_image`` was 5D, ``OtolithModel.forward``'s ``out["density"]``
+        comes back shaped ``(B, K, N)`` instead of ``(B, N)``. Select, per sample, the
+        candidate whose count best matches the TRUE age (``select_density_candidate``)
+        and replace ``density``/``density_count`` with the selected ``(B, N)``/``(B,)``
+        tensors — every downstream consumer (``_loss_parts``, ``_combined_loss``,
+        ``validate``'s own ``density_active`` accounting) then sees exactly the shape
+        it always has, unaware multiple candidates ever existed. No-op (returns ``out``
+        unchanged) when density is already 2D — i.e. every existing single-wycinek or
+        no-density-head config.
+        """
+        density = out.get("density")
+        if density is not None and density.dim() == 3:
+            selected, _idx = select_density_candidate(density, ages)
+            out = dict(out)
+            out["density"] = selected
+            out["density_count"] = selected.sum(dim=-1)
+        return out
+
+    @staticmethod
     def _predict_age(out: dict) -> torch.Tensor:
         """Decode integer age from dict output.
 
@@ -249,6 +271,7 @@ class Trainer:
             out = self.model(images, metadata=metadata, polar_t=polar_grid,
                               polar_theta=polar_theta, polar_valid=polar_valid,
                               density_image=image_strip)
+            out = self._select_multi_wycinek(out, ages)
             loss = self._combined_loss(out, targets, ages, polar_grid, polar_valid, polar_theta,
                                         zegar_heatmap, has_zegar_target)
             loss.backward()
@@ -314,6 +337,7 @@ class Trainer:
                 out = self.model(images, metadata=metadata, polar_t=polar_grid,
                                   polar_theta=polar_theta, polar_valid=polar_valid,
                                   density_image=image_strip)
+                out = self._select_multi_wycinek(out, ages)
                 parts = self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta,
                                           zegar_heatmap, has_zegar_target)
                 pred_ages = self._predict_age(out)

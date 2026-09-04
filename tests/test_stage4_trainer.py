@@ -47,7 +47,7 @@ class _MockDinoBackbone(nn.Module):
 class _SyntheticDataset(Dataset):
     def __init__(self, n: int = 8, num_age_classes: int = 10, image_size: int = 56,
                 with_polar: bool = False, with_zegar: bool = False, zegar_every: int = 2,
-                with_strip: bool = False):
+                with_strip: bool = False, multi_wycinek_k: int = 0):
         self.n = n
         self.num_age_classes = num_age_classes
         self.image_size = image_size
@@ -58,6 +58,10 @@ class _SyntheticDataset(Dataset):
         # dual_branch_density="image_strip" key (non-square shape, on purpose — the
         # whole point is it's NOT the same grid as "image").
         self.with_strip = with_strip
+        # 03.09, multi-wycinek experiment: >0 mirrors OtolithDataset's
+        # multi_wycinek_k>1 path — image_strip becomes (K,3,14,28) instead of
+        # (3,14,28). Takes precedence over with_strip when both are set.
+        self.multi_wycinek_k = multi_wycinek_k
 
     def __len__(self) -> int:
         return self.n
@@ -84,7 +88,9 @@ class _SyntheticDataset(Dataset):
                 heat[0, 0] = 1.0
             item["zegar_heatmap"] = heat
             item["has_zegar_target"] = torch.tensor(has_target, dtype=torch.bool)
-        if self.with_strip:
+        if self.multi_wycinek_k > 0:
+            item["image_strip"] = torch.randn(self.multi_wycinek_k, 3, 14, 28)
+        elif self.with_strip:
             item["image_strip"] = torch.randn(3, 14, 28)   # deliberately non-square
         return item
 
@@ -111,9 +117,11 @@ def _make_cfg(tmp_path: Path, epochs: int = 2, freeze_epochs: int = 0,
 
 
 def _make_loader(n: int = 8, batch_size: int = 4, with_polar: bool = False,
-                 with_zegar: bool = False, with_strip: bool = False) -> DataLoader:
+                 with_zegar: bool = False, with_strip: bool = False,
+                 multi_wycinek_k: int = 0) -> DataLoader:
     ds = _SyntheticDataset(n=n, num_age_classes=10, image_size=56, with_polar=with_polar,
-                           with_zegar=with_zegar, with_strip=with_strip)
+                           with_zegar=with_zegar, with_strip=with_strip,
+                           multi_wycinek_k=multi_wycinek_k)
     return DataLoader(ds, batch_size=batch_size, shuffle=False)
 
 
@@ -848,6 +856,60 @@ def test_train_one_epoch_without_image_strip_passes_none(tmp_path):
 
     assert len(captured) > 0
     assert all(t is None for t in captured)
+
+
+# ---------------------------------------------------------------------------
+# Multi-wycinek experiment (03.09) — candidate selection wiring
+# ---------------------------------------------------------------------------
+
+def test_select_multi_wycinek_noop_for_2d_density():
+    """Regression pin: an ordinary (B,N) density (single-wycinek or no strip branch
+    at all) must pass through _select_multi_wycinek completely unchanged."""
+    from src.trainer import Trainer
+    out = {"density": torch.rand(3, 16), "density_count": torch.rand(3)}
+    ages = torch.tensor([2.0, 4.0, 6.0])
+    result = Trainer._select_multi_wycinek(out, ages)
+    assert result is out
+    assert torch.equal(result["density"], out["density"])
+
+
+def test_select_multi_wycinek_reduces_3d_to_2d_by_best_count_match():
+    from src.trainer import Trainer
+    density = torch.tensor([
+        [[0.25, 0.25, 0.25, 0.25],   # count=1.0
+         [0.5, 0.5, 0.5, 0.5]],      # count=2.0
+    ])
+    ages = torch.tensor([2.0])
+    out = {"density": density, "density_count": density.sum(dim=-1)}
+    result = Trainer._select_multi_wycinek(out, ages)
+    assert result["density"].shape == (1, 4)
+    assert torch.equal(result["density"][0], density[0, 1])   # count=2.0 matches age=2.0
+    assert result["density_count"].shape == (1,)
+
+
+def test_train_one_epoch_completes_with_multi_wycinek_density_image(tmp_path):
+    """End-to-end smoke: multi_wycinek_k>1 batches must flow through forward() ->
+    selection -> _combined_loss without shape errors, and produce a valid loss."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+    loader = _make_loader(n=4, multi_wycinek_k=3)
+    trainer = Trainer(cfg, model, loader, None)
+    loss = trainer.train_one_epoch()
+    assert isinstance(loss, float)
+
+
+def test_validate_completes_with_multi_wycinek_density_image(tmp_path):
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+    loader = _make_loader(n=4, multi_wycinek_k=3)
+    trainer = Trainer(cfg, model, loader, loader)
+    val_loss, val_mae = trainer.validate()
+    assert isinstance(val_loss, float)
+    assert isinstance(val_mae, float)
 
 
 def test_fit_ema_selection_runs_and_saves_best(tmp_path):

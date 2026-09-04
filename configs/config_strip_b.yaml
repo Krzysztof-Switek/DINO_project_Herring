@@ -1,0 +1,137 @@
+# 03.09 — Eksperyment "wielokrotne wycinki" (Track B / "Wariant 2"), rozszerzenie Track A
+# (config_strip_a.yaml, żywy bieg na serwerze — TEN plik go nie modyfikuje i nie zastępuje).
+#
+# Jedyna deklarowana różnica względem Track A: zamiast jednego, deterministycznie wybranego
+# wycinka na próbkę (otolith_axis.find_reading_edge), głowica density dostaje `multi_wycinek_k`
+# kandydackich wycinków na próbkę (otolith_axis.find_reading_edge_candidates), a mechanizm
+# spójności liczby wybiera, który kandydat trenuje głowicę w danym kroku
+# (src/model.py::select_density_candidate, wybór wg zgodności całki mapy density z PRAWDZIWYM
+# wiekiem próbki). Głowica wieku (CORAL+MIL) pozostaje całkowicie nietknięta — identyczna
+# receptura co w Track A i Run N.
+#
+# Pełny opis decyzji projektowych: plans and summaries/03.09_multi_wycinek_plan.md
+# (kontekst/uzasadnienie: plans and summaries/02.09_wycinki_plan.md).
+#
+# UWAGA (to samo ryzyko co w Track A): karty raportu (_compute_axis_data_for_samples,
+# scripts/run_pipeline.py) NIE są świadome gałęzi paska (ani tym bardziej wielu kandydatów) —
+# panele density/kandydaci w report.html z tego biegu są bez sensu. Ufać wyłącznie
+# predictions.csv/pipeline_summary.json (wiek) oraz dedykowanemu skryptowi ewaluacji ZEGAR.
+#
+# DODATKOWE ryzyko udokumentowane w planie 03.09: więcej kandydatów oznacza więcej okazji do
+# przypadkowego dopasowania liczby (zgodność całki z wiekiem) bez faktycznie trafnej lokalizacji
+# pierścieni — rozstrzyga wynik na ZEGAR, nie sama zbieżność straty count-consistency.
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # niezmienione względem Run N / Track A
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  head_type: both                 # coral | mil | both — MIL nadal sprzężony z backbone jak w Run N
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  density_conc_weight: 1.0        # wewnętrzny człon top-k w density_count_loss (NIE E9/Zmiana B)
+  density_tv_weight: 0.0          # jawnie 0,0, jak w Track A
+
+  # Niezmienione względem Track A — RadialAttentionDensityHead nie ma zastosowania dla
+  # wycinków (brak kąta θ), a 5D density_image (wiele kandydatów naraz) jest w src/model.py
+  # jawnie ograniczone do density_head_type=mlp.
+  density_head_type: mlp
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  mask_background: true
+  mask_cache_dir: null
+
+  dual_branch_density: true
+  strip_length_px: 1330           # niezmienione względem Track A (wynik Kroku 0, p1)
+  strip_width_px: 98
+  strips_cache_dir: null
+
+  # JEDYNA deklarowana zmiana względem Track A (03.09, plans and summaries/
+  # 03.09_multi_wycinek_plan.md) — 5 kandydackich osi na próbkę zamiast jednej, minimalny
+  # odstęp kątowy 8° (patrz otolith_axis.find_reading_edge_candidates) tak, żeby kandydaci byli
+  # realnie różnymi kierunkami, nie kilkoma niemal identycznymi promieniami.
+  multi_wycinek_k: 5
+  multi_wycinek_min_angle_sep_deg: 8.0
+
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  # UWAGA: patrz nagłówek pliku — ta ścieżka nie jest świadoma gałęzi paska, jej wyjście dla
+  # tego biegu jest bez znaczenia. Wartości identyczne z Track A/Run N dla spójności configu.
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  density_image_size: 728
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8

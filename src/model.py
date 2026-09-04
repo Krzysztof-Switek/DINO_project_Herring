@@ -113,6 +113,50 @@ def mil_count_loss(
     return (l_on + sparsity_weight * l_off).mean()
 
 
+def select_density_candidate(density: Tensor, ages: Tensor) -> Tuple[Tensor, Tensor]:
+    """Select, per sample, which of K candidate density maps trains the density head
+    (03.09, multi-wycinek experiment — plans and summaries/03.09_multi_wycinek_plan.md,
+    "Wariant 2" / Track B).
+
+    ``density``: ``(B, K, N)`` — one density map per candidate wycinek, i.e.
+    ``OtolithModel.forward()``'s ``out["density"]`` when its ``density_image`` input
+    was 5D. ``ages``: ``(B,)`` — the TRUE age (this selection is a training-time-only
+    mechanism; ground truth is what makes it meaningful. At inference, without ground
+    truth, a caller would instead select against the CORAL-predicted age — see the
+    plan's "Wariant 1", a separate, inference-only mechanism this function is not used
+    for).
+
+    For each sample, computes the count-consistency mismatch between each candidate's
+    density integral and the true age — ``|density[:, k, :].sum(-1) - age|`` — and
+    picks the candidate with the SMALLEST mismatch. This is consistent with the same
+    count-consistency principle ``density_count_loss`` already trains toward
+    (integral ≈ age); it does not introduce a new objective, only a new way to choose
+    which of K already-computed views feeds the existing one.
+
+    The selection itself (``argmin``) is non-differentiable — that is fine, since it
+    only decides WHICH already-computed density map's loss backpropagates, never HOW.
+    The stop-gradient property is unaffected: whichever candidate is selected, its
+    loss (``density_count_loss``, unchanged) still only ever updates the density head,
+    never the shared backbone (that guarantee lives entirely upstream, in
+    ``forward()``'s ``torch.no_grad()``/``.detach()``).
+
+    Known risk (documented in the plan, not mitigated here): more candidates means
+    more chances for a coincidental count match without a genuinely better ring
+    position — the concentration term in ``density_count_loss`` (forces peaked, not
+    diffuse, activity) partially guards against this, but real localisation accuracy
+    on ZEGAR, not count-match convergence alone, is what actually settles whether this
+    mechanism helps.
+
+    Returns ``(selected_density (B, N), selected_idx (B,) long)``.
+    """
+    counts = density.sum(dim=-1)                                          # (B, K)
+    mismatch = (counts - ages.unsqueeze(1).to(counts.dtype)).abs()        # (B, K)
+    idx = mismatch.argmin(dim=1)                                          # (B,)
+    batch_idx = torch.arange(density.shape[0], device=density.device)
+    selected = density[batch_idx, idx]                                    # (B, N)
+    return selected, idx
+
+
 def density_count_loss(
     density: Tensor,
     age: Tensor,
@@ -823,30 +867,58 @@ class OtolithModel(nn.Module):
             out["patch_count"] = patch_probs.sum(dim=1)           # (B,)
 
         if self.use_density_head:
+            # Multi-wycinek (03.09, plans and summaries/03.09_multi_wycinek_plan.md):
+            # density_image is (B, K, C, H, W) instead of (B, C, H, W) when the caller
+            # (OtolithDataset.__getitem__ with multi_wycinek_k>1) supplies K candidate
+            # wycinki per sample. Detected purely by ndim — every existing 4D caller
+            # is unaffected.
+            is_multi = density_image is not None and density_image.dim() == 5
             if density_image is not None:
                 # Dual-branch (02.09): a totally separate forward pass, no backward
                 # graph built at all — cheaper than .detach() (which still builds and
                 # discards a graph up to the detach point) since nothing downstream
                 # needs gradient into this pass in the first place.
+                img_for_backbone = density_image
+                if is_multi:
+                    # Flatten K into the batch dim for a SINGLE batched backbone call
+                    # (still one no_grad pass, not K separate ones — cost scales with
+                    # total patches either way, batching just avoids K python-level
+                    # forward calls).
+                    B_, K_ = density_image.shape[:2]
+                    img_for_backbone = density_image.reshape(B_ * K_, *density_image.shape[2:])
                 with torch.no_grad():
-                    density_feats = self.backbone.forward_features(density_image)
+                    density_feats = self.backbone.forward_features(img_for_backbone)
                 detached = density_feats["x_norm_patchtokens"]
             else:
                 # STOP-GRADIENT: detach patch tokens so the density loss updates only
                 # the density head, never the shared backbone (age head stays safe by
                 # design).
                 detached = patches.detach()
+
+            if is_multi and self.density_head_type != "mlp":
+                # polar_t/theta/valid (per-image, not per-candidate) don't broadcast
+                # across the flattened B*K dimension — rather than silently misalign
+                # them, refuse. Multi-wycinek is scoped to density_head_type="mlp" by
+                # design (see the plan) since "mlp" needs no positional kwargs at all.
+                raise NotImplementedError(
+                    "5D density_image (multi-wycinek) is only supported with "
+                    "density_head_type='mlp' — polar_t/theta/valid do not broadcast "
+                    "across the K candidate dimension for the other head types."
+                )
+
             if self.density_head_type == "mlp":
                 # Bare nn.Sequential (see __init__) — takes ONLY the tensor, no kwargs.
-                dens_logits = self.density_head(detached).squeeze(-1)       # (B, N)
+                dens_logits = self.density_head(detached).squeeze(-1)       # (B[*K], N)
             else:
                 dens_logits = self.density_head(
                     detached, polar_t=polar_t, polar_theta=polar_theta,
                     polar_valid=polar_valid,
                 ).squeeze(-1)                                               # (B, N)
-            density = torch.sigmoid(dens_logits)                            # (B, N) ∈ [0,1]
+            density = torch.sigmoid(dens_logits)                            # (B[*K], N) ∈ [0,1]
+            if is_multi:
+                density = density.reshape(B_, K_, -1)                       # (B, K, N)
             out["density"] = density
-            out["density_count"] = density.sum(dim=1)                       # (B,)
+            out["density_count"] = density.sum(dim=-1)                      # (B,) or (B, K)
 
         return out
 

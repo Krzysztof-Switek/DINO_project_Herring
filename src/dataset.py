@@ -14,7 +14,8 @@ from torchvision import transforms
 from scripts.prepare_labels import extract_campaign_token
 from src.config import OtolithConfig
 from src.otolith_axis import (apply_background_mask, compute_polar_grid, detect_axis,
-                              get_or_compute_mask, mask_bbox, resolve_centroid)
+                              detect_axis_candidates, get_or_compute_mask, mask_bbox,
+                              resolve_centroid)
 from src.strip_extraction import get_or_compute_strip, load_strip
 
 REQUIRED_COLUMNS = {"image_id", "age", "split"}
@@ -260,6 +261,8 @@ class OtolithDataset(Dataset):
         self.dual_branch_density = cfg.data.dual_branch_density
         self.strips_cache_dir: Optional[Path] = None
         self.strip_transform: Optional[transforms.Compose] = None
+        self.multi_wycinek_k: int = 1
+        self.multi_wycinek_min_angle_sep_deg: float = cfg.data.multi_wycinek_min_angle_sep_deg
         if self.dual_branch_density:
             base_strips_dir = (Path(cfg.data.strips_cache_dir) if cfg.data.strips_cache_dir
                                else root / "data" / "strips_cache")
@@ -273,6 +276,10 @@ class OtolithDataset(Dataset):
             self.strips_cache_dir.mkdir(parents=True, exist_ok=True)
             self.strip_transform = build_transforms(
                 cfg.data.strip_length_px, split, include_flips=True, strip=True)
+            # Multi-wycinek experiment (03.09, plans and summaries/
+            # 03.09_multi_wycinek_plan.md) — 1 (default) = today's single-wycinek
+            # behaviour, zero change.
+            self.multi_wycinek_k = cfg.data.multi_wycinek_k
 
     # ------------------------------------------------------------------
     # Demo mode — limit dataset right at the source
@@ -542,10 +549,39 @@ class OtolithDataset(Dataset):
             return image
         return Image.fromarray(apply_background_mask(rgb, mask))
 
+    def _load_raw_rgb(self, image_id: str) -> np.ndarray:
+        """Load ``image_id`` from disk as an RGB uint8 array — shared by the single-
+        and multi-wycinek strip loaders below (03.09)."""
+        img_dir = self._image_dir_for(image_id)
+        path = img_dir / image_id
+        if not path.exists():
+            for ext in IMAGE_EXTENSIONS:
+                candidate = img_dir / (image_id + ext)
+                if candidate.exists():
+                    path = candidate
+                    break
+        image = Image.open(path).convert("RGB")
+        return np.array(image, dtype=np.uint8)
+
     def _load_strip_image(self, image_id: str) -> torch.Tensor:
-        """Build the density branch's second input (02.09, dendrochronology-strip
-        experiment): a straightened rectangular crop along the (nucleus -> far_edge)
-        reading axis, ``src.strip_extraction.get_or_compute_strip``.
+        """Build the density branch's second input.
+
+        Returns a single ``(3, Wp, Lp)`` tensor when ``multi_wycinek_k<=1`` (02.09,
+        today's default, unchanged behaviour), or a stacked ``(K, 3, Wp, Lp)`` tensor
+        when ``multi_wycinek_k>1`` (03.09, multi-wycinek experiment — see ``plans and
+        summaries/03.09_multi_wycinek_plan.md``). ``default_collate`` adds the batch
+        dimension on top either way, so ``OtolithModel.forward``'s ``density_image``
+        ends up either 4D (``B,3,Wp,Lp``) or 5D (``B,K,3,Wp,Lp``) — it branches on
+        ``ndim`` to tell the two apart.
+        """
+        if self.multi_wycinek_k <= 1:
+            return self._build_strip_tensor(image_id)
+        return self._build_multi_strip_tensor(image_id)
+
+    def _build_strip_tensor(self, image_id: str) -> torch.Tensor:
+        """Single-wycinek path (02.09): a straightened rectangular crop along the
+        (nucleus -> far_edge) reading axis, ``src.strip_extraction.get_or_compute_
+        strip``.
 
         Checks the strip cache FIRST, before touching the raw photo at all — unlike
         the mask cache (whose caller always needs the raw pixels regardless, to draw
@@ -565,16 +601,7 @@ class OtolithDataset(Dataset):
         if cached is not None and cached.shape[:2] == (strip_width_px, strip_length_px):
             return self.strip_transform(Image.fromarray(cached))
 
-        img_dir = self._image_dir_for(image_id)
-        path = img_dir / image_id
-        if not path.exists():
-            for ext in IMAGE_EXTENSIONS:
-                candidate = img_dir / (image_id + ext)
-                if candidate.exists():
-                    path = candidate
-                    break
-        image = Image.open(path).convert("RGB")
-        rgb = np.array(image, dtype=np.uint8)
+        rgb = self._load_raw_rgb(image_id)
 
         mask_cache_path = self.mask_cache_dir / f"{Path(image_id).stem}_mask.png"
         mask = get_or_compute_mask(rgb, mask_cache_path, seg_params=self.cfg.segmentation.as_params())
@@ -594,6 +621,62 @@ class OtolithDataset(Dataset):
         strip = get_or_compute_strip(
             rgb, mask, axis_info, strip_cache_path, strip_length_px, strip_width_px)
         return self.strip_transform(Image.fromarray(strip))
+
+    def _build_multi_strip_tensor(self, image_id: str) -> torch.Tensor:
+        """Multi-wycinek path (03.09, ``multi_wycinek_k>1``): ``K`` candidate wycinki
+        per sample, one per candidate reading axis from
+        ``otolith_axis.detect_axis_candidates``.
+
+        Always returns exactly ``(multi_wycinek_k, 3, Wp, Lp)`` — when segmentation or
+        axis-finding yields fewer than ``K`` genuine candidates, the BEST one (index 0,
+        ``detect_axis_candidates`` returns them ranked) is repeated to pad the stack to
+        a uniform shape (``torch.stack``/``default_collate`` require it across a
+        batch); the downstream selection mechanism then simply has fewer effective
+        choices for that particular image, not a crash or a shape mismatch. Same total
+        fallback (plain resize, repeated ``K`` times) as the single-wycinek path when
+        segmentation fails entirely.
+        """
+        strip_length_px = self.cfg.data.strip_length_px
+        strip_width_px = self.cfg.data.strip_width_px
+        k = self.multi_wycinek_k
+        stem = Path(image_id).stem
+        cache_dir = self.strips_cache_dir / f"k{k}"
+
+        cache_paths = [cache_dir / f"{stem}_strip_{i}.png" for i in range(k)]
+        cached = [load_strip(p) for p in cache_paths]
+        if all(c is not None and c.shape[:2] == (strip_width_px, strip_length_px) for c in cached):
+            tensors = [self.strip_transform(Image.fromarray(c)) for c in cached]
+            return torch.stack(tensors, dim=0)
+
+        rgb = self._load_raw_rgb(image_id)
+
+        mask_cache_path = self.mask_cache_dir / f"{stem}_mask.png"
+        mask = get_or_compute_mask(rgb, mask_cache_path, seg_params=self.cfg.segmentation.as_params())
+        axis_candidates: list = []
+        if mask is not None:
+            axis_candidates = detect_axis_candidates(
+                rgb, seg_params=self.cfg.segmentation.as_params(),
+                nucleus_method=self.cfg.segmentation.nucleus_method,
+                axis_method=self.cfg.segmentation.axis_method,
+                mask=mask, k=k, min_angle_sep_deg=self.multi_wycinek_min_angle_sep_deg,
+            )
+
+        if not axis_candidates:
+            fallback = Image.fromarray(rgb).resize(
+                (strip_length_px, strip_width_px), Image.BILINEAR)
+            tensor = self.strip_transform(fallback)
+            return tensor.unsqueeze(0).expand(k, -1, -1, -1).clone()
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        strips = []
+        for i in range(k):
+            axis_info = axis_candidates[i] if i < len(axis_candidates) else axis_candidates[0]
+            strip = get_or_compute_strip(
+                rgb, mask, axis_info, cache_paths[i], strip_length_px, strip_width_px)
+            strips.append(strip)
+
+        tensors = [self.strip_transform(Image.fromarray(s)) for s in strips]
+        return torch.stack(tensors, dim=0)
 
     # ------------------------------------------------------------------
     # Metadata encoding

@@ -11,10 +11,12 @@ from src.otolith_axis import (
     apply_background_mask,
     compute_polar_grid,
     detect_axis,
+    detect_axis_candidates,
     find_centroid,
     find_farthest_edge,
     find_intensity_centroid,
     find_reading_edge,
+    find_reading_edge_candidates,
     get_or_compute_mask,
     load_mask,
     mask_bbox,
@@ -311,6 +313,76 @@ def test_find_reading_edge_returns_none_for_empty_mask():
     assert find_reading_edge(img, empty_mask, (50, 50)) is None
 
 
+# ---------------------------------------------------------------------------
+# find_reading_edge_candidates — 03.09, multi-wycinek experiment
+# ---------------------------------------------------------------------------
+
+def test_find_reading_edge_candidates_k1_matches_find_reading_edge():
+    """k=1 must reproduce find_reading_edge's own single-winner result exactly —
+    find_reading_edge is now a thin wrapper around this function."""
+    img = _make_ringed_blob_with_spur()
+    mask = segment_otolith(img, method="threshold")
+    centroid = find_centroid(mask)
+    single = find_reading_edge(img, mask, centroid)
+    candidates = find_reading_edge_candidates(img, mask, centroid, k=1)
+    assert candidates == [single]
+
+
+def test_find_reading_edge_candidates_first_is_best():
+    """Regardless of k, the first returned candidate must match the single-best
+    find_reading_edge result — same ranking, just not collapsed to one."""
+    img = _make_ringed_blob_with_spur()
+    mask = segment_otolith(img, method="threshold")
+    centroid = find_centroid(mask)
+    single = find_reading_edge(img, mask, centroid)
+    candidates = find_reading_edge_candidates(img, mask, centroid, k=5)
+    assert candidates[0] == single
+
+
+def test_find_reading_edge_candidates_returns_multiple_separated_points():
+    """The ringed body has ring texture across the whole cone (not just one
+    direction), so k=5 should yield several genuinely different candidates, each at
+    least min_angle_sep_deg apart around the centroid — not k near-duplicates."""
+    img = _make_ringed_blob_with_spur()
+    mask = segment_otolith(img, method="threshold")
+    centroid = find_centroid(mask)
+    candidates = find_reading_edge_candidates(img, mask, centroid, k=5, min_angle_sep_deg=8.0)
+    assert 1 < len(candidates) <= 5
+
+    cx, cy = centroid
+    angles = [np.arctan2(y - cy, x - cx) for x, y in candidates]
+    min_sep = np.radians(8.0)
+    for i in range(len(angles)):
+        for j in range(i + 1, len(angles)):
+            gap = abs(np.angle(np.exp(1j * (angles[i] - angles[j]))))
+            assert gap >= min_sep - 1e-6, f"candidates {i},{j} closer than min_angle_sep_deg"
+
+
+def test_find_reading_edge_candidates_respects_k():
+    img = _make_ringed_blob_with_spur()
+    mask = segment_otolith(img, method="threshold")
+    centroid = find_centroid(mask)
+    candidates = find_reading_edge_candidates(img, mask, centroid, k=2, min_angle_sep_deg=8.0)
+    assert len(candidates) <= 2
+
+
+def test_find_reading_edge_candidates_falls_back_when_no_rings_detected():
+    """Same fallback as find_reading_edge — a single-element list wrapping
+    find_farthest_edge's result."""
+    img = _make_dark_ellipse(center=(400, 300), axes=(100, 200))
+    mask = segment_otolith(img)
+    centroid = find_centroid(mask)
+    candidates = find_reading_edge_candidates(img, mask, centroid, k=5)
+    farthest = find_farthest_edge(mask, centroid, direction="down")
+    assert candidates == [farthest]
+
+
+def test_find_reading_edge_candidates_empty_for_empty_mask():
+    empty_mask = np.zeros((100, 100), dtype=np.uint8)
+    img = np.zeros((100, 100, 3), dtype=np.uint8)
+    assert find_reading_edge_candidates(img, empty_mask, (50, 50), k=5) == []
+
+
 def test_detect_axis_ring_richness_method_differs_from_farthest():
     img = _make_ringed_blob_with_spur()
     info_farthest = detect_axis(img, seg_params={"method": "threshold"}, axis_method="farthest")
@@ -358,6 +430,54 @@ def test_detect_axis_returns_dict_for_valid_ellipse():
 def test_detect_axis_returns_none_for_uniform():
     img = np.full((400, 400, 3), 255, dtype=np.uint8)
     assert detect_axis(img) is None
+
+
+# ---------------------------------------------------------------------------
+# detect_axis_candidates — 03.09, multi-wycinek experiment
+# ---------------------------------------------------------------------------
+
+def test_detect_axis_candidates_k1_matches_detect_axis():
+    img = _make_ringed_blob_with_spur()
+    single = detect_axis(img, seg_params={"method": "threshold"})
+    candidates = detect_axis_candidates(img, seg_params={"method": "threshold"}, k=1)
+    assert len(candidates) == 1
+    assert candidates[0]["far_edge"] == single["far_edge"]
+    assert candidates[0]["length_px"] == single["length_px"]
+
+
+def test_detect_axis_candidates_first_matches_detect_axis():
+    img = _make_ringed_blob_with_spur()
+    single = detect_axis(img, seg_params={"method": "threshold"})
+    candidates = detect_axis_candidates(img, seg_params={"method": "threshold"}, k=5)
+    assert candidates[0]["far_edge"] == single["far_edge"]
+
+
+def test_detect_axis_candidates_share_centroid_and_mask_differ_in_far_edge():
+    img = _make_ringed_blob_with_spur()
+    candidates = detect_axis_candidates(
+        img, seg_params={"method": "threshold"}, k=5, min_angle_sep_deg=8.0,
+    )
+    assert 1 < len(candidates) <= 5
+    first = candidates[0]
+    for c in candidates[1:]:
+        assert c["centroid"] == first["centroid"]
+        assert np.array_equal(c["mask"], first["mask"])
+        assert c["far_edge"] != first["far_edge"]
+    far_edges = [c["far_edge"] for c in candidates]
+    assert len(set(far_edges)) == len(far_edges), "far_edge values must all be distinct"
+
+
+def test_detect_axis_candidates_farthest_method_degenerates_to_one():
+    img = _make_ringed_blob_with_spur()
+    candidates = detect_axis_candidates(
+        img, seg_params={"method": "threshold"}, axis_method="farthest", k=5,
+    )
+    assert len(candidates) == 1
+
+
+def test_detect_axis_candidates_empty_for_uniform():
+    img = np.full((400, 400, 3), 255, dtype=np.uint8)
+    assert detect_axis_candidates(img, k=5) == []
 
 
 def test_detect_axis_intensity_nucleus_method_shifts_centroid():

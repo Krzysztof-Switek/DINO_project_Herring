@@ -168,6 +168,20 @@ class DataConfig(BaseModel):
     # collision bug (scripts/diagnostics/expert_annotation_eval.py, 12.08).
     strips_cache_dir: Optional[str] = None
 
+    # Multi-wycinek experiment (03.09, plans and summaries/03.09_multi_wycinek_plan.md,
+    # "Wariant 2" / Track B) — instead of a single deterministic reading axis
+    # (otolith_axis.find_reading_edge), build `multi_wycinek_k` candidate wycinki per sample
+    # (otolith_axis.find_reading_edge_candidates) and let the density head's own count-
+    # consistency against the TRUE age select which candidate's density map actually trains
+    # the head (src/model.py::select_density_candidate). 1 (default) = today's single-wycinek
+    # behaviour, zero change — only meaningful when dual_branch_density=True. The age heads
+    # are completely unaffected either way; this only changes what the density branch sees.
+    multi_wycinek_k: int = Field(1, ge=1)
+    # Minimum angular separation (degrees) enforced between candidate axes — see
+    # otolith_axis.find_reading_edge_candidates's own min_angle_sep_deg docstring for why this
+    # matters (without it, "k best" collapses to k near-identical rays a few degrees apart).
+    multi_wycinek_min_angle_sep_deg: float = Field(8.0, ge=0.0)
+
     @field_validator("image_size")
     @classmethod
     def image_size_divisible(cls, v: int) -> int:
