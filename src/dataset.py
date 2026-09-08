@@ -16,7 +16,8 @@ from src.config import OtolithConfig
 from src.otolith_axis import (apply_background_mask, compute_polar_grid, detect_axis,
                               detect_axis_candidates, get_or_compute_mask, mask_bbox,
                               resolve_centroid)
-from src.strip_extraction import get_or_compute_strip, load_strip
+from src.strip_extraction import (get_or_compute_strip, get_or_compute_strip_validity,
+                                  load_strip, load_strip_validity)
 
 REQUIRED_COLUMNS = {"image_id", "age", "split"}
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
@@ -263,6 +264,11 @@ class OtolithDataset(Dataset):
         self.strip_transform: Optional[transforms.Compose] = None
         self.multi_wycinek_k: int = 1
         self.multi_wycinek_min_angle_sep_deg: float = cfg.data.multi_wycinek_min_angle_sep_deg
+        # Background-activation penalty (08.09, plans and summaries/
+        # 08.09_metodyka_i_diagnoza_paska.md) — False (default) = zero behaviour change.
+        # config.py forbids this together with multi_wycinek_k>1.
+        self.strip_mask_background_loss = cfg.data.strip_mask_background_loss
+        self.strip_transform_no_flip: Optional[transforms.Compose] = None
         if self.dual_branch_density:
             base_strips_dir = (Path(cfg.data.strips_cache_dir) if cfg.data.strips_cache_dir
                                else root / "data" / "strips_cache")
@@ -276,6 +282,14 @@ class OtolithDataset(Dataset):
             self.strips_cache_dir.mkdir(parents=True, exist_ok=True)
             self.strip_transform = build_transforms(
                 cfg.data.strip_length_px, split, include_flips=True, strip=True)
+            if self.strip_mask_background_loss:
+                # include_flips=False so the Compose applies no RandomVerticalFlip of
+                # its own — the flip decision instead happens explicitly in
+                # _build_strip_tensor_and_valid_mask, applied identically to the strip
+                # image AND its valid mask (see that method's docstring for why the
+                # normal self.strip_transform can't be reused for this path).
+                self.strip_transform_no_flip = build_transforms(
+                    cfg.data.strip_length_px, split, include_flips=False, strip=True)
             # Multi-wycinek experiment (03.09, plans and summaries/
             # 03.09_multi_wycinek_plan.md) — 1 (default) = today's single-wycinek
             # behaviour, zero change.
@@ -391,7 +405,12 @@ class OtolithDataset(Dataset):
             sample["metadata"] = self._encode_metadata(row)
 
         if self.dual_branch_density:
-            sample["image_strip"] = self._load_strip_image(image_id)
+            if self.strip_mask_background_loss:
+                image_strip, strip_valid_mask = self._build_strip_tensor_and_valid_mask(image_id)
+                sample["image_strip"] = image_strip
+                sample["strip_valid_mask"] = strip_valid_mask
+            else:
+                sample["image_strip"] = self._load_strip_image(image_id)
 
         return sample
 
@@ -621,6 +640,76 @@ class OtolithDataset(Dataset):
         strip = get_or_compute_strip(
             rgb, mask, axis_info, strip_cache_path, strip_length_px, strip_width_px)
         return self.strip_transform(Image.fromarray(strip))
+
+    def _decide_strip_vflip(self) -> bool:
+        """Split out from _build_strip_tensor_and_valid_mask purely so tests can force
+        a flip via monkeypatching, mirroring _decide_flip's rationale."""
+        return torch.rand(()).item() < 0.5
+
+    def _build_strip_tensor_and_valid_mask(self, image_id: str) -> tuple:
+        """Single-wycinek strip + its per-patch tissue-validity mask (08.09, plans and
+        summaries/08.09_metodyka_i_diagnoza_paska.md), built TOGETHER so the same
+        random vertical flip (train split) is applied to both — keeping the density
+        loss's valid_mask aligned with the density grid it gates.
+
+        Cannot reuse self.strip_transform here (unlike the unmasked
+        _build_strip_tensor path): that Compose's RandomVerticalFlip makes its own
+        private random choice with no hook to replay on a second tensor — the same
+        problem already solved once in this module for the E9 polar grid
+        (_load_image_with_polar/_decide_flip). Horizontal flip stays unconditionally
+        dropped for strips (would reverse the canonicalized reading direction), so
+        only the vertical decision needs to be explicit here. Config validation
+        (src/config.py) forbids strip_mask_background_loss with multi_wycinek_k>1, so
+        this is only ever reached on the single-wycinek path.
+        """
+        strip_length_px = self.cfg.data.strip_length_px
+        strip_width_px = self.cfg.data.strip_width_px
+        patch_size = self.cfg.data.patch_size
+        h_p, w_p = strip_width_px // patch_size, strip_length_px // patch_size
+        stem = Path(image_id).stem
+        strip_cache_path = self.strips_cache_dir / f"{stem}_strip.png"
+        valid_cache_path = self.strips_cache_dir / f"{stem}_strip_valid.npy"
+
+        cached_strip = load_strip(strip_cache_path)
+        cached_valid = load_strip_validity(valid_cache_path)
+        if (cached_strip is not None and cached_strip.shape[:2] == (strip_width_px, strip_length_px)
+                and cached_valid is not None and cached_valid.shape == (h_p, w_p)):
+            strip_arr, valid_arr = cached_strip, cached_valid
+        else:
+            rgb = self._load_raw_rgb(image_id)
+            mask_cache_path = self.mask_cache_dir / f"{stem}_mask.png"
+            mask = get_or_compute_mask(rgb, mask_cache_path, seg_params=self.cfg.segmentation.as_params())
+            axis_info = None
+            if mask is not None:
+                axis_info = detect_axis(
+                    rgb, seg_params=self.cfg.segmentation.as_params(),
+                    nucleus_method=self.cfg.segmentation.nucleus_method,
+                    axis_method=self.cfg.segmentation.axis_method,
+                    mask=mask,
+                )
+            if mask is None or axis_info is None:
+                # Never crash training on a bad photo — fall back to a plain resize
+                # (matching _build_strip_tensor) and an all-valid mask (unknown
+                # geometry means "don't penalise anything", the conservative default).
+                fallback = Image.fromarray(rgb).resize(
+                    (strip_length_px, strip_width_px), Image.BILINEAR)
+                valid_t = torch.ones(h_p, w_p, dtype=torch.float32)
+                if self.split == "train" and self._decide_strip_vflip():
+                    fallback = fallback.transpose(Image.FLIP_TOP_BOTTOM)
+                    valid_t = torch.flip(valid_t, dims=[0])
+                return self.strip_transform_no_flip(fallback), valid_t
+
+            strip_arr = get_or_compute_strip(
+                rgb, mask, axis_info, strip_cache_path, strip_length_px, strip_width_px)
+            valid_arr = get_or_compute_strip_validity(
+                mask, axis_info, valid_cache_path, strip_length_px, strip_width_px, patch_size)
+
+        strip_img = Image.fromarray(strip_arr)
+        valid_t = torch.from_numpy(valid_arr.copy())
+        if self.split == "train" and self._decide_strip_vflip():
+            strip_img = strip_img.transpose(Image.FLIP_TOP_BOTTOM)
+            valid_t = torch.flip(valid_t, dims=[0])
+        return self.strip_transform_no_flip(strip_img), valid_t
 
     def _build_multi_strip_tensor(self, image_id: str) -> torch.Tensor:
         """Multi-wycinek path (03.09, ``multi_wycinek_k>1``): ``K`` candidate wycinki

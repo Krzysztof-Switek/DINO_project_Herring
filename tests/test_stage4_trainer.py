@@ -47,7 +47,8 @@ class _MockDinoBackbone(nn.Module):
 class _SyntheticDataset(Dataset):
     def __init__(self, n: int = 8, num_age_classes: int = 10, image_size: int = 56,
                 with_polar: bool = False, with_zegar: bool = False, zegar_every: int = 2,
-                with_strip: bool = False, multi_wycinek_k: int = 0):
+                with_strip: bool = False, multi_wycinek_k: int = 0,
+                with_strip_valid_mask: bool = False):
         self.n = n
         self.num_age_classes = num_age_classes
         self.image_size = image_size
@@ -62,6 +63,11 @@ class _SyntheticDataset(Dataset):
         # multi_wycinek_k>1 path — image_strip becomes (K,3,14,28) instead of
         # (3,14,28). Takes precedence over with_strip when both are set.
         self.multi_wycinek_k = multi_wycinek_k
+        # 08.09, background-activation penalty: mirrors OtolithDataset's
+        # strip_mask_background_loss="strip_valid_mask" key. Fixed, non-trivial
+        # pattern (one valid, one masked-out patch of the 2) so tests can tell a real
+        # mask from an all-ones stand-in.
+        self.with_strip_valid_mask = with_strip_valid_mask
 
     def __len__(self) -> int:
         return self.n
@@ -92,6 +98,8 @@ class _SyntheticDataset(Dataset):
             item["image_strip"] = torch.randn(self.multi_wycinek_k, 3, 14, 28)
         elif self.with_strip:
             item["image_strip"] = torch.randn(3, 14, 28)   # deliberately non-square
+        if self.with_strip_valid_mask:
+            item["strip_valid_mask"] = torch.tensor([[1.0, 0.0]])   # (h_p=1, w_p=2)
         return item
 
 
@@ -118,10 +126,11 @@ def _make_cfg(tmp_path: Path, epochs: int = 2, freeze_epochs: int = 0,
 
 def _make_loader(n: int = 8, batch_size: int = 4, with_polar: bool = False,
                  with_zegar: bool = False, with_strip: bool = False,
-                 multi_wycinek_k: int = 0) -> DataLoader:
+                 multi_wycinek_k: int = 0, with_strip_valid_mask: bool = False) -> DataLoader:
     ds = _SyntheticDataset(n=n, num_age_classes=10, image_size=56, with_polar=with_polar,
                            with_zegar=with_zegar, with_strip=with_strip,
-                           multi_wycinek_k=multi_wycinek_k)
+                           multi_wycinek_k=multi_wycinek_k,
+                           with_strip_valid_mask=with_strip_valid_mask)
     return DataLoader(ds, batch_size=batch_size, shuffle=False)
 
 
@@ -853,6 +862,92 @@ def test_train_one_epoch_without_image_strip_passes_none(tmp_path):
     loader = _make_loader(n=4)   # no with_strip
     trainer = Trainer(cfg, model, loader, None)
     trainer.train_one_epoch()
+
+    assert len(captured) > 0
+    assert all(t is None for t in captured)
+
+
+# ---------------------------------------------------------------------------
+# Background-activation penalty (08.09) — strip_valid_mask -> density_count_loss wiring
+# ---------------------------------------------------------------------------
+
+def test_train_one_epoch_routes_strip_valid_mask_to_density_count_loss(tmp_path):
+    """batch["strip_valid_mask"] (only present when
+    cfg.data.strip_mask_background_loss=True) must reach density_count_loss as its
+    valid_mask kwarg during training, flattened (B,Hp,Wp)->(B,N) like polar_grid."""
+    import src.trainer as trainer_module
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+
+    captured = []
+    orig = trainer_module.density_count_loss
+    def _spy(*args, **kwargs):
+        captured.append(kwargs.get("valid_mask"))
+        return orig(*args, **kwargs)
+    trainer_module.density_count_loss = _spy
+    try:
+        loader = _make_loader(n=4, with_strip=True, with_strip_valid_mask=True)
+        trainer = Trainer(cfg, model, loader, None)
+        trainer.train_one_epoch()
+    finally:
+        trainer_module.density_count_loss = orig
+
+    assert len(captured) > 0
+    assert all(t is not None for t in captured)
+    assert all(t.shape == (4, 2) for t in captured)   # (B, Hp*Wp) = (4, 1*2)
+    assert all(torch.equal(t, torch.tensor([[1.0, 0.0]] * 4)) for t in captured)
+
+
+def test_validate_routes_strip_valid_mask_to_density_count_loss(tmp_path):
+    """Same wiring, validate() path."""
+    import src.trainer as trainer_module
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+
+    captured = []
+    orig = trainer_module.density_count_loss
+    def _spy(*args, **kwargs):
+        captured.append(kwargs.get("valid_mask"))
+        return orig(*args, **kwargs)
+    trainer_module.density_count_loss = _spy
+    try:
+        loader = _make_loader(n=4, with_strip=True, with_strip_valid_mask=True)
+        trainer = Trainer(cfg, model, loader, loader)
+        trainer.validate()
+    finally:
+        trainer_module.density_count_loss = orig
+
+    assert len(captured) > 0
+    assert all(t is not None for t in captured)
+    assert all(t.shape == (4, 2) for t in captured)
+
+
+def test_train_one_epoch_without_strip_valid_mask_passes_none(tmp_path):
+    """Regression pin: a batch with no "strip_valid_mask" key (the default for every
+    existing config) must call density_count_loss with valid_mask=None explicitly —
+    reproduces today's unmasked behaviour exactly."""
+    import src.trainer as trainer_module
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+
+    captured = []
+    orig = trainer_module.density_count_loss
+    def _spy(*args, **kwargs):
+        captured.append(kwargs.get("valid_mask"))
+        return orig(*args, **kwargs)
+    trainer_module.density_count_loss = _spy
+    try:
+        loader = _make_loader(n=4, with_strip=True)   # no with_strip_valid_mask
+        trainer = Trainer(cfg, model, loader, None)
+        trainer.train_one_epoch()
+    finally:
+        trainer_module.density_count_loss = orig
 
     assert len(captured) > 0
     assert all(t is None for t in captured)

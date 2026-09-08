@@ -116,6 +116,39 @@ def test_strip_dims_must_be_divisible_only_when_dual_branch_enabled() -> None:
                   model={"use_density_head": True})
 
 
+def test_strip_mask_background_loss_default_is_off() -> None:
+    """08.09: strip_mask_background_loss defaults False, zero behaviour change."""
+    from src.config import get_default_config
+    cfg = get_default_config()
+    assert cfg.data.strip_mask_background_loss is False
+
+
+def test_strip_mask_background_loss_requires_dual_branch_density() -> None:
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_density": False, "strip_mask_background_loss": True})
+    # with dual_branch_density=True it's valid (given the usual strip prerequisites)
+    OtolithConfig(data={"dual_branch_density": True, "mask_background": True,
+                        "strip_mask_background_loss": True},
+                  model={"use_density_head": True})
+
+
+def test_strip_mask_background_loss_rejects_multi_wycinek() -> None:
+    """08.09 fix is scoped to the single-wycinek path — must reject k>1 explicitly rather
+    than silently ignoring the mask for the multi-candidate branch."""
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_density": True, "mask_background": True,
+                            "strip_mask_background_loss": True, "multi_wycinek_k": 5},
+                      model={"use_density_head": True})
+    # k=1 (default) is fine
+    OtolithConfig(data={"dual_branch_density": True, "mask_background": True,
+                        "strip_mask_background_loss": True, "multi_wycinek_k": 1},
+                  model={"use_density_head": True})
+
+
 def test_entrypoint_info_mode(tmp_path) -> None:
     from src.entrypoint import run
     code = run(["--config", str(CONFIG_PATH), "--mode", "info"])

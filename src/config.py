@@ -182,6 +182,18 @@ class DataConfig(BaseModel):
     # matters (without it, "k best" collapses to k near-identical rays a few degrees apart).
     multi_wycinek_min_angle_sep_deg: float = Field(8.0, ge=0.0)
 
+    # Background-activation penalty for the strip's density loss (08.09, plans and summaries/
+    # 08.09_metodyka_i_diagnoza_paska.md) -- diagnosed cause of the strip branch's measured
+    # background-fixation (~40% of Track A/B's top-k density picks landed in the
+    # MASK_FILL_RGB-filled corridor beyond the real otolith edge, on every one of 42 ZEGAR
+    # images). False (default) = zero behaviour change: the dataset never builds the extra
+    # per-patch validity mask, and density_count_loss receives valid_mask=None exactly as
+    # today. True: OtolithDataset additionally computes/caches a per-patch tissue-validity
+    # mask (src/strip_extraction.py::get_or_compute_strip_validity) and the trainer passes it
+    # into density_count_loss, so background patches never enter the integral or the
+    # concentration loss's top-k "on" set, while still receiving a real "off" penalty.
+    strip_mask_background_loss: bool = False
+
     @field_validator("image_size")
     @classmethod
     def image_size_divisible(cls, v: int) -> int:
@@ -217,6 +229,17 @@ class DataConfig(BaseModel):
                     "data.dual_branch_density=True requires data.mask_background=True "
                     "(the strip is built from the masked image — see src/strip_extraction.py)"
                 )
+            if self.strip_mask_background_loss and self.multi_wycinek_k > 1:
+                raise ValueError(
+                    "data.strip_mask_background_loss=True is not yet supported together with "
+                    "data.multi_wycinek_k>1 (08.09 diagnosis/fix scoped to the single-wycinek "
+                    "path — see plans and summaries/08.09_metodyka_i_diagnoza_paska.md)"
+                )
+        elif self.strip_mask_background_loss:
+            raise ValueError(
+                "data.strip_mask_background_loss=True requires data.dual_branch_density=True "
+                "(the validity mask only makes sense for the strip density branch)"
+            )
         return self
 
 

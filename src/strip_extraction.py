@@ -136,6 +136,70 @@ def extract_strip_from_axis_info(
 
 
 # ---------------------------------------------------------------------------
+# Per-patch tissue validity mask (08.09, plans and summaries/
+# 08.09_metodyka_i_diagnoza_paska.md) -- diagnosed background-fixation fix: the strip's density
+# loss (src/model.py::density_count_loss's new `valid_mask` param) needs to know, per patch,
+# whether it lies on real otolith tissue or in the MASK_FILL_RGB-filled corridor beyond the
+# real edge. Warps the SEGMENTATION MASK (not the RGB image) with the EXACT SAME
+# `strip_transform_matrix` used by `extract_strip`, so the result lines up 1:1 with the strip's
+# own pixels/patches -- never re-derive this geometry independently.
+# ---------------------------------------------------------------------------
+
+def extract_strip_validity(
+    mask: np.ndarray,
+    centroid: tuple[float, float],
+    far_edge: tuple[float, float],
+    length_px: float,
+    strip_length_px: int,
+    strip_width_px: int,
+    patch_size: int,
+) -> np.ndarray:
+    """(h_p, w_p) float32 in [0, 1] -- fraction of each strip patch lying inside ``mask``.
+
+    ``mask`` is the ORIGINAL image's binary segmentation mask (same one ``extract_strip``
+    itself masks the background with before warping) -- NOT the already-warped strip image.
+    Nearest-neighbour interpolation (a fractional-mask blend would invent fake partial-tissue
+    values at the boundary) and ``borderValue=0`` (anywhere the warp's source footprint falls
+    outside the original image is invalid, same as outside the mask).
+
+    ``strip_length_px``/``strip_width_px`` must both be divisible by ``patch_size`` (already
+    validated at the config level, same guard as the strip dimensions themselves) so the
+    average-pool reshape below is exact, never truncating.
+    """
+    M = strip_transform_matrix(centroid, far_edge, length_px, strip_length_px, strip_width_px)
+    # Binarise FIRST (masks in this project are uint8 0/255, e.g. otolith_axis.segment_otolith's
+    # output -- ">0" is the established foreground test everywhere else, see e.g.
+    # apply_background_mask) so the warped values are exactly {0, 1} for NEAREST interpolation,
+    # never {0, 255}, before the patch-level average below turns them into a real [0, 1] fraction.
+    mask_bin = (mask > 0).astype(np.uint8)
+    warped = cv2.warpAffine(
+        mask_bin, M, (strip_length_px, strip_width_px),
+        flags=cv2.INTER_NEAREST, borderValue=0,
+    )
+    h_p, w_p = strip_width_px // patch_size, strip_length_px // patch_size
+    return (
+        warped.reshape(h_p, patch_size, w_p, patch_size)
+        .mean(axis=(1, 3))
+        .astype(np.float32)
+    )
+
+
+def extract_strip_validity_from_axis_info(
+    mask: np.ndarray,
+    axis_info: dict,
+    strip_length_px: int,
+    strip_width_px: int,
+    patch_size: int,
+) -> np.ndarray:
+    """Convenience wrapper unpacking ``axis_info`` into :func:`extract_strip_validity`'s
+    explicit arguments -- mirrors :func:`extract_strip_from_axis_info`."""
+    return extract_strip_validity(
+        mask, axis_info["centroid"], axis_info["far_edge"], axis_info["length_px"],
+        strip_length_px, strip_width_px, patch_size,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Strip cache I/O — mirrors otolith_axis.save_mask / load_mask / get_or_compute_mask exactly,
 # one cached strip per (image, strip_length_px, strip_width_px) combination. Callers are
 # responsible for keying ``cache_path`` by BOTH the image stem AND the strip dimensions (e.g. the
@@ -185,3 +249,50 @@ def get_or_compute_strip(
     strip, _M = extract_strip_from_axis_info(rgb, mask, axis_info, strip_length_px, strip_width_px)
     save_strip(strip, cache_path)
     return strip
+
+
+def save_strip_validity(valid: np.ndarray, path: str | Path) -> None:
+    """Save a validity mask as ``.npy`` (not PNG -- these are fractional [0,1] values at patch
+    resolution, not an 8-bit image)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, valid.astype(np.float32))
+
+
+def load_strip_validity(path: str | Path) -> Optional[np.ndarray]:
+    """Load a previously cached validity mask; returns ``None`` if missing/unreadable.
+    ``path`` should already end in ``.npy`` -- ``np.save`` only appends it when absent, and a
+    caller that always passes an explicit ``.npy`` name (as ``OtolithDataset`` does) avoids the
+    ambiguity of relying on that auto-append behaviour for the matching ``load``."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return np.load(path)
+    except Exception:
+        return None
+
+
+def get_or_compute_strip_validity(
+    mask: np.ndarray,
+    axis_info: dict,
+    cache_path: str | Path,
+    strip_length_px: int,
+    strip_width_px: int,
+    patch_size: int,
+) -> np.ndarray:
+    """Load ``cache_path`` if present and the right shape, else compute + cache it.
+
+    Mirrors :func:`get_or_compute_strip`'s pattern exactly, including the same deliberate
+    shape check on a cache hit (a stale mask cached at different strip/patch dimensions must
+    never be served silently -- the documented mask-cache collision bug class,
+    ``expert_annotation_eval.py``, 12.08).
+    """
+    h_p, w_p = strip_width_px // patch_size, strip_length_px // patch_size
+    cached = load_strip_validity(cache_path)
+    if cached is not None and cached.shape == (h_p, w_p):
+        return cached
+    valid = extract_strip_validity_from_axis_info(
+        mask, axis_info, strip_length_px, strip_width_px, patch_size)
+    save_strip_validity(valid, cache_path)
+    return valid

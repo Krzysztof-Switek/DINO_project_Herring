@@ -136,7 +136,8 @@ class Trainer:
                     polar_valid: Optional[torch.Tensor] = None,
                     polar_theta: Optional[torch.Tensor] = None,
                     zegar_heatmap: Optional[torch.Tensor] = None,
-                    has_zegar_target: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
+                    has_zegar_target: Optional[torch.Tensor] = None,
+                    strip_valid_mask: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
         """Weighted CORAL / MIL components + their sum, keyed by name.
 
         Returned so the trainer can log the head losses separately (report
@@ -153,7 +154,8 @@ class Trainer:
             # Computed on the STOP-GRADIENT density output → updates only the density
             # head, never the backbone / CORAL / MIL (age head safe by construction).
             parts["density"] = self.density_w * density_count_loss(
-                out["density"], ages, self.density_conc_w, self.density_tv_w
+                out["density"], ages, self.density_conc_w, self.density_tv_w,
+                valid_mask=strip_valid_mask,
             )
             if self.density_concentricity_w > 0.0 and polar_grid is not None:
                 B, N = out["density"].shape
@@ -186,10 +188,11 @@ class Trainer:
                        polar_valid: Optional[torch.Tensor] = None,
                        polar_theta: Optional[torch.Tensor] = None,
                        zegar_heatmap: Optional[torch.Tensor] = None,
-                       has_zegar_target: Optional[torch.Tensor] = None) -> torch.Tensor:
+                       has_zegar_target: Optional[torch.Tensor] = None,
+                       strip_valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Combined CORAL + MIL loss (the scalar we optimise)."""
         return self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta,
-                                 zegar_heatmap, has_zegar_target)["total"]
+                                 zegar_heatmap, has_zegar_target, strip_valid_mask)["total"]
 
     @staticmethod
     def _select_multi_wycinek(out: dict, ages: torch.Tensor) -> dict:
@@ -266,6 +269,13 @@ class Trainer:
             image_strip = batch.get("image_strip")
             if image_strip is not None:
                 image_strip = image_strip.to(self.device)
+            # Background-activation penalty (08.09) — only present when
+            # cfg.data.strip_mask_background_loss=True. Flattened (B,Hp,Wp)->(B,N)
+            # here, once, same pattern as polar_grid/polar_valid above.
+            strip_valid_mask = batch.get("strip_valid_mask")
+            if strip_valid_mask is not None:
+                strip_valid_mask = strip_valid_mask.to(self.device)
+                strip_valid_mask = strip_valid_mask.reshape(strip_valid_mask.shape[0], -1)
 
             self.optimizer.zero_grad()
             out = self.model(images, metadata=metadata, polar_t=polar_grid,
@@ -273,7 +283,7 @@ class Trainer:
                               density_image=image_strip)
             out = self._select_multi_wycinek(out, ages)
             loss = self._combined_loss(out, targets, ages, polar_grid, polar_valid, polar_theta,
-                                        zegar_heatmap, has_zegar_target)
+                                        zegar_heatmap, has_zegar_target, strip_valid_mask)
             loss.backward()
             self.optimizer.step()
 
@@ -333,13 +343,17 @@ class Trainer:
                 image_strip = batch.get("image_strip")
                 if image_strip is not None:
                     image_strip = image_strip.to(self.device)
+                strip_valid_mask = batch.get("strip_valid_mask")
+                if strip_valid_mask is not None:
+                    strip_valid_mask = strip_valid_mask.to(self.device)
+                    strip_valid_mask = strip_valid_mask.reshape(strip_valid_mask.shape[0], -1)
 
                 out = self.model(images, metadata=metadata, polar_t=polar_grid,
                                   polar_theta=polar_theta, polar_valid=polar_valid,
                                   density_image=image_strip)
                 out = self._select_multi_wycinek(out, ages)
                 parts = self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta,
-                                          zegar_heatmap, has_zegar_target)
+                                          zegar_heatmap, has_zegar_target, strip_valid_mask)
                 pred_ages = self._predict_age(out)
 
                 bs = images.size(0)

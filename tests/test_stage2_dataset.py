@@ -930,6 +930,108 @@ def test_dual_branch_density_age_ordinal_unaffected(ellipse_data, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Background-activation penalty (08.09) — strip_mask_background_loss
+# ---------------------------------------------------------------------------
+
+def _masked_strip_cfg(tmp_path, strip_length_px: int = 140, strip_width_px: int = 42):
+    cfg = _strip_cfg(tmp_path, strip_length_px, strip_width_px)
+    cfg.data.strip_mask_background_loss = True
+    return cfg
+
+
+def test_strip_mask_background_loss_off_leaves_no_valid_mask_key(ellipse_data, tmp_path):
+    """False (default) must be a complete no-op: no strip_valid_mask key at all."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _strip_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert "strip_valid_mask" not in item
+
+
+def test_strip_mask_background_loss_adds_correctly_shaped_valid_mask(ellipse_data, tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _masked_strip_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert item["image_strip"].shape == (3, 42, 140)
+    assert item["strip_valid_mask"].shape == (3, 10)   # (Wp/patch_size, Lp/patch_size)
+    assert item["strip_valid_mask"].min() >= 0.0
+    assert item["strip_valid_mask"].max() <= 1.0
+
+
+def test_strip_mask_background_loss_gracefully_falls_back_for_unsegmentable_image(dummy_data, tmp_path):
+    """dummy_data's images are flat solid colour — no foreground to segment. The
+    valid mask must fall back to all-ones (unknown geometry -> don't penalise
+    anything), never crash the dataset."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = dummy_data
+    cfg = _masked_strip_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert item["strip_valid_mask"].shape == (3, 10)
+    assert torch.allclose(item["strip_valid_mask"], torch.ones(3, 10))
+
+
+def test_strip_mask_background_loss_vflip_synced_with_image(ellipse_data, tmp_path, monkeypatch):
+    """The same explicit vertical-flip decision must relocate the valid mask in
+    lockstep with the strip image — same requirement already enforced for the E9
+    polar grid (test_polar_grid_flip_synced_with_image) and the zegar heatmap."""
+    import numpy as np
+    import torchvision.transforms as T
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+
+    monkeypatch.setattr(T.ColorJitter, "forward", lambda self, img: img)
+    cfg = _masked_strip_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    monkeypatch.setattr(ds, "_decide_strip_vflip", lambda: False)
+    baseline = ds[0]
+    monkeypatch.setattr(ds, "_decide_strip_vflip", lambda: True)
+    flipped = ds[0]
+
+    assert torch.allclose(flipped["image_strip"], torch.flip(baseline["image_strip"], dims=[1]), atol=1e-5)
+    expected = np.flipud(baseline["strip_valid_mask"].numpy())
+    assert np.allclose(flipped["strip_valid_mask"].numpy(), expected, atol=1e-6)
+    # Not a no-op — the ellipse fixture's mask isn't symmetric top/bottom by
+    # construction coincidence check would be flaky, so just assert the flip ran.
+    assert not torch.allclose(flipped["image_strip"], baseline["image_strip"])
+
+
+def test_strip_mask_background_loss_cache_reused_on_second_access(tmp_path, monkeypatch):
+    """Second access must hit the on-disk valid-mask cache, not recompute the
+    axis/warp (mirrors test_dual_branch_density_strip_cache_reused_on_second_access)."""
+    import cv2
+    import numpy as np
+    from src.dataset import OtolithDataset
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    arr = np.full((200, 160, 3), 255, dtype=np.uint8)
+    cv2.ellipse(arr, (80, 100), (50, 80), 0, 0, 360, (40, 40, 40), -1)
+    name = "fish_ellipse.png"
+    Image.fromarray(arr).save(img_dir / name)
+    csv_path = tmp_path / "labels.csv"
+    pd.DataFrame([{"image_id": name, "age": 4, "split": "test"}]).to_csv(csv_path, index=False)
+
+    cfg = _masked_strip_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "test", labels_csv=str(csv_path), image_dir=str(img_dir))
+    first_img = ds[0]["image_strip"]
+    first_valid = ds[0]["strip_valid_mask"]
+
+    def _boom(*a, **kw):
+        raise AssertionError("detect_axis should NOT be called on a cache hit")
+    monkeypatch.setattr("src.dataset.detect_axis", _boom)
+
+    second_img = ds[0]["image_strip"]
+    second_valid = ds[0]["strip_valid_mask"]
+    assert torch.allclose(first_img, second_img)
+    assert torch.allclose(first_valid, second_valid)
+
+
+# ---------------------------------------------------------------------------
 # Multi-wycinek experiment (03.09) — multi_wycinek_k > 1
 # ---------------------------------------------------------------------------
 

@@ -162,6 +162,7 @@ def density_count_loss(
     age: Tensor,
     conc_weight: float = 1.0,
     tv_weight: float = 0.0,
+    valid_mask: Optional[Tensor] = None,
 ) -> Tensor:
     """Count-consistency loss for the decoupled density-map counting head (Kierunek B).
 
@@ -177,19 +178,48 @@ def density_count_loss(
         density     : (B, N) per-patch density ∈ [0, 1]
         age         : (B,)   true integer ages (integral target + top-k count)
         conc_weight : weight of the concentration term relative to the count term
+        valid_mask  : optional (B, N) ∈ [0, 1], 1 = real tissue patch, 0 = background
+                      (e.g. the strip's MASK_FILL_RGB-filled corridor beyond the real
+                      otolith edge — 08.09, ``plans and summaries/
+                      08.09_metodyka_i_diagnoza_paska.md``). ``None`` (default)
+                      reproduces today's behaviour EXACTLY (every patch is valid) —
+                      mathematically identical to the pre-08.09 formula, not just
+                      "close": with an all-ones mask this ``masked_fill`` is a no-op,
+                      the sort order is unchanged, and ``on``/``off`` collapse to the
+                      original top-k/rest split. When given, background patches (a)
+                      never enter the integral (``count`` sums ``density * valid_mask``
+                      only) and (b) can never be selected into the top-k "on" set (they
+                      are ranked last, via ``-inf``) — but STILL receive a real ``l_off``
+                      penalty on their OWN density value (not on the ``-inf`` sentinel),
+                      so any residual background activation is actively suppressed
+                      instead of merely uncounted. Diagnosed cause this fixes: on the
+                      strip branch, a perfectly flat MASK_FILL_RGB background patch is a
+                      lower-variance, easier-to-detect pattern than the real (faint,
+                      noisy) ring texture — nothing in the un-masked loss ever told the
+                      density head "not there", so it learned to concentrate on the
+                      background instead (measured: ~40% of Track A/B's top-k picks
+                      landed outside the tissue mask, on every one of 42 ZEGAR images).
 
     Returns scalar loss. Meant to be computed on a STOP-GRADIENT input so it never
     reshapes the shared backbone (age head stays safe).
     """
-    count = density.sum(dim=1)                                        # (B,) integral
+    if valid_mask is None:
+        valid_mask = torch.ones_like(density)
+    count = (density * valid_mask).sum(dim=1)                         # (B,) integral, tissue-only
     l_count = F.smooth_l1_loss(count, age.float())
 
     B, N = density.shape
-    sorted_d, _ = torch.sort(density, dim=1, descending=True)         # (B, N) desc
+    # Rank by a masked key so background patches always sort last (never enter "on"),
+    # but recover the REAL density values afterward for the actual on/off penalties —
+    # sorting by -inf must never leak into ((1-sorted_d)**2) / (sorted_d**2) below.
+    rank_key = density.masked_fill(valid_mask < 0.5, float("-inf"))
+    _sorted_key, sort_idx = torch.sort(rank_key, dim=1, descending=True)  # (B, N) desc
+    sorted_d = torch.gather(density, 1, sort_idx)                     # real values, same order
+    sorted_valid = torch.gather(valid_mask, 1, sort_idx)
     ranks = torch.arange(N, device=density.device).unsqueeze(0)       # (1, N)
     k = age.long().clamp(min=0, max=N).unsqueeze(1)                   # (B, 1) = ⌈age⌉ on
-    on = (ranks < k).float()
-    off = 1.0 - on
+    on = (ranks < k).float() * sorted_valid                           # top-k AND real tissue
+    off = 1.0 - on                                                    # background always "off"
     n_on = on.sum(dim=1).clamp(min=1.0)
     n_off = off.sum(dim=1).clamp(min=1.0)
     l_on = (((1.0 - sorted_d) ** 2) * on).sum(dim=1) / n_on

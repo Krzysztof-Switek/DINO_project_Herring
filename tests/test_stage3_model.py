@@ -726,6 +726,62 @@ def test_density_tv_prior_penalises_scattered_more_than_coherent():
 
 
 # ---------------------------------------------------------------------------
+# 08.09 (plans and summaries/08.09_metodyka_i_diagnoza_paska.md): valid_mask param on
+# density_count_loss -- excludes background (strip MASK_FILL_RGB corridor) from the
+# count/concentration objective, fixing the measured ~40% background-fixation rate.
+# ---------------------------------------------------------------------------
+
+def test_density_count_loss_valid_mask_none_matches_all_ones():
+    """valid_mask=None must be BIT-IDENTICAL to an explicit all-ones mask -- the documented
+    backward-compatibility guarantee, not just "close"."""
+    from src.model import density_count_loss
+    torch.manual_seed(0)
+    density = torch.rand(3, 20)
+    ages = torch.tensor([2, 5, 8])
+    without = density_count_loss(density, ages, conc_weight=1.0, tv_weight=0.0)
+    with_ones = density_count_loss(
+        density, ages, conc_weight=1.0, tv_weight=0.0, valid_mask=torch.ones_like(density))
+    assert torch.equal(without, with_ones)
+
+
+def test_density_count_loss_excludes_background_from_count():
+    """A background cell with high density must not count toward the integral."""
+    from src.model import density_count_loss
+    density = torch.zeros(1, 4)
+    density[0, 0] = 0.9   # background, masked out
+    density[0, 1] = 0.1   # real tissue
+    valid_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0]])
+    ages = torch.tensor([1])
+    # Masked count = 0.1 (tissue only) vs age=1 -> large SmoothL1 term.
+    loss_masked = density_count_loss(density, ages, conc_weight=0.0, valid_mask=valid_mask)
+    # Unmasked count = 1.0, matches age=1 almost exactly -> near-zero term.
+    loss_unmasked = density_count_loss(density, ages, conc_weight=0.0)
+    assert float(loss_masked) > float(loss_unmasked)
+
+
+def test_density_count_loss_background_never_enters_on_set():
+    """A background cell with the single highest density value must never be selected into
+    the concentration loss's top-k "on" set, must not blow up the loss (the internal -inf
+    ranking sentinel must never leak into the returned value), and must still receive a REAL,
+    value-proportional "off" penalty."""
+    from src.model import density_count_loss
+    density = torch.tensor([[0.99, 0.5, 0.4, 0.01]])   # cell 0 is the strongest overall
+    valid_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0]])  # but cell 0 is background
+    ages = torch.tensor([1])                            # top-1 among TISSUE should be cell 1
+
+    loss = density_count_loss(density, ages, conc_weight=1.0, tv_weight=0.0, valid_mask=valid_mask)
+    assert torch.isfinite(loss), "background's -inf ranking key must never leak into the loss value"
+
+    # A quieter background cell must lower the loss -- proves the "off" penalty is real and
+    # proportional to the background cell's OWN value, not a fixed or ignored quantity.
+    density_bg_zero = density.clone()
+    density_bg_zero[0, 0] = 0.0
+    loss_bg_zero = density_count_loss(
+        density_bg_zero, ages, conc_weight=1.0, tv_weight=0.0, valid_mask=valid_mask)
+    assert float(loss_bg_zero) < float(loss)
+
+
+# ---------------------------------------------------------------------------
 # Change A (05.08): attention-based density head (density_head_type="attention")
 # ---------------------------------------------------------------------------
 

@@ -100,6 +100,89 @@ def _make_cfg(tmp_path: Path):
 # End-to-end test
 # ---------------------------------------------------------------------------
 
+def _make_strip_synthetic_data(root: Path) -> tuple[Path, Path]:
+    """Ellipse images (real segmentable foreground, unlike _make_synthetic_data's
+    random noise) so the dual_branch_density path's axis detection/warp actually runs
+    for real, not just its unsegmentable-image fallback."""
+    import cv2
+    img_dir = root / "images"
+    img_dir.mkdir()
+    rows = []
+    idx = 0
+    for split, n in [("train", 8), ("val", 4), ("test", 4)]:
+        for i in range(n):
+            fname = f"fish_{idx:03d}.png"
+            age = (i % (NUM_CLASSES - 1)) + 1
+            arr = np.full((200, 160, 3), 255, dtype=np.uint8)
+            cv2.ellipse(arr, (80, 100), (50, 80), 0, 0, 360, (40, 40, 40), -1)
+            PILImage.fromarray(arr, "RGB").save(img_dir / fname)
+            rows.append({"image_id": fname, "age": age, "split": split})
+            idx += 1
+    csv_path = root / "labels.csv"
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    return img_dir, csv_path
+
+
+def _make_strip_masked_cfg(tmp_path: Path):
+    from src.config import OtolithConfig
+    cfg = OtolithConfig()
+    cfg.model.num_age_classes = NUM_CLASSES
+    cfg.model.dropout = 0.0
+    cfg.model.use_density_head = True
+    cfg.data.image_size = 56
+    cfg.data.patch_size = 14
+    cfg.data.num_workers = 0
+    cfg.data.metadata_cols = []
+    cfg.data.mask_background = True
+    cfg.data.mask_cache_dir = str(tmp_path / "masks_cache")
+    cfg.data.dual_branch_density = True
+    cfg.data.strip_length_px = 140
+    cfg.data.strip_width_px = 42
+    cfg.data.strips_cache_dir = str(tmp_path / "strips_cache")
+    cfg.data.strip_mask_background_loss = True
+    cfg.training.epochs = 2
+    cfg.training.freeze_backbone_epochs = 1
+    cfg.training.batch_size = 4
+    cfg.training.device = "cpu"
+    cfg.training.scheduler = "none"
+    cfg.training.checkpoint_dir = str(tmp_path / "checkpoints")
+    cfg.training.log_dir = str(tmp_path / "logs")
+    return cfg
+
+
+def test_full_pipeline_strip_mask_background_loss(tmp_path):
+    """08.09 (plans and summaries/08.09_metodyka_i_diagnoza_paska.md): full-chain smoke
+    test for the background-activation penalty — OtolithDataset(dual_branch_density=True,
+    strip_mask_background_loss=True), with REAL segmentable images (so axis detection,
+    strip extraction, and extract_strip_validity all actually run, not just their
+    unsegmentable-image fallback) -> DataLoader -> Trainer.fit() must complete both
+    epochs without error and report a density_loss metric, exactly like every other
+    density-head config already covered by test_full_pipeline above.
+    """
+    from src.dataset import OtolithDataset
+    from src.model import OtolithModel
+    from src.trainer import Trainer
+
+    img_dir, csv_path = _make_strip_synthetic_data(tmp_path)
+    cfg = _make_strip_masked_cfg(tmp_path)
+    common = dict(labels_csv=str(csv_path), image_dir=str(img_dir))
+    ds_train = OtolithDataset(cfg, split="train", **common)
+    ds_val = OtolithDataset(cfg, split="val", **common)
+    train_loader = DataLoader(ds_train, batch_size=4, shuffle=False)
+    val_loader = DataLoader(ds_val, batch_size=4, shuffle=False)
+
+    item = ds_train[0]
+    assert item["image_strip"].shape == (3, 42, 140)
+    assert item["strip_valid_mask"].shape == (3, 10)
+
+    model = OtolithModel(cfg, backbone=_MockDinoBackbone())
+    trainer = Trainer(cfg, model, train_loader, val_loader)
+    trainer.fit()
+
+    assert not model.backbone_is_frozen()
+    assert trainer.last_val_metrics.get("density_loss") is not None
+
+
 def test_full_pipeline(tmp_path):
     from src.config import OtolithConfig
     from src.dataset import OtolithDataset

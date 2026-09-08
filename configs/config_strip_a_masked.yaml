@@ -1,0 +1,130 @@
+# 08.09 — Eksperyment "pasek, kara za tło" (Track A + valid_mask): identyczny z
+# config_strip_a.yaml poza JEDNĄ dodaną zmienną: data.strip_mask_background_loss=true.
+#
+# Kontekst i pełna diagnoza: plans and summaries/08.09_metodyka_i_diagnoza_paska.md.
+# Skrót: checkpoint Wariantu A (outputs/03.09_strip_a) systematycznie fixuje się na tło
+# (MASK_FILL_RGB, stała, zero-wariancji) zamiast na fakturę przyrostów — 40% wybranych
+# punktów na wszystkich 42/42 zdjęciach ZEGAR leży poza tkanką otolitu. Backbone koduje
+# realny sygnał granic przyrostów (zweryfikowane, test "c" w dokumencie diagnozy) —
+# problem leży w density_count_loss nigdy nie karzącym aktywację na tle, nie w backbone'ie
+# ani w jakości wejścia (kontrast nie pomógł, test osobny).
+#
+# Naprawa: density_count_loss dostaje teraz opcjonalny valid_mask (src/model.py, 08.09) —
+# maska tkanki/tła per patch paska (src/strip_extraction.py::extract_strip_validity,
+# warpAffine tej samej macierzy transformacji co sam pasek, na masce segmentacji zamiast
+# na RGB). Tło NIGDY nie liczy się do sumy (l_count) ani nie może wejść do zbioru top-k
+# "on" (l_conc) — ale wciąż dostaje realną karę l_off proporcjonalną do własnej aktywacji,
+# więc trening ma bodziec żeby ją WYGASIĆ, nie tylko ją zignorować przy dekodowaniu.
+#
+# JEDNA izolowana zmienna względem config_strip_a.yaml: strip_mask_background_loss.
+# Wszystko inne (seed, backbone, splity, augmentacje, harmonogram, wagi strat) identyczne,
+# żeby wynik był wprost porównywalny z Wariantem A na tej samej metodzie oceny
+# (scripts/diagnostics/full_strip_eval.py + outside_mask check, 42 obrazy ZEGAR).
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # niezmienione względem Run N / Wariantu A
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  head_type: both                 # coral | mil | both
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  density_conc_weight: 1.0        # wewnętrzny człon top-k w density_count_loss (NIE E9/Zmiana B)
+  density_tv_weight: 0.0          # identyczne z Wariantem A (patrz nagłówek config_strip_a.yaml)
+  density_head_type: mlp          # identyczne z Wariantem A — brak θ dla wyprostowanego paska
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  mask_background: true
+  mask_cache_dir: null
+
+  dual_branch_density: true
+  strip_length_px: 1330           # identyczne z Wariantem A — nie ablujemy geometrię tutaj
+  strip_width_px: 98
+  strips_cache_dir: null
+
+  # JEDYNA deklarowana zmiana względem config_strip_a.yaml (08.09) — patrz nagłówek pliku.
+  strip_mask_background_loss: true
+
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  # UWAGA: identyczna z config_strip_a.yaml — te pola sterują ścieżką kart raportu, która
+  # nie jest świadoma gałęzi paska. Prawdziwa lokalizacja tego biegu liczona osobno przez
+  # scripts/diagnostics/full_strip_eval.py (nie przez report.html).
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  density_image_size: 728
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8
