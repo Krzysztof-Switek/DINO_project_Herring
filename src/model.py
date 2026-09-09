@@ -17,7 +17,7 @@ Forward always returns a dict; callers select the head they need.
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -850,6 +850,13 @@ class OtolithModel(nn.Module):
         polar_theta: Optional[Tensor] = None,
         polar_valid: Optional[Tensor] = None,
         density_image: Optional[Tensor] = None,
+        density_polar_t: Optional[Tensor] = None,
+        density_polar_theta: Optional[Tensor] = None,
+        density_polar_valid: Optional[Tensor] = None,
+        density_image_bands: Optional[List[Tensor]] = None,
+        density_bands_polar_t: Optional[List[Tensor]] = None,
+        density_bands_polar_theta: Optional[List[Tensor]] = None,
+        density_bands_polar_valid: Optional[List[Tensor]] = None,
     ) -> Dict[str, Tensor]:
         """Return a dict of head outputs. Patches participate in autograd.
 
@@ -859,6 +866,16 @@ class OtolithModel(nn.Module):
         loss (``OtolithDataset._need_polar``), now ALSO forwarded into the density head
         itself when it is ``RadialAttentionDensityHead``. Every other head type ignores
         them (see their ``forward`` signatures) — passing them is always safe.
+
+        ``density_polar_t``/``density_polar_theta``/``density_polar_valid`` (09.09, polar-wedge
+        experiment, all optional, all ``None`` by default): the polar-aware density head's OWN
+        positional coordinates, for when ``density_image`` is a DIFFERENT geometry than ``image``
+        (e.g. ``src.wedge_extraction.wedge_polar_coords`` — each wedge patch's true (t, theta) is
+        known from the extraction's own construction, NOT the square image's segmentation-derived
+        grid). Used ONLY inside the ``density_image is not None`` branch below; when omitted
+        there, falls back to ``polar_t``/``polar_theta``/``polar_valid`` — this is why every
+        existing caller (Run N: no ``density_image``; the strip: ``density_head_type="mlp"``,
+        ignores all polar args regardless) is byte-identical, unaffected by adding these params.
 
         ``density_image`` (optional, 02.09 — dendrochronology-strip experiment, plans
         and summaries/02.09_wycinki_plan.md): when given, the density head reads patch
@@ -875,6 +892,27 @@ class OtolithModel(nn.Module):
         for them, which is the whole point of this parameter: it lets a caller (e.g.
         ``OtolithDataset``'s strip branch) feed the density head a totally different
         crop without the age heads' training dynamics changing at all.
+
+        ``density_image_bands``/``density_bands_polar_t/theta/valid`` (09.09, angular-resolution
+        bands, `plans and summaries/09.09_wycinek_pasma_katowe_plan.md` — all optional, all
+        ``None`` by default): a genuinely SEPARATE code path from ``density_image`` above, not an
+        alternative way to pass the same thing. ``density_image_bands`` is a **list** of K tensors
+        ``(B, C, H_k, W_k)``, each band its OWN shape (unlike multi-wycinek's ``density_image``,
+        where K candidates share ONE shape and stack into a single 5D tensor) — bands CANNOT be
+        stacked without padding, so each runs through its own ``torch.no_grad()`` backbone call
+        (K separate calls, not one batched ``(B*K, ...)`` call). The resulting K patch-token
+        sequences are concatenated along the patch dimension into ONE ``(B, sum(N_k), D)``
+        sequence — together with the correspondingly concatenated ``density_bands_polar_t/theta/
+        valid`` — before reaching ``self.density_head``, which needs no change of its own to
+        accept this (its attention already operates on a flat ``(B, N, D)`` sequence with
+        accompanying ``(B, N)`` positions, never assuming a rectangular ``(H_p, W_p)`` grid — see
+        the plan's architecture section). Requires a polar-aware ``density_head_type`` (raises
+        ``NotImplementedError`` for ``"mlp"``, which has no use for per-patch positions or
+        concatenation semantics — use the existing ``density_image`` path for that instead).
+        Mutually exclusive with ``density_image`` in practice (a caller supplies one or the
+        other), though nothing here enforces that explicitly — ``density_image_bands`` is checked
+        FIRST, so supplying both would silently prefer bands; every existing caller passes at most
+        one of the two.
         """
         # NOTE: forward_features WITHOUT torch.no_grad — patches must
         # backpropagate when the MIL head is active.
@@ -896,7 +934,35 @@ class OtolithModel(nn.Module):
             out["patch_probs"] = patch_probs
             out["patch_count"] = patch_probs.sum(dim=1)           # (B,)
 
-        if self.use_density_head:
+        if self.use_density_head and density_image_bands is not None:
+            # Angular-resolution bands (09.09) — see the density_image_bands docstring above for
+            # why this is a genuinely separate path, not a variant of density_image's own 5D
+            # multi-wycinek handling below.
+            if self.density_head_type == "mlp":
+                raise NotImplementedError(
+                    "density_image_bands requires a polar-aware density_head_type "
+                    "(radial_attention) — 'mlp' has no use for per-patch positions or "
+                    "cross-band concatenation; use density_image for the single-canvas path."
+                )
+            band_tokens = []
+            for band_img in density_image_bands:
+                with torch.no_grad():
+                    band_feats = self.backbone.forward_features(band_img)
+                band_tokens.append(band_feats["x_norm_patchtokens"])   # (B, N_k, D)
+            detached = torch.cat(band_tokens, dim=1)                    # (B, sum(N_k), D)
+            dp_t = (torch.cat(density_bands_polar_t, dim=1)
+                    if density_bands_polar_t is not None else None)
+            dp_theta = (torch.cat(density_bands_polar_theta, dim=1)
+                       if density_bands_polar_theta is not None else None)
+            dp_valid = (torch.cat(density_bands_polar_valid, dim=1)
+                       if density_bands_polar_valid is not None else None)
+            dens_logits = self.density_head(
+                detached, polar_t=dp_t, polar_theta=dp_theta, polar_valid=dp_valid,
+            ).squeeze(-1)                                                # (B, sum(N_k))
+            density = torch.sigmoid(dens_logits)
+            out["density"] = density
+            out["density_count"] = density.sum(dim=-1)                   # (B,)
+        elif self.use_density_head:
             # Multi-wycinek (03.09, plans and summaries/03.09_multi_wycinek_plan.md):
             # density_image is (B, K, C, H, W) instead of (B, C, H, W) when the caller
             # (OtolithDataset.__getitem__ with multi_wycinek_k>1) supplies K candidate
@@ -940,9 +1006,17 @@ class OtolithModel(nn.Module):
                 # Bare nn.Sequential (see __init__) — takes ONLY the tensor, no kwargs.
                 dens_logits = self.density_head(detached).squeeze(-1)       # (B[*K], N)
             else:
+                # 09.09: when density reads from a SEPARATE geometry (density_image), its own
+                # polar coordinates (if supplied) take priority over polar_t/theta/valid, which
+                # describe `image`'s grid, not density_image's — see the density_polar_* docstring
+                # above. None (default) falls back to today's exact behaviour.
+                if density_image is not None and density_polar_t is not None:
+                    dp_t, dp_theta, dp_valid = density_polar_t, density_polar_theta, density_polar_valid
+                else:
+                    dp_t, dp_theta, dp_valid = polar_t, polar_theta, polar_valid
                 dens_logits = self.density_head(
-                    detached, polar_t=polar_t, polar_theta=polar_theta,
-                    polar_valid=polar_valid,
+                    detached, polar_t=dp_t, polar_theta=dp_theta,
+                    polar_valid=dp_valid,
                 ).squeeze(-1)                                               # (B, N)
             density = torch.sigmoid(dens_logits)                            # (B[*K], N) ∈ [0,1]
             if is_multi:
@@ -1065,6 +1139,39 @@ class OtolithModel(nn.Module):
         B, N = density.shape
         H_p, W_p = _resolve_patch_grid(N, patch_grid)
         return density.reshape(B, H_p, W_p)
+
+    def get_density_probs_bands(
+        self,
+        images: List[Tensor],
+        polar_t: Optional[List[Tensor]] = None,
+        polar_theta: Optional[List[Tensor]] = None,
+        polar_valid: Optional[List[Tensor]] = None,
+    ) -> Tensor:
+        """Decoupled density map for the angular-resolution-bands path (09.09,
+        `plans and summaries/09.09_wycinek_pasma_katowe_plan.md`) — mirrors
+        :meth:`get_density_probs`, but returns the concatenated ``(B, sum(N_k))`` FLAT sequence
+        directly: unlike a single wedge/strip, bands of different shapes have no one rectangular
+        ``(H_p, W_p)`` to reshape into. A caller decoding peaks from this (e.g.
+        ``scripts/diagnostics/train_zegar_localization_head.py::decode_topk_peaks_real_t``)
+        already has the per-patch ``(t, theta)`` from the SAME ``polar_t``/``polar_theta`` lists
+        it passed in here — concatenate them the same way to line up with this method's output.
+
+        Raises if the model was built without a density head. ``images[0]`` is passed as
+        ``forward()``'s required ``image`` positional argument purely to satisfy its signature —
+        its own (CORAL/MIL) output is discarded here, only ``out["density"]`` is used, which
+        comes entirely from ``density_image_bands`` instead.
+        """
+        if not hasattr(self, "density_head"):
+            raise RuntimeError(
+                "Model has no density head (model.use_density_head=false)"
+            )
+        with torch.no_grad():
+            out = self.forward(
+                images[0], density_image_bands=images,
+                density_bands_polar_t=polar_t, density_bands_polar_theta=polar_theta,
+                density_bands_polar_valid=polar_valid,
+            )
+        return out["density"]                            # (B, sum(N_k))
 
     # ------------------------------------------------------------------
     # Backbone freeze control

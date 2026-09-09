@@ -18,6 +18,12 @@ from src.otolith_axis import (apply_background_mask, compute_polar_grid, detect_
                               resolve_centroid)
 from src.strip_extraction import (get_or_compute_strip, get_or_compute_strip_validity,
                                   load_strip, load_strip_validity)
+from src.wedge_extraction import (WedgeBandGeometry, extract_polar_wedge_band,
+                                  extract_polar_wedge_band_validity, extract_polar_wedge_validity,
+                                  get_or_compute_wedge, load_wedge, save_wedge,
+                                  wedge_band_geometries_from_axis_info, wedge_band_polar_coords,
+                                  wedge_band_row_frac_edges, wedge_geometry_from_axis_info,
+                                  wedge_polar_coords)
 
 REQUIRED_COLUMNS = {"image_id", "age", "split"}
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".tif", ".tiff"]
@@ -73,6 +79,7 @@ def decode_age_ordinal(logits: torch.Tensor) -> torch.Tensor:
 
 def build_transforms(
     image_size: int, split: str, include_flips: bool = True, strip: bool = False,
+    wedge: bool = False,
 ) -> transforms.Compose:
     """``include_flips=False`` drops RandomHorizontalFlip/RandomVerticalFlip from the
     train pipeline — used when a caller needs to apply an IDENTICAL random flip
@@ -92,14 +99,27 @@ def build_transforms(
     ``RandomVerticalFlip`` (mirrors across the width axis, meaning-preserving) is
     unaffected by ``strip`` and needs no cross-tensor sync here (unlike the polar-grid
     case above) — the strip branch has no second geometric tensor riding along with it.
+
+    ``wedge=True`` (09.09, polar-wedge experiment — see
+    ``OtolithDataset._load_wedge_image``): input is already the exact target size
+    (``src.wedge_extraction.extract_polar_wedge``'s output), Resize skipped, same as
+    ``strip``. The flip logic is the OPPOSITE of the strip's, because the two axes mean
+    opposite things: a wedge's ROWS are radius (nucleus -> far edge, t=0..1) — reversing
+    them would be the same reading-direction violation ``strip`` avoids by dropping
+    horizontal flip, so ``RandomVerticalFlip`` is unconditionally dropped here. A
+    wedge's COLUMNS are angle around the reading axis — mirroring them (angle -> -angle)
+    is a genuine geometric reflection symmetry (a ring seen swept one angular direction
+    looks structurally the same swept the other way), so ``RandomHorizontalFlip`` is
+    kept, unlike the strip's own dropped horizontal flip.
     """
-    resize_op = [] if strip else [transforms.Resize((image_size, image_size))]
+    resize_op = [] if (strip or wedge) else [transforms.Resize((image_size, image_size))]
     if split == "train":
         ops = list(resize_op)
         if include_flips:
             if not strip:
                 ops.append(transforms.RandomHorizontalFlip())
-            ops.append(transforms.RandomVerticalFlip())
+            if not wedge:
+                ops.append(transforms.RandomVerticalFlip())
         ops += [
             transforms.ColorJitter(brightness=0.2, contrast=0.2),
             transforms.ToTensor(),
@@ -295,6 +315,67 @@ class OtolithDataset(Dataset):
             # behaviour, zero change.
             self.multi_wycinek_k = cfg.data.multi_wycinek_k
 
+        # Polar-wedge experiment (09.09, plans and summaries/
+        # 09.09_pasek_maskowanie_wyniki_i_literatura.md follow-up) — alternative
+        # dual-branch geometry to the strip above (config.py forbids both at once).
+        # False (default) = zero extra cost, mirrors dual_branch_density.
+        self.dual_branch_wedge = cfg.data.dual_branch_wedge
+        self.wedges_cache_dir: Optional[Path] = None
+        self.wedge_transform_no_flip: Optional[transforms.Compose] = None
+        if self.dual_branch_wedge:
+            base_wedges_dir = (Path(cfg.data.wedge_cache_dir) if cfg.data.wedge_cache_dir
+                               else root / "data" / "wedges_cache")
+            wedge_w_px = cfg.data.wedge_n_angle_patches * cfg.data.patch_size
+            wedge_h_px = cfg.data.wedge_n_radius_patches * cfg.data.patch_size
+            # Dimension+angle-keyed subdirectory — same "never silently serve a stale,
+            # wrong-shape cache" lesson as strips_cache_dir/strip_mask_cache_dir.
+            self.wedges_cache_dir = (
+                base_wedges_dir / f"{wedge_h_px}x{wedge_w_px}_{cfg.data.wedge_delta_theta_deg:g}deg"
+            )
+            self.wedges_cache_dir.mkdir(parents=True, exist_ok=True)
+            self.wedge_delta_theta_deg = cfg.data.wedge_delta_theta_deg
+            self.wedge_canvas_w = wedge_w_px
+            self.wedge_canvas_h = wedge_h_px
+            # include_flips=False: the horizontal (angular-mirror) flip decision must be
+            # made explicitly and applied identically to the wedge image AND its
+            # polar_t/theta/valid tensors — same reason self.strip_transform_no_flip
+            # exists for the strip's masked variant (Compose's own random flip can't be
+            # replayed on a second tensor).
+            self.wedge_transform_no_flip = build_transforms(
+                wedge_w_px, split, include_flips=False, wedge=True)
+
+        # Angular-resolution bands (09.09 follow-up, plans and summaries/
+        # 09.09_wycinek_pasma_katowe_plan.md) — opt-in ON TOP OF dual_branch_wedge above (config.py
+        # requires wedge_band_* to be all-None or all-set together, and dual_branch_wedge=True).
+        # None (default) = zero extra cost, mirrors every other experiment flag in this class.
+        self.wedge_bands_enabled = cfg.data.wedge_band_edges_t is not None
+        self.wedge_band_geoms_cache_dirs: list[Path] = []
+        self.wedge_band_canvas_w: list[int] = []
+        self.wedge_band_canvas_h: list[int] = []
+        self.wedge_band_row_fracs: Optional[np.ndarray] = None
+        self.wedge_band_transform_no_flip: Optional[transforms.Compose] = None
+        if self.wedge_bands_enabled:
+            self.wedge_band_edges_t = list(cfg.data.wedge_band_edges_t)
+            self.wedge_band_row_fracs = wedge_band_row_frac_edges(self.wedge_band_edges_t)
+            self.wedge_band_canvas_w = [n * cfg.data.patch_size
+                                        for n in cfg.data.wedge_band_n_angle_patches]
+            self.wedge_band_canvas_h = [n * cfg.data.patch_size
+                                        for n in cfg.data.wedge_band_n_radius_patches]
+            base_bands_dir = (Path(cfg.data.wedge_bands_cache_dir) if cfg.data.wedge_bands_cache_dir
+                              else root / "data" / "wedge_bands_cache")
+            n_bands = len(self.wedge_band_canvas_w)
+            for i in range(n_bands):
+                band_dir = (base_bands_dir /
+                           f"band{i}_{self.wedge_band_canvas_h[i]}x{self.wedge_band_canvas_w[i]}_"
+                           f"{cfg.data.wedge_delta_theta_deg:g}deg")
+                band_dir.mkdir(parents=True, exist_ok=True)
+                self.wedge_band_geoms_cache_dirs.append(band_dir)
+            # build_transforms(wedge=True) skips Resize entirely (input already the exact target
+            # size) — size-agnostic, so ONE shared transform serves every band regardless of its
+            # own (different) canvas width; the first positional arg is unused in that path.
+            self.wedge_band_transform_no_flip = build_transforms(
+                1, split, include_flips=False, wedge=True)
+
     # ------------------------------------------------------------------
     # Demo mode — limit dataset right at the source
     # ------------------------------------------------------------------
@@ -411,6 +492,25 @@ class OtolithDataset(Dataset):
                 sample["strip_valid_mask"] = strip_valid_mask
             else:
                 sample["image_strip"] = self._load_strip_image(image_id)
+
+        if self.dual_branch_wedge and not self.wedge_bands_enabled:
+            # Bands REPLACE the single-canvas wedge (not additive) — computing both would waste
+            # a full extra extraction/backbone-worth of tensors per sample for no benefit; a
+            # config with wedge_band_edges_t set is asking for the band geometry, not both.
+            (image_wedge, wedge_polar_t,
+             wedge_polar_theta, wedge_polar_valid) = self._build_wedge_tensor_and_polar(image_id)
+            sample["image_wedge"] = image_wedge
+            sample["wedge_polar_t"] = wedge_polar_t
+            sample["wedge_polar_theta"] = wedge_polar_theta
+            sample["wedge_polar_valid"] = wedge_polar_valid
+
+        if self.wedge_bands_enabled:
+            for i, (band_img, band_t, band_theta, band_valid) in enumerate(
+                    self._build_wedge_bands_tensors_and_polar(image_id)):
+                sample[f"image_wedge_band{i}"] = band_img
+                sample[f"wedge_band{i}_polar_t"] = band_t
+                sample[f"wedge_band{i}_polar_theta"] = band_theta
+                sample[f"wedge_band{i}_polar_valid"] = band_valid
 
         return sample
 
@@ -766,6 +866,216 @@ class OtolithDataset(Dataset):
 
         tensors = [self.strip_transform(Image.fromarray(s)) for s in strips]
         return torch.stack(tensors, dim=0)
+
+    # ------------------------------------------------------------------
+    # Polar-wedge branch (09.09) — see src/wedge_extraction.py's module docstring for
+    # the geometry and literature this is based on.
+    # ------------------------------------------------------------------
+
+    def _decide_wedge_hflip(self) -> bool:
+        """Split out purely so tests can force a flip via monkeypatching — mirrors
+        _decide_strip_vflip's rationale exactly, same reason."""
+        return torch.rand(()).item() < 0.5
+
+    def _build_wedge_tensor_and_polar(self, image_id: str) -> tuple:
+        """Wedge image + its per-patch (t, theta, valid) polar coordinates, built
+        TOGETHER so the same random horizontal (angular-mirror) flip is applied to
+        all four — keeping RadialAttentionDensityHead's positional encoding aligned
+        with the pixels it describes. Cannot reuse a plain Compose with its own
+        RandomHorizontalFlip here for the same reason _build_strip_tensor_and_valid_
+        mask can't: a second (here: three more) tensor needs the IDENTICAL flip
+        decision replayed on it, which torchvision's built-in random transforms have
+        no hook for.
+
+        Checks the wedge-image cache FIRST (get_or_compute_wedge) — a cache hit still
+        needs the real mask (cheap, itself cached by get_or_compute_mask) to compute
+        the validity mask, but never needs to re-run axis-finding/extraction.
+        """
+        stem = Path(image_id).stem
+        wedge_cache_path = self.wedges_cache_dir / f"{stem}_wedge.png"
+        patch_size = self.cfg.data.patch_size
+
+        rgb = self._load_raw_rgb(image_id)
+        mask_cache_path = self.mask_cache_dir / f"{stem}_mask.png"
+        mask = get_or_compute_mask(rgb, mask_cache_path, seg_params=self.cfg.segmentation.as_params())
+
+        # Wedge-image cache checked BEFORE detect_axis: a cache hit already carries its
+        # own WedgeGeometry (saved alongside the .png as .geom.npz), so re-running real
+        # axis-finding is unnecessary — mirrors get_or_compute_strip's own cache-first
+        # short-circuit (see test_dual_branch_wedge_cache_reused_on_second_access).
+        cached = load_wedge(wedge_cache_path) if mask is not None else None
+        if cached is not None and cached[0].shape[:2] == (self.wedge_canvas_h, self.wedge_canvas_w):
+            wedge_arr, geom = cached
+            h_p, w_p = self.cfg.data.wedge_n_radius_patches, self.cfg.data.wedge_n_angle_patches
+            t_grid, theta_grid = wedge_polar_coords(geom, patch_size)
+            valid_grid = extract_polar_wedge_validity(mask, geom, patch_size)
+            wedge_img = Image.fromarray(wedge_arr)
+            if self.split == "train" and self._decide_wedge_hflip():
+                wedge_img = wedge_img.transpose(Image.FLIP_LEFT_RIGHT)
+                t_grid, theta_grid, valid_grid = (np.flip(a, axis=1).copy()
+                                                  for a in (t_grid, theta_grid, valid_grid))
+            return (self.wedge_transform_no_flip(wedge_img),
+                    torch.from_numpy(t_grid), torch.from_numpy(theta_grid),
+                    torch.from_numpy(valid_grid))
+
+        axis_info = None
+        if mask is not None:
+            axis_info = detect_axis(
+                rgb, seg_params=self.cfg.segmentation.as_params(),
+                nucleus_method=self.cfg.segmentation.nucleus_method,
+                axis_method=self.cfg.segmentation.axis_method,
+                mask=mask,
+            )
+
+        h_p = self.cfg.data.wedge_n_radius_patches
+        w_p = self.cfg.data.wedge_n_angle_patches
+        if mask is None or axis_info is None:
+            # Never crash training on a bad photo — plain resize + an all-valid mask
+            # (unknown geometry means "don't penalise anything"), same philosophy as
+            # every other fallback in this module. Polar coords still make sense (they
+            # come from the CANVAS geometry, not the failed segmentation) — reuse a
+            # throwaway WedgeGeometry centred at the image's own centre, angle 0, so
+            # wedge_polar_coords has something consistent to compute from.
+            fallback = Image.fromarray(rgb).resize(
+                (self.wedge_canvas_w, self.wedge_canvas_h), Image.BILINEAR)
+            dummy_geom = wedge_geometry_from_axis_info(
+                np.ones(rgb.shape[:2], dtype=np.uint8) * 255,
+                {"centroid": (rgb.shape[1] / 2, rgb.shape[0] / 2),
+                 "far_edge": (rgb.shape[1], rgb.shape[0] / 2)},
+                self.wedge_delta_theta_deg, self.wedge_canvas_w, self.wedge_canvas_h,
+            )
+            t_grid, theta_grid = wedge_polar_coords(dummy_geom, patch_size)
+            valid_grid = np.ones((h_p, w_p), dtype=np.float32)
+            if self.split == "train" and self._decide_wedge_hflip():
+                fallback = fallback.transpose(Image.FLIP_LEFT_RIGHT)
+                t_grid, theta_grid, valid_grid = (np.flip(a, axis=1).copy()
+                                                  for a in (t_grid, theta_grid, valid_grid))
+            return (self.wedge_transform_no_flip(fallback),
+                    torch.from_numpy(t_grid), torch.from_numpy(theta_grid),
+                    torch.from_numpy(valid_grid))
+
+        wedge_arr, geom = get_or_compute_wedge(
+            rgb, mask, axis_info, wedge_cache_path,
+            self.wedge_delta_theta_deg, self.wedge_canvas_w, self.wedge_canvas_h,
+        )
+        t_grid, theta_grid = wedge_polar_coords(geom, patch_size)
+        valid_grid = extract_polar_wedge_validity(mask, geom, patch_size)
+
+        wedge_img = Image.fromarray(wedge_arr)
+        if self.split == "train" and self._decide_wedge_hflip():
+            wedge_img = wedge_img.transpose(Image.FLIP_LEFT_RIGHT)
+            t_grid, theta_grid, valid_grid = (np.flip(a, axis=1).copy()
+                                              for a in (t_grid, theta_grid, valid_grid))
+        return (self.wedge_transform_no_flip(wedge_img),
+                torch.from_numpy(t_grid), torch.from_numpy(theta_grid),
+                torch.from_numpy(valid_grid))
+
+    # ------------------------------------------------------------------
+    # Angular-resolution bands (09.09 follow-up) — plans and summaries/
+    # 09.09_wycinek_pasma_katowe_plan.md. REPLACES the single-canvas wedge above (not additive,
+    # see __getitem__) when cfg.data.wedge_band_edges_t is set.
+    # ------------------------------------------------------------------
+
+    def _finish_wedge_bands(
+        self, wedge_arrs: list, bands: list, mask: np.ndarray,
+        valid_override: Optional[float] = None,
+    ) -> list:
+        """Shared tail for all three code paths below (cache-hit / segmentation-failure fallback /
+        freshly-extracted): computes each band's polar coords + validity, then applies ONE SHARED
+        flip decision (not one per band) to every band's image and polar tensors together —
+        mirrors _build_wedge_tensor_and_polar's own single-flip-per-sample discipline exactly, just
+        replayed across N bands instead of one canvas."""
+        patch_size = self.cfg.data.patch_size
+        do_flip = self.split == "train" and self._decide_wedge_hflip()
+        results = []
+        for arr, band in zip(wedge_arrs, bands):
+            t_grid, theta_grid = wedge_band_polar_coords(band, patch_size)
+            if valid_override is not None:
+                h_p = band.geom.canvas_h // patch_size
+                w_p = band.geom.canvas_w // patch_size
+                valid_grid = np.full((h_p, w_p), valid_override, dtype=np.float32)
+            else:
+                valid_grid = extract_polar_wedge_band_validity(mask, band, patch_size)
+            img = Image.fromarray(arr)
+            if do_flip:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                t_grid, theta_grid, valid_grid = (np.flip(a, axis=1).copy()
+                                                  for a in (t_grid, theta_grid, valid_grid))
+            results.append((self.wedge_band_transform_no_flip(img),
+                            torch.from_numpy(t_grid), torch.from_numpy(theta_grid),
+                            torch.from_numpy(valid_grid)))
+        return results
+
+    def _build_wedge_bands_tensors_and_polar(self, image_id: str) -> list:
+        """Returns a list of ``(image, polar_t, polar_theta, polar_valid)`` tuples, one per band —
+        mirrors :meth:`_build_wedge_tensor_and_polar`'s three-path structure (cache-hit /
+        segmentation-failure fallback / freshly-extracted), generalised to N bands sharing ONE
+        mask/axis_info/ray-cast computation instead of duplicating it per band."""
+        stem = Path(image_id).stem
+        patch_size = self.cfg.data.patch_size
+        n_bands = len(self.wedge_band_canvas_w)
+        band_cache_paths = [self.wedge_band_geoms_cache_dirs[i] / f"{stem}_wedge_band{i}.png"
+                            for i in range(n_bands)]
+
+        rgb = self._load_raw_rgb(image_id)
+        mask_cache_path = self.mask_cache_dir / f"{stem}_mask.png"
+        mask = get_or_compute_mask(rgb, mask_cache_path, seg_params=self.cfg.segmentation.as_params())
+
+        # Cache-hit path: ALL bands present at the right shape -> reconstruct WedgeBandGeometry
+        # from each cached .geom.npz (row_frac_lo/hi are fixed config values, not per-image —
+        # wedge_band_row_fracs was precomputed once in __init__) — no detect_axis needed, mirrors
+        # the single-band wedge's own cache-first short-circuit.
+        if mask is not None:
+            loaded = [load_wedge(p) for p in band_cache_paths]
+            if all(l is not None and l[0].shape[:2] == (self.wedge_band_canvas_h[i],
+                                                          self.wedge_band_canvas_w[i])
+                   for i, l in enumerate(loaded)):
+                bands = [
+                    WedgeBandGeometry(geom=geom,
+                                      row_frac_lo=float(self.wedge_band_row_fracs[i]),
+                                      row_frac_hi=float(self.wedge_band_row_fracs[i + 1]))
+                    for i, (_arr, geom) in enumerate(loaded)
+                ]
+                wedge_arrs = [arr for arr, _geom in loaded]
+                return self._finish_wedge_bands(wedge_arrs, bands, mask)
+
+        axis_info = None
+        if mask is not None:
+            axis_info = detect_axis(
+                rgb, seg_params=self.cfg.segmentation.as_params(),
+                nucleus_method=self.cfg.segmentation.nucleus_method,
+                axis_method=self.cfg.segmentation.axis_method,
+                mask=mask,
+            )
+
+        if mask is None or axis_info is None:
+            # Never crash training on a bad photo — same philosophy as _build_wedge_tensor_and_
+            # polar's own fallback: plain per-band resize + all-valid mask (unknown geometry means
+            # "don't penalise anything"). Reuses a throwaway centred axis so wedge_band_polar_
+            # coords still has something consistent to compute from.
+            dummy_mask = np.ones(rgb.shape[:2], dtype=np.uint8) * 255
+            dummy_axis_info = {"centroid": (rgb.shape[1] / 2, rgb.shape[0] / 2),
+                               "far_edge": (rgb.shape[1], rgb.shape[0] / 2)}
+            bands = wedge_band_geometries_from_axis_info(
+                dummy_mask, dummy_axis_info, self.cfg.data.wedge_delta_theta_deg,
+                self.wedge_band_edges_t, self.wedge_band_canvas_w, self.wedge_band_canvas_h,
+            )
+            wedge_arrs = [
+                np.array(Image.fromarray(rgb).resize((w, h), Image.BILINEAR))
+                for w, h in zip(self.wedge_band_canvas_w, self.wedge_band_canvas_h)
+            ]
+            return self._finish_wedge_bands(wedge_arrs, bands, dummy_mask, valid_override=1.0)
+
+        bands = wedge_band_geometries_from_axis_info(
+            mask, axis_info, self.cfg.data.wedge_delta_theta_deg,
+            self.wedge_band_edges_t, self.wedge_band_canvas_w, self.wedge_band_canvas_h,
+        )
+        wedge_arrs = []
+        for i, band in enumerate(bands):
+            arr = extract_polar_wedge_band(rgb, mask, band)
+            save_wedge(arr, band.geom, band_cache_paths[i])
+            wedge_arrs.append(arr)
+        return self._finish_wedge_bands(wedge_arrs, bands, mask)
 
     # ------------------------------------------------------------------
     # Metadata encoding

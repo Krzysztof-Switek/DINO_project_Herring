@@ -61,6 +61,13 @@ class Trainer:
         self.zegar_position_w = getattr(cfg.model, "zegar_position_weight", 0.0)
         self.last_val_metrics: dict = {}   # Section-B diagnostics from validate()
 
+        # Angular-resolution bands (09.09, plans and summaries/09.09_wycinek_pasma_katowe_plan.md)
+        # — 0 (default, wedge_band_edges_t=None) = zero extra cost, mirrors every other
+        # experiment flag. Number of bands is config-driven (not hardcoded to 4) since the
+        # dataset field names (image_wedge_band0, ...) and batch keys depend on it.
+        band_edges = getattr(cfg.data, "wedge_band_edges_t", None)
+        self.n_wedge_bands = len(band_edges) - 1 if band_edges else 0
+
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
 
@@ -137,11 +144,26 @@ class Trainer:
                     polar_theta: Optional[torch.Tensor] = None,
                     zegar_heatmap: Optional[torch.Tensor] = None,
                     has_zegar_target: Optional[torch.Tensor] = None,
-                    strip_valid_mask: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
+                    strip_valid_mask: Optional[torch.Tensor] = None,
+                    wedge_valid_mask: Optional[torch.Tensor] = None,
+                    wedge_bands_valid_mask: Optional[torch.Tensor] = None) -> dict[str, torch.Tensor]:
         """Weighted CORAL / MIL components + their sum, keyed by name.
 
         Returned so the trainer can log the head losses separately (report
         Section B — "which head is learning"). ``total`` is what we backprop.
+
+        ``wedge_valid_mask`` (09.09, polar-wedge experiment): the wedge's own tissue-
+        fraction validity (``extract_polar_wedge_validity``, same role as
+        ``strip_valid_mask`` for the strip — background-cell exclusion from the count
+        integral), kept as a SEPARATE param rather than overloading
+        ``strip_valid_mask`` since ``dual_branch_density``/``dual_branch_wedge`` are
+        config-mutually-exclusive but the trainer itself makes no such assumption.
+
+        ``wedge_bands_valid_mask`` (09.09, angular-resolution bands): the per-band tissue
+        validities (``extract_polar_wedge_band_validity``), already concatenated across all
+        bands by the caller to match ``out["density"])``'s own ``(B, sum(N_k))`` shape — same
+        role as ``wedge_valid_mask``, kept separate since bands REPLACE (not add to) the
+        single-canvas wedge, so a given batch carries at most one of the two.
         """
         parts: dict[str, torch.Tensor] = {}
         if "coral_logits" in out:
@@ -153,9 +175,12 @@ class Trainer:
         if "density" in out:
             # Computed on the STOP-GRADIENT density output → updates only the density
             # head, never the backbone / CORAL / MIL (age head safe by construction).
+            density_valid_mask = (strip_valid_mask if strip_valid_mask is not None
+                                  else wedge_valid_mask if wedge_valid_mask is not None
+                                  else wedge_bands_valid_mask)
             parts["density"] = self.density_w * density_count_loss(
                 out["density"], ages, self.density_conc_w, self.density_tv_w,
-                valid_mask=strip_valid_mask,
+                valid_mask=density_valid_mask,
             )
             if self.density_concentricity_w > 0.0 and polar_grid is not None:
                 B, N = out["density"].shape
@@ -189,10 +214,13 @@ class Trainer:
                        polar_theta: Optional[torch.Tensor] = None,
                        zegar_heatmap: Optional[torch.Tensor] = None,
                        has_zegar_target: Optional[torch.Tensor] = None,
-                       strip_valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                       strip_valid_mask: Optional[torch.Tensor] = None,
+                       wedge_valid_mask: Optional[torch.Tensor] = None,
+                       wedge_bands_valid_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Combined CORAL + MIL loss (the scalar we optimise)."""
         return self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta,
-                                 zegar_heatmap, has_zegar_target, strip_valid_mask)["total"]
+                                 zegar_heatmap, has_zegar_target, strip_valid_mask,
+                                 wedge_valid_mask, wedge_bands_valid_mask)["total"]
 
     @staticmethod
     def _select_multi_wycinek(out: dict, ages: torch.Tensor) -> dict:
@@ -214,6 +242,39 @@ class Trainer:
             out["density"] = selected
             out["density_count"] = selected.sum(dim=-1)
         return out
+
+    def _prepare_wedge_bands(self, batch: dict) -> tuple:
+        """Angular-resolution bands (09.09) — pulls ``image_wedge_band{i}``/``wedge_band{i}_
+        polar_{t,theta,valid}`` for every band out of ``batch``, moves them to ``self.device``,
+        and returns the four lists ``OtolithModel.forward``'s ``density_image_bands`` path needs,
+        plus the ALREADY-CONCATENATED tissue-validity mask for ``density_count_loss`` — shared by
+        ``train_one_epoch``/``validate`` so the two loops don't duplicate this loop.
+
+        ``density_bands_polar_valid`` is all-True (every band patch has a well-defined position
+        BY CONSTRUCTION, same reasoning as the single-canvas wedge's own ``density_polar_valid``)
+        — NOT the tissue fraction, which is a different concept returned separately as
+        ``wedge_bands_valid_mask`` (mirrors ``wedge_polar_valid``'s dual role for the single wedge).
+        Returns all-``None``/``None`` when ``self.n_wedge_bands == 0`` or the batch carries no
+        band keys (dual_branch_wedge without bands, or bands disabled).
+        """
+        if self.n_wedge_bands == 0 or "image_wedge_band0" not in batch:
+            return None, None, None, None, None
+
+        image_bands, dp_t, dp_theta, dp_valid, tissue_valids = [], [], [], [], []
+        for i in range(self.n_wedge_bands):
+            img_b = batch[f"image_wedge_band{i}"].to(self.device)
+            t_b = batch[f"wedge_band{i}_polar_t"].to(self.device)
+            theta_b = batch[f"wedge_band{i}_polar_theta"].to(self.device)
+            tissue_b = batch[f"wedge_band{i}_polar_valid"].to(self.device)
+            Bc = t_b.shape[0]
+            t_flat = t_b.reshape(Bc, -1)
+            image_bands.append(img_b)
+            dp_t.append(t_flat)
+            dp_theta.append(theta_b.reshape(Bc, -1))
+            dp_valid.append(torch.ones_like(t_flat, dtype=torch.bool))
+            tissue_valids.append(tissue_b.reshape(Bc, -1))
+        wedge_bands_valid_mask = torch.cat(tissue_valids, dim=1)
+        return image_bands, dp_t, dp_theta, dp_valid, wedge_bands_valid_mask
 
     @staticmethod
     def _predict_age(out: dict) -> torch.Tensor:
@@ -276,14 +337,47 @@ class Trainer:
             if strip_valid_mask is not None:
                 strip_valid_mask = strip_valid_mask.to(self.device)
                 strip_valid_mask = strip_valid_mask.reshape(strip_valid_mask.shape[0], -1)
+            # Polar-wedge experiment (09.09) — only present when cfg.data.dual_branch_
+            # wedge=True (config-mutually-exclusive with dual_branch_density above, so
+            # image_strip/image_wedge are never both set for a single config). The
+            # wedge's per-patch (t, theta) are known EXACTLY from its own construction
+            # (density_polar_t/theta below) — unlike polar_grid, which the square image
+            # only ESTIMATES from segmentation — so density_polar_valid is all-True
+            # (every wedge patch has a well-defined position by construction; wedge_
+            # polar_valid itself is the TISSUE fraction, same role as strip_valid_mask,
+            # not a positional-meaningfulness mask).
+            image_wedge = batch.get("image_wedge")
+            density_polar_t = density_polar_theta = density_polar_valid = None
+            wedge_valid_mask = batch.get("wedge_polar_valid")
+            if image_wedge is not None:
+                image_wedge = image_wedge.to(self.device)
+                wedge_polar_t = batch["wedge_polar_t"].to(self.device)
+                wedge_polar_theta = batch["wedge_polar_theta"].to(self.device)
+                Bw = wedge_polar_t.shape[0]
+                density_polar_t = wedge_polar_t.reshape(Bw, -1)
+                density_polar_theta = wedge_polar_theta.reshape(Bw, -1)
+                density_polar_valid = torch.ones_like(density_polar_t, dtype=torch.bool)
+                wedge_valid_mask = wedge_valid_mask.to(self.device).reshape(Bw, -1)
+            # Angular-resolution bands (09.09) — REPLACES the single-canvas wedge above when
+            # present (OtolithDataset never emits both for one config, see its own __getitem__).
+            (image_wedge_bands, density_bands_polar_t, density_bands_polar_theta,
+             density_bands_polar_valid, wedge_bands_valid_mask) = self._prepare_wedge_bands(batch)
 
             self.optimizer.zero_grad()
             out = self.model(images, metadata=metadata, polar_t=polar_grid,
                               polar_theta=polar_theta, polar_valid=polar_valid,
-                              density_image=image_strip)
+                              density_image=image_strip if image_strip is not None else image_wedge,
+                              density_polar_t=density_polar_t,
+                              density_polar_theta=density_polar_theta,
+                              density_polar_valid=density_polar_valid,
+                              density_image_bands=image_wedge_bands,
+                              density_bands_polar_t=density_bands_polar_t,
+                              density_bands_polar_theta=density_bands_polar_theta,
+                              density_bands_polar_valid=density_bands_polar_valid)
             out = self._select_multi_wycinek(out, ages)
             loss = self._combined_loss(out, targets, ages, polar_grid, polar_valid, polar_theta,
-                                        zegar_heatmap, has_zegar_target, strip_valid_mask)
+                                        zegar_heatmap, has_zegar_target, strip_valid_mask,
+                                        wedge_valid_mask, wedge_bands_valid_mask)
             loss.backward()
             self.optimizer.step()
 
@@ -347,13 +441,35 @@ class Trainer:
                 if strip_valid_mask is not None:
                     strip_valid_mask = strip_valid_mask.to(self.device)
                     strip_valid_mask = strip_valid_mask.reshape(strip_valid_mask.shape[0], -1)
+                image_wedge = batch.get("image_wedge")
+                density_polar_t = density_polar_theta = density_polar_valid = None
+                wedge_valid_mask = batch.get("wedge_polar_valid")
+                if image_wedge is not None:
+                    image_wedge = image_wedge.to(self.device)
+                    wedge_polar_t = batch["wedge_polar_t"].to(self.device)
+                    wedge_polar_theta = batch["wedge_polar_theta"].to(self.device)
+                    Bw = wedge_polar_t.shape[0]
+                    density_polar_t = wedge_polar_t.reshape(Bw, -1)
+                    density_polar_theta = wedge_polar_theta.reshape(Bw, -1)
+                    density_polar_valid = torch.ones_like(density_polar_t, dtype=torch.bool)
+                    wedge_valid_mask = wedge_valid_mask.to(self.device).reshape(Bw, -1)
+                (image_wedge_bands, density_bands_polar_t, density_bands_polar_theta,
+                 density_bands_polar_valid, wedge_bands_valid_mask) = self._prepare_wedge_bands(batch)
 
                 out = self.model(images, metadata=metadata, polar_t=polar_grid,
                                   polar_theta=polar_theta, polar_valid=polar_valid,
-                                  density_image=image_strip)
+                                  density_image=image_strip if image_strip is not None else image_wedge,
+                                  density_polar_t=density_polar_t,
+                                  density_polar_theta=density_polar_theta,
+                                  density_polar_valid=density_polar_valid,
+                                  density_image_bands=image_wedge_bands,
+                                  density_bands_polar_t=density_bands_polar_t,
+                                  density_bands_polar_theta=density_bands_polar_theta,
+                                  density_bands_polar_valid=density_bands_polar_valid)
                 out = self._select_multi_wycinek(out, ages)
                 parts = self._loss_parts(out, targets, ages, polar_grid, polar_valid, polar_theta,
-                                          zegar_heatmap, has_zegar_target, strip_valid_mask)
+                                          zegar_heatmap, has_zegar_target, strip_valid_mask,
+                                          wedge_valid_mask, wedge_bands_valid_mask)
                 pred_ages = self._predict_age(out)
 
                 bs = images.size(0)

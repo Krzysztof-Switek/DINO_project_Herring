@@ -1,0 +1,173 @@
+# 09.09 — Eksperyment "wycinek kątowy" (polar wedge): głowica wieku (CORAL+MIL) trenuje
+# WYŁĄCZNIE na pełnym kwadratowym obrazie, dokładnie jak w Run N (config_radial_attention.yaml) —
+# zero zmian. Głowica density czyta z OSOBNEGO przejścia backbone'u na wycinku kątowym Δθ wokół
+# osi jądro→brzeg (data.dual_branch_wedge=true, src/wedge_extraction.py) — Daugmanowe "rubber
+# sheet" rozwinięcie ograniczone do sektora, nie pełnych 360°, plus DarSwin (Athwale i in., ICCV
+# 2023) "polar patch partitioning" i Gillert i in. (CVPR 2023, polar-grid dla słojów drzewa).
+#
+# Pełny opis decyzji projektowych: C:\Users\kswitek\.claude\plans\wise-moseying-rivest.md,
+# outputs/09.09_masked_wizualizacje/report4.html (§1-§3b).
+#
+# RÓŻNICA względem paska (config_strip_a.yaml): wycinek ma DWA prawdziwe wymiary geometryczne
+# (kąt I promień, nie tylko promień + stały margines), więc RadialAttentionDensityHead (Run N) MA
+# tu sens — użyta WPROST jako rozwiązanie docelowe (density_head_type=radial_attention), nie
+# zastąpiona przez mlp jak w pasku. Każdy patch wycinka ma dobrze określoną (t, θ) WPROST z
+# konstrukcji (density_polar_t/theta w src/model.py, 09.09) — nie szacowaną z segmentacji jak dla
+# kwadratowego obrazu.
+#
+# Jedna izolowana zmienna względem Run N: geometria wejścia głowicy density. Wszystko inne —
+# backbone, receptura CORAL+MIL, splity, augmentacje, harmonogram treningu — identyczne, żeby
+# wynik był wprost porównywalny (wiek: pipeline_summary.json vs Run N 0,8498 MAE; lokalizacja:
+# dedykowany eval skrypt wzorem scripts/diagnostics/expert_annotation_eval_strip.py, do zbudowania
+# analogicznie dla wycinka przed oceną wyników tego biegu).
+#
+# NIEZWERYFIKOWANE wprost dla geometrii wycinka (jawnie, nie ukryte — patrz plan, sekcja
+# "Ryzyka/niewiadome"): density_attn_radial_bins/window_deg poniżej są SKOPIOWANE z Run N
+# (12 koszyków / 45°), dostrojone do 48-promieniowej geometrii PEŁNEGO obrazu — czy przenoszą się
+# sensownie na gęstą siatkę wycinka (44 wiersze x 13 kolumn) nie zostało jeszcze zmierzone. Pierwszy
+# bieg tego configu jest też pierwszą realną oceną tego pytania, nie założeniem.
+#
+# UWAGA (to samo ryzyko co przy pasku): karty raportu (_compute_axis_data_for_samples,
+# scripts/run_pipeline.py) NIE są świadome gałęzi wycinka — panele density/kandydaci w report.html
+# z tego biegu są bez sensu (nie crashują, ale nic nie mówią o realnej lokalizacji tego modelu).
+# Ufać wyłącznie predictions.csv/pipeline_summary.json (wiek) oraz dedykowanemu eval skryptowi
+# lokalizacji (do zbudowania przed oceną wyników, wzorem expert_annotation_eval_strip.py).
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # niezmienione względem Run N
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  head_type: both                 # coral | mil | both — MIL nadal sprzężony z backbone jak w Run N
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  density_conc_weight: 1.0        # wewnętrzny człon top-k w density_count_loss (NIE E9)
+  density_tv_weight: 0.03         # jak Run N (geometria wycinka ma prawdziwy kąt, TV ma sens)
+
+  # ROZWIĄZANIE DOCELOWE (09.09) — wprost radial_attention, bez pośredniego etapu mlp (patrz
+  # nagłówek pliku). density_attn_* SKOPIOWANE z Run N, NIEZWERYFIKOWANE dla tej geometrii —
+  # patrz nagłówek pliku i plan, sekcja "Ryzyka/niewiadome".
+  density_head_type: radial_attention
+  density_attn_num_heads: 4
+  density_attn_num_layers: 1
+  density_attn_num_angle_freqs: 4
+  density_attn_num_radius_freqs: 4
+  density_attn_radial_bins: 12
+  density_attn_window_deg: 45.0
+
+  # E9 (density_concentricity_weight) WYŁĄCZONE — square-image'owy polar_grid ma INNĄ liczbę
+  # patchy niż out["density"] gdy density_image jest ustawione (tak samo jak dla paska,
+  # config_strip_a.yaml) — zobacz src/trainer.py Faza 5 notatka w planie.
+  density_concentricity_weight: 0.0
+  density_concentricity_bins: 12
+  density_concentricity_window_deg: 45.0   # nieużywane przy wadze 0,0, zostawione dla spójności
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  # WYMAGANE: gałąź wycinka buduje się z maskowanego obrazu (apply_background_mask PRZED
+  # remapem biegunowym) — wymuszone też przez OtolithConfig walidator, gdy dual_branch_wedge=true.
+  mask_background: true
+  mask_cache_dir: null
+
+  # Wycinek kątowy (09.09) — WŁĄCZONY, jedyna deklarowana zmiana względem Run N. Żadna z
+  # poniższych trzech liczb nie jest zgadywana:
+  #   - wedge_delta_theta_deg: 2×p95 kątowego odchylenia realnych przyrostów KK/SS od osi
+  #     odczytu (scripts/diagnostics/analyze_zegar_wedge_geometry.py, 42×2 czytelników,
+  #     419 przyrostów) — pokrywa 95% przyrostów w całym zbiorze (Z15 jest udokumentowanym
+  #     wyjątkiem, patrz report4.html §4).
+  #   - wedge_n_angle_patches: dopasowane do gęstości 48 promieni Run N (Δθ/7,5°).
+  #   - wedge_n_radius_patches: NIERÓWNOMIERNY warp (09.09 follow-up,
+  #     scripts/diagnostics/analyze_wedge_radial_resolution_profile.py) — 44 patche, nie 95
+  #     jak w pasku, bo gęstość wymagana LOKALNIE per strefa promienia jest niejednolita
+  #     (realne odstępy przyrostów maleją ~7x od środka do brzegu, r=-0,53).
+  dual_branch_wedge: true
+  wedge_delta_theta_deg: 98.7
+  wedge_n_angle_patches: 13
+  wedge_n_radius_patches: 44
+  wedge_cache_dir: null
+
+  # Zmiana C WYŁĄCZONA — spójne z Run N.
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  # UWAGA: te pola sterują ścieżką kart raportu (_compute_axis_data_for_samples), która NIE jest
+  # świadoma gałęzi wycinka — zostawione identyczne z Run N dla spójności configu, ale ich wyjście
+  # dla tego biegu jest bez znaczenia (patrz nagłówek pliku). Nie próbować "naprawiać" ich tutaj —
+  # prawdziwa lokalizacja tego modelu wymaga osobnego eval skryptu (wzorem
+  # expert_annotation_eval_strip.py).
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  density_image_size: 728
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8

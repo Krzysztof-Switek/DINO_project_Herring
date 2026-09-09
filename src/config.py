@@ -194,6 +194,78 @@ class DataConfig(BaseModel):
     # concentration loss's top-k "on" set, while still receiving a real "off" penalty.
     strip_mask_background_loss: bool = False
 
+    # Polar-wedge localization experiment (09.09, plans and summaries/
+    # 09.09_pasek_maskowanie_wyniki_i_literatura.md follow-up — literature: Daugman's iris
+    # "rubber sheet model", DarSwin's polar patch partitioning (Athwale et al., ICCV 2023,
+    # arXiv:2304.09691), Gillert et al.'s polar-grid tree-ring instance segmentation, CVPR 2023).
+    # Alternative dual-branch geometry to the strip above: instead of warping ONE straight line,
+    # unwraps an ANGULAR SECTOR (wedge) around the reading axis (src/wedge_extraction.py) — every
+    # column of the resulting image is a genuinely different angular ray from the nucleus (like
+    # Run N's 48-ray consensus), all from a single backbone pass (like the strip), because
+    # per-angle boundary radius R(theta) keeps every cell inside real tissue by construction
+    # (verified 0/3072 ray-sampled points outside the mask for Run N's own geometry — the wedge
+    # reuses the identical R(theta), src/otolith_axis.py::compute_R_theta). False (default) =
+    # zero behaviour change. Mutually exclusive with dual_branch_density (strip) — a sample uses
+    # ONE dual-branch geometry, not both, to keep the density-branch input unambiguous.
+    dual_branch_wedge: bool = False
+    # Full angular width of the wedge, degrees. NOT a guess: measured from real ZEGAR data
+    # (scripts/diagnostics/analyze_zegar_wedge_geometry.py, 09.09) as 2x the p95 angular
+    # deviation of true KK/SS increment positions from the reading axis (49.4 deg per side ->
+    # 98.7 deg full width) — covers 95% of real increments; see
+    # outputs/09.09_masked_wizualizacje/wedge_geometry/wedge_geometry_summary.json for the raw
+    # measurement. A single otolith with uniformly extreme deviation (e.g. Z15 in that analysis)
+    # can still fall entirely outside even this measured width — a real, documented limitation,
+    # not a bug (see the wedge-geometry report).
+    wedge_delta_theta_deg: float = Field(98.7, gt=0.0, le=360.0)
+    # Angular (columns) and radial (rows) patch counts. Radial count comes from a NON-UNIFORM
+    # per-zone derivation (09.09 follow-up to the strip's own single-global-percentile number —
+    # scripts/diagnostics/analyze_wedge_radial_resolution_profile.py): ring spacing shrinks
+    # sharply toward the edge (Pearson r=-0.53 with radius, zero measured increment pairs below
+    # t=0.5 across 335 real ZEGAR gaps), so a single global density (the strip's own 95 patches)
+    # both wastes resolution near the nucleus and under-protects the tightest real edge gaps. 44
+    # patches is the total after applying the SAME MARGIN_PATCHES=2 collision-avoidance rule
+    # locally per radial zone instead of once globally — see `src/wedge_extraction.py`'s
+    # `_RADIAL_WARP_T`/`_RADIAL_WARP_ROW_FRAC`, which the actual row->t sampling now follows
+    # (non-uniform, not `row / canvas_h`).
+    # Angular count is a DIFFERENT kind of measurement (not a collision-avoidance argument like
+    # radius — increments differ by ROW/radius, not column/angle): matched to the angular ray
+    # density Run N itself already demonstrates working (48 rays / 360 deg ~= 7.5 deg/ray),
+    # scaled to wedge_delta_theta_deg (98.7 / 7.5 ~= 13 columns).
+    wedge_n_angle_patches: int = Field(13, ge=1)
+    wedge_n_radius_patches: int = Field(44, ge=1)
+    # None -> "<project_root>/data/wedges_cache/{wedge_n_angle_patches*patch_size}x
+    # {wedge_n_radius_patches*patch_size}_{wedge_delta_theta_deg}" — same dimension-keyed
+    # subdirectory convention as strips_cache_dir, same reason (never silently serve a
+    # stale/wrong-shape cached wedge).
+    wedge_cache_dir: Optional[str] = None
+
+    # Angular-resolution bands (09.09 follow-up, plans and summaries/
+    # 09.09_wycinek_pasma_katowe_plan.md): a SEPARATE, genuinely new architectural experiment, not
+    # a literature-precedented mechanism (DarSwin/Daugman/Gillert all have this project's own
+    # measured limitation — fixed angular column count means real per-column arc length grows
+    # linearly with radius, mean 5.49x compression at the otolith edge across 42 real ZEGAR images,
+    # scripts/diagnostics/analyze_wedge_angular_resolution.py). Splits the radius into bands, each
+    # rendered as its own wedge canvas with its OWN, wider-near-the-edge column count.
+    # All three None (default) => zero behaviour change (today's single-band wedge above). When
+    # set, all three MUST be set together with consistent lengths — see the validator below.
+    # wedge_band_edges_t: monotonic t breakpoints, e.g. [0.0, 0.6, 0.8, 0.9, 1.0] for 4 bands
+    # (these specific edges reuse the zone boundaries already measured/implemented for the
+    # non-uniform RADIAL warp above — merged pairwise, not independently chosen).
+    wedge_band_edges_t: Optional[list[float]] = None
+    # Per-band angular column count, e.g. [97, 129, 145, 161] — sized (scripts/diagnostics/
+    # analyze_real_otolith_size_distribution.py + analyze_wedge_angular_resolution.py) for ZERO
+    # compression loss (target ratio 1.0x) even at the largest otolith measured across a random
+    # 400-image sample of the real training population (length_px=1305.1px) — a deliberately
+    # broader sample than the 42-image ZEGAR set, since otolith size needs no expert annotation.
+    wedge_band_n_angle_patches: Optional[list[int]] = None
+    # Per-band radial row count, e.g. [11, 12, 9, 12] — taken directly from the existing
+    # non-uniform radial warp (_RADIAL_WARP_T/_RADIAL_WARP_ROW_FRAC), summing the rows belonging
+    # to each band's own zones, NOT recomputed independently.
+    wedge_band_n_radius_patches: Optional[list[int]] = None
+    # None -> per-band cache dirs derived the same way as wedge_cache_dir, one subdirectory per
+    # band (dimension-keyed, same never-serve-a-stale-shape guard).
+    wedge_bands_cache_dir: Optional[str] = None
+
     @field_validator("image_size")
     @classmethod
     def image_size_divisible(cls, v: int) -> int:
@@ -240,6 +312,67 @@ class DataConfig(BaseModel):
                 "data.strip_mask_background_loss=True requires data.dual_branch_density=True "
                 "(the validity mask only makes sense for the strip density branch)"
             )
+
+        if self.dual_branch_wedge:
+            if self.dual_branch_density:
+                raise ValueError(
+                    "data.dual_branch_wedge=True cannot be combined with "
+                    "data.dual_branch_density=True — a sample uses ONE dual-branch density "
+                    "geometry (strip or wedge), not both"
+                )
+            wedge_w = self.wedge_n_angle_patches * self.patch_size
+            wedge_h = self.wedge_n_radius_patches * self.patch_size
+            if wedge_w % self.patch_size != 0 or wedge_h % self.patch_size != 0:
+                # unreachable in practice (both dims are built FROM patch counts above), kept
+                # as a guard against a future refactor that takes raw pixel dims instead
+                raise ValueError("wedge canvas dimensions must be divisible by patch_size")
+            if not self.mask_background:
+                raise ValueError(
+                    "data.dual_branch_wedge=True requires data.mask_background=True "
+                    "(the wedge is built from the masked image — see src/wedge_extraction.py)"
+                )
+            if self.multi_wycinek_k > 1:
+                raise ValueError(
+                    "data.dual_branch_wedge=True is not yet supported together with "
+                    "data.multi_wycinek_k>1 (the wedge already gives multi-direction structure "
+                    "within ONE sample — no separate multi-candidate-axis mechanism needed)"
+                )
+
+        band_fields = (self.wedge_band_edges_t, self.wedge_band_n_angle_patches,
+                       self.wedge_band_n_radius_patches)
+        if any(f is not None for f in band_fields):
+            if not self.dual_branch_wedge:
+                raise ValueError(
+                    "data.wedge_band_edges_t/wedge_band_n_angle_patches/"
+                    "wedge_band_n_radius_patches require data.dual_branch_wedge=True"
+                )
+            if any(f is None for f in band_fields):
+                raise ValueError(
+                    "data.wedge_band_edges_t, wedge_band_n_angle_patches and "
+                    "wedge_band_n_radius_patches must all be set together, or all left None"
+                )
+            edges, n_angle, n_radius = band_fields
+            n_bands = len(edges) - 1
+            if n_bands < 1:
+                raise ValueError("data.wedge_band_edges_t must have at least 2 breakpoints")
+            if len(n_angle) != n_bands or len(n_radius) != n_bands:
+                raise ValueError(
+                    f"data.wedge_band_edges_t implies {n_bands} bands but "
+                    f"wedge_band_n_angle_patches has {len(n_angle)} and "
+                    f"wedge_band_n_radius_patches has {len(n_radius)} entries"
+                )
+            if edges[0] != 0.0 or edges[-1] != 1.0:
+                raise ValueError(
+                    f"data.wedge_band_edges_t must start at 0.0 and end at 1.0, got "
+                    f"[{edges[0]}, ..., {edges[-1]}]"
+                )
+            if any(b <= a for a, b in zip(edges, edges[1:])):
+                raise ValueError("data.wedge_band_edges_t must be strictly increasing")
+            if any(n <= 0 for n in n_angle) or any(n <= 0 for n in n_radius):
+                raise ValueError(
+                    "data.wedge_band_n_angle_patches/wedge_band_n_radius_patches entries must "
+                    "all be positive"
+                )
         return self
 
 
@@ -485,6 +618,11 @@ class OtolithConfig(BaseModel):
             raise ValueError(
                 "data.dual_branch_density=True requires model.use_density_head=True "
                 "(the strip branch exists only to feed the density head)"
+            )
+        if self.data.dual_branch_wedge and not self.model.use_density_head:
+            raise ValueError(
+                "data.dual_branch_wedge=True requires model.use_density_head=True "
+                "(the wedge branch exists only to feed the density head)"
             )
         return self
 

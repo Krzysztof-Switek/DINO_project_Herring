@@ -781,6 +781,35 @@ def sample_profile_along_axis(
 # Polar-coordinate grid (E9 concentricity prior)
 # ---------------------------------------------------------------------------
 
+def compute_R_theta(
+    mask: np.ndarray, centroid: tuple[float, float], n_angle_bins: int = 360,
+) -> np.ndarray:
+    """Per-angle-bin otolith boundary radius R(theta): ray-cast from ``centroid`` along
+    ``n_angle_bins`` directions spanning ``(-pi, pi]``, farthest still-inside-``mask`` point per
+    ray. Bin ``i`` covers angle ``-pi + i * 2*pi/n_angle_bins`` (matches the ``bin_idx`` formula
+    in :func:`compute_polar_grid` below, which consumes this).
+
+    Promoted (09.09, wycinek kątowy / polar wedge experiment) out of ``compute_polar_grid``,
+    where this exact loop used to live inline — behaviour byte-identical, now reusable by
+    ``src/wedge_extraction.py`` without duplicating the ray-casting, per this project's
+    established "reuse, don't re-derive geometry" convention (e.g. ``strip_transform_matrix``
+    reused by both ``extract_strip`` and ``extract_strip_validity``).
+    """
+    mask_bin = np.asarray(mask) > 0
+    H, W = mask_bin.shape[:2]
+    cx, cy = float(centroid[0]), float(centroid[1])
+    angles = np.linspace(-np.pi, np.pi, n_angle_bins, endpoint=False)
+    r_max = float(np.hypot(max(cx, W - cx), max(cy, H - cy))) + 1.0
+    radii = np.arange(1.0, max(r_max, 2.0))
+    R_theta = np.zeros(n_angle_bins, dtype=np.float32)
+    for i, a in enumerate(angles):
+        xs = np.clip((cx + radii * np.cos(a)).astype(np.int64), 0, W - 1)
+        ys = np.clip((cy + radii * np.sin(a)).astype(np.int64), 0, H - 1)
+        inside = np.nonzero(mask_bin[ys, xs])[0]
+        R_theta[i] = float(radii[inside.max()]) if inside.size else 0.0
+    return R_theta
+
+
 def compute_polar_grid(
     mask: np.ndarray,
     centroid: tuple[int, int],
@@ -832,15 +861,7 @@ def compute_polar_grid(
     # R(theta): ray-cast from the centroid along n_angle_bins directions, find the
     # farthest point still inside the mask (mirrors the ray-casting already used by
     # _segment_radial, but walking the binary mask instead of re-thresholding pixels).
-    angles = np.linspace(-np.pi, np.pi, n_angle_bins, endpoint=False)
-    r_max = float(np.hypot(max(cx, W - cx), max(cy, H - cy))) + 1.0
-    radii = np.arange(1.0, max(r_max, 2.0))
-    R_theta = np.zeros(n_angle_bins, dtype=np.float32)
-    for i, a in enumerate(angles):
-        xs = np.clip((cx + radii * np.cos(a)).astype(np.int64), 0, W - 1)
-        ys = np.clip((cy + radii * np.sin(a)).astype(np.int64), 0, H - 1)
-        inside = np.nonzero(mask_bin[ys, xs])[0]
-        R_theta[i] = float(radii[inside.max()]) if inside.size else 0.0
+    R_theta = compute_R_theta(mask_bin, centroid, n_angle_bins)
 
     # Patch-grid cell centres, expressed in the SAME pixel frame as `mask` — a plain
     # fractional-position mapping, the same grid<->pixel convention already used by

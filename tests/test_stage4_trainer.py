@@ -48,7 +48,8 @@ class _SyntheticDataset(Dataset):
     def __init__(self, n: int = 8, num_age_classes: int = 10, image_size: int = 56,
                 with_polar: bool = False, with_zegar: bool = False, zegar_every: int = 2,
                 with_strip: bool = False, multi_wycinek_k: int = 0,
-                with_strip_valid_mask: bool = False):
+                with_strip_valid_mask: bool = False, with_wedge: bool = False,
+                with_wedge_bands: bool = False):
         self.n = n
         self.num_age_classes = num_age_classes
         self.image_size = image_size
@@ -68,6 +69,17 @@ class _SyntheticDataset(Dataset):
         # pattern (one valid, one masked-out patch of the 2) so tests can tell a real
         # mask from an all-ones stand-in.
         self.with_strip_valid_mask = with_strip_valid_mask
+        # 09.09, polar-wedge experiment: mirrors OtolithDataset's dual_branch_wedge
+        # "image_wedge"/"wedge_polar_t"/"wedge_polar_theta"/"wedge_polar_valid" keys.
+        # Non-square shape (h_p=2, w_p=3) and a non-trivial wedge_polar_valid pattern
+        # (one masked-out patch of the 6) so tests can distinguish real values from an
+        # all-ones/all-zeros stand-in.
+        self.with_wedge = with_wedge
+        # 09.09 follow-up, angular-resolution bands: mirrors OtolithDataset's
+        # image_wedge_band{i}/wedge_band{i}_polar_{t,theta,valid} keys — 2 bands, deliberately
+        # DIFFERENT shapes per band (band 0 smaller than band 1, like the real design where later
+        # bands are wider), each with its own non-trivial (not all-ones) tissue-validity pattern.
+        self.with_wedge_bands = with_wedge_bands
 
     def __len__(self) -> int:
         return self.n
@@ -100,6 +112,20 @@ class _SyntheticDataset(Dataset):
             item["image_strip"] = torch.randn(3, 14, 28)   # deliberately non-square
         if self.with_strip_valid_mask:
             item["strip_valid_mask"] = torch.tensor([[1.0, 0.0]])   # (h_p=1, w_p=2)
+        if self.with_wedge:
+            item["image_wedge"] = torch.randn(3, 28, 42)   # deliberately non-square
+            item["wedge_polar_t"] = torch.rand(2, 3)
+            item["wedge_polar_theta"] = torch.rand(2, 3)
+            item["wedge_polar_valid"] = torch.tensor([[1.0, 0.0, 1.0], [1.0, 1.0, 1.0]])
+        if self.with_wedge_bands:
+            item["image_wedge_band0"] = torch.randn(3, 14, 28)   # (h_p=1, w_p=2)
+            item["wedge_band0_polar_t"] = torch.rand(1, 2)
+            item["wedge_band0_polar_theta"] = torch.rand(1, 2)
+            item["wedge_band0_polar_valid"] = torch.tensor([[1.0, 0.0]])
+            item["image_wedge_band1"] = torch.randn(3, 28, 42)   # (h_p=2, w_p=3)
+            item["wedge_band1_polar_t"] = torch.rand(2, 3)
+            item["wedge_band1_polar_theta"] = torch.rand(2, 3)
+            item["wedge_band1_polar_valid"] = torch.tensor([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
         return item
 
 
@@ -126,11 +152,13 @@ def _make_cfg(tmp_path: Path, epochs: int = 2, freeze_epochs: int = 0,
 
 def _make_loader(n: int = 8, batch_size: int = 4, with_polar: bool = False,
                  with_zegar: bool = False, with_strip: bool = False,
-                 multi_wycinek_k: int = 0, with_strip_valid_mask: bool = False) -> DataLoader:
+                 multi_wycinek_k: int = 0, with_strip_valid_mask: bool = False,
+                 with_wedge: bool = False, with_wedge_bands: bool = False) -> DataLoader:
     ds = _SyntheticDataset(n=n, num_age_classes=10, image_size=56, with_polar=with_polar,
                            with_zegar=with_zegar, with_strip=with_strip,
                            multi_wycinek_k=multi_wycinek_k,
-                           with_strip_valid_mask=with_strip_valid_mask)
+                           with_strip_valid_mask=with_strip_valid_mask, with_wedge=with_wedge,
+                           with_wedge_bands=with_wedge_bands)
     return DataLoader(ds, batch_size=batch_size, shuffle=False)
 
 
@@ -951,6 +979,253 @@ def test_train_one_epoch_without_strip_valid_mask_passes_none(tmp_path):
 
     assert len(captured) > 0
     assert all(t is None for t in captured)
+
+
+# ---------------------------------------------------------------------------
+# Polar-wedge experiment (09.09) — image_wedge/wedge_polar_* wiring
+# ---------------------------------------------------------------------------
+
+def test_train_one_epoch_routes_image_wedge_to_density_image(tmp_path):
+    """batch["image_wedge"] (only present when dual_branch_wedge=True) must reach
+    forward() as density_image during training, and its own polar coords
+    (wedge_polar_t/theta, flattened (B,Hp,Wp)->(B,N)) as density_polar_t/theta — NOT
+    the square image's own polar_t/theta (there are none here, with_polar=False)."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+
+    captured = []
+    orig_forward = model.forward
+    def _spy_forward(*args, **kwargs):
+        captured.append({
+            "density_image": kwargs.get("density_image"),
+            "density_polar_t": kwargs.get("density_polar_t"),
+            "density_polar_theta": kwargs.get("density_polar_theta"),
+            "density_polar_valid": kwargs.get("density_polar_valid"),
+        })
+        return orig_forward(*args, **kwargs)
+    model.forward = _spy_forward
+
+    loader = _make_loader(n=4, with_wedge=True)
+    trainer = Trainer(cfg, model, loader, None)
+    trainer.train_one_epoch()
+
+    assert len(captured) > 0
+    for c in captured:
+        assert c["density_image"] is not None and c["density_image"].shape[-2:] == (28, 42)
+        assert c["density_polar_t"] is not None and c["density_polar_t"].shape == (4, 6)
+        assert c["density_polar_theta"] is not None and c["density_polar_theta"].shape == (4, 6)
+        # every wedge patch has a well-defined position by construction -> all-True,
+        # regardless of wedge_polar_valid's own (tissue-fraction) values.
+        assert c["density_polar_valid"] is not None
+        assert c["density_polar_valid"].dtype == torch.bool
+        assert bool(c["density_polar_valid"].all())
+
+
+def test_validate_routes_image_wedge_to_density_image(tmp_path):
+    """Same wiring, validate() path."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+
+    captured = []
+    orig_forward = model.forward
+    def _spy_forward(*args, **kwargs):
+        captured.append({
+            "density_image": kwargs.get("density_image"),
+            "density_polar_t": kwargs.get("density_polar_t"),
+            "density_polar_theta": kwargs.get("density_polar_theta"),
+            "density_polar_valid": kwargs.get("density_polar_valid"),
+        })
+        return orig_forward(*args, **kwargs)
+    model.forward = _spy_forward
+
+    loader = _make_loader(n=4, with_wedge=True)
+    trainer = Trainer(cfg, model, loader, loader)
+    trainer.validate()
+
+    assert len(captured) > 0
+    for c in captured:
+        assert c["density_image"] is not None and c["density_image"].shape[-2:] == (28, 42)
+        assert c["density_polar_t"] is not None and c["density_polar_t"].shape == (4, 6)
+        assert bool(c["density_polar_valid"].all())
+
+
+def test_train_one_epoch_routes_wedge_polar_valid_to_density_count_loss(tmp_path):
+    """batch["wedge_polar_valid"] (the wedge's own TISSUE-fraction validity, a
+    different role than density_polar_valid above) must reach density_count_loss as
+    its valid_mask kwarg, flattened (B,Hp,Wp)->(B,N) exactly like strip_valid_mask."""
+    import src.trainer as trainer_module
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    cfg.model.use_density_head = True
+    model = _make_model(cfg)
+
+    captured = []
+    orig = trainer_module.density_count_loss
+    def _spy(*args, **kwargs):
+        captured.append(kwargs.get("valid_mask"))
+        return orig(*args, **kwargs)
+    trainer_module.density_count_loss = _spy
+    try:
+        loader = _make_loader(n=4, with_wedge=True)
+        trainer = Trainer(cfg, model, loader, None)
+        trainer.train_one_epoch()
+    finally:
+        trainer_module.density_count_loss = orig
+
+    assert len(captured) > 0
+    assert all(t is not None for t in captured)
+    assert all(t.shape == (4, 6) for t in captured)
+    expected_row = torch.tensor([1.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+    assert all(torch.equal(t, expected_row.expand(4, -1)) for t in captured)
+
+
+def test_train_one_epoch_without_image_wedge_passes_none(tmp_path):
+    """Regression pin: a batch with no "image_wedge" key (dual_branch_wedge=False,
+    every existing config) must call forward() with density_image/density_polar_*
+    =None explicitly."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    model = _make_model(cfg)
+
+    captured = []
+    orig_forward = model.forward
+    def _spy_forward(*args, **kwargs):
+        captured.append((kwargs.get("density_image"), kwargs.get("density_polar_t")))
+        return orig_forward(*args, **kwargs)
+    model.forward = _spy_forward
+
+    loader = _make_loader(n=4)   # no with_wedge
+    trainer = Trainer(cfg, model, loader, None)
+    trainer.train_one_epoch()
+
+    assert len(captured) > 0
+    assert all(img is None and pt is None for img, pt in captured)
+
+
+# ---------------------------------------------------------------------------
+# Angular-resolution bands (09.09 follow-up) — image_wedge_band{i}/wedge_band{i}_polar_* wiring
+# ---------------------------------------------------------------------------
+
+def _bands_cfg(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    cfg.model.use_density_head = True
+    cfg.model.density_head_type = "radial_attention"   # bands require a polar-aware head
+    cfg.model.density_attn_num_heads = 4                # divides _MockDinoBackbone.embed_dim=64
+    cfg.data.wedge_band_edges_t = [0.0, 0.5, 1.0]   # 2 bands, matches _SyntheticDataset's mock
+    return cfg
+
+
+def test_train_one_epoch_routes_density_image_bands_and_concatenated_polar(tmp_path):
+    """batch["image_wedge_band{i}"] (only present when wedge bands are enabled) must reach
+    forward() as a LIST via density_image_bands, and the per-band polar_t/theta (flattened
+    (B,Hp,Wp)->(B,N) each) as density_bands_polar_t/theta — density_bands_polar_valid all-True
+    regardless of the bands' own (tissue-fraction) wedge_band{i}_polar_valid values."""
+    from src.trainer import Trainer
+    cfg = _bands_cfg(tmp_path)
+    model = _make_model(cfg)
+
+    captured = []
+    orig_forward = model.forward
+    def _spy_forward(*args, **kwargs):
+        captured.append({
+            "bands": kwargs.get("density_image_bands"),
+            "t": kwargs.get("density_bands_polar_t"),
+            "theta": kwargs.get("density_bands_polar_theta"),
+            "valid": kwargs.get("density_bands_polar_valid"),
+        })
+        return orig_forward(*args, **kwargs)
+    model.forward = _spy_forward
+
+    loader = _make_loader(n=4, with_wedge_bands=True)
+    trainer = Trainer(cfg, model, loader, None)
+    assert trainer.n_wedge_bands == 2
+    trainer.train_one_epoch()
+
+    assert len(captured) > 0
+    for c in captured:
+        assert c["bands"] is not None and len(c["bands"]) == 2
+        assert c["bands"][0].shape[-2:] == (14, 28) and c["bands"][1].shape[-2:] == (28, 42)
+        assert c["t"][0].shape == (4, 2) and c["t"][1].shape == (4, 6)
+        assert c["theta"][0].shape == (4, 2) and c["theta"][1].shape == (4, 6)
+        for v in c["valid"]:
+            assert v.dtype == torch.bool and bool(v.all())
+
+
+def test_validate_routes_density_image_bands(tmp_path):
+    """Same wiring, validate() path."""
+    from src.trainer import Trainer
+    cfg = _bands_cfg(tmp_path)
+    model = _make_model(cfg)
+
+    captured = []
+    orig_forward = model.forward
+    def _spy_forward(*args, **kwargs):
+        captured.append(kwargs.get("density_image_bands"))
+        return orig_forward(*args, **kwargs)
+    model.forward = _spy_forward
+
+    loader = _make_loader(n=4, with_wedge_bands=True)
+    trainer = Trainer(cfg, model, loader, loader)
+    trainer.validate()
+
+    assert len(captured) > 0
+    assert all(bands is not None and len(bands) == 2 for bands in captured)
+
+
+def test_train_one_epoch_routes_concatenated_wedge_bands_valid_to_density_count_loss(tmp_path):
+    """The per-band TISSUE validity (wedge_band{i}_polar_valid) must reach density_count_loss as
+    its valid_mask kwarg, concatenated across bands to match out["density"]'s own (B, sum(N_k))
+    shape — a different concept from density_bands_polar_valid (always all-True) above."""
+    import src.trainer as trainer_module
+    from src.trainer import Trainer
+    cfg = _bands_cfg(tmp_path)
+    model = _make_model(cfg)
+
+    captured = []
+    orig = trainer_module.density_count_loss
+    def _spy(*args, **kwargs):
+        captured.append(kwargs.get("valid_mask"))
+        return orig(*args, **kwargs)
+    trainer_module.density_count_loss = _spy
+    try:
+        loader = _make_loader(n=4, with_wedge_bands=True)
+        trainer = Trainer(cfg, model, loader, None)
+        trainer.train_one_epoch()
+    finally:
+        trainer_module.density_count_loss = orig
+
+    assert len(captured) > 0
+    assert all(t is not None for t in captured)
+    assert all(t.shape == (4, 8) for t in captured)   # (B, N0=2 + N1=6)
+    expected_row = torch.tensor([1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
+    assert all(torch.equal(t, expected_row.expand(4, -1)) for t in captured)
+
+
+def test_train_one_epoch_without_wedge_bands_passes_none(tmp_path):
+    """Regression pin: a batch with no band keys (wedge_band_edges_t=None, every pre-09.09
+    config) must call forward() with density_image_bands=None explicitly."""
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path)
+    model = _make_model(cfg)
+
+    captured = []
+    orig_forward = model.forward
+    def _spy_forward(*args, **kwargs):
+        captured.append(kwargs.get("density_image_bands"))
+        return orig_forward(*args, **kwargs)
+    model.forward = _spy_forward
+
+    loader = _make_loader(n=4)   # no with_wedge_bands
+    trainer = Trainer(cfg, model, loader, None)
+    assert trainer.n_wedge_bands == 0
+    trainer.train_one_epoch()
+
+    assert len(captured) > 0
+    assert all(bands is None for bands in captured)
 
 
 # ---------------------------------------------------------------------------

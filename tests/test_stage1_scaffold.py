@@ -149,6 +149,140 @@ def test_strip_mask_background_loss_rejects_multi_wycinek() -> None:
                   model={"use_density_head": True})
 
 
+def test_dual_branch_wedge_default_is_off() -> None:
+    """09.09: polar-wedge experiment — dual_branch_wedge defaults False, zero behaviour change."""
+    from src.config import get_default_config
+    cfg = get_default_config()
+    assert cfg.data.dual_branch_wedge is False
+
+
+def test_dual_branch_wedge_requires_mask_background_and_density_head() -> None:
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_wedge": True, "mask_background": False},
+                      model={"use_density_head": True})
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_wedge": True, "mask_background": True},
+                      model={"use_density_head": False})
+    OtolithConfig(data={"dual_branch_wedge": True, "mask_background": True},
+                  model={"use_density_head": True})
+
+
+def test_dual_branch_wedge_and_strip_are_mutually_exclusive() -> None:
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_wedge": True, "dual_branch_density": True,
+                            "mask_background": True},
+                      model={"use_density_head": True})
+
+
+def test_dual_branch_wedge_rejects_multi_wycinek() -> None:
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_wedge": True, "mask_background": True,
+                            "multi_wycinek_k": 5},
+                      model={"use_density_head": True})
+    OtolithConfig(data={"dual_branch_wedge": True, "mask_background": True,
+                        "multi_wycinek_k": 1},
+                  model={"use_density_head": True})
+
+
+def test_wedge_band_fields_default_to_none() -> None:
+    """09.09 follow-up: angular-resolution bands default to None (off) — zero behaviour change."""
+    from src.config import get_default_config
+    cfg = get_default_config()
+    assert cfg.data.wedge_band_edges_t is None
+    assert cfg.data.wedge_band_n_angle_patches is None
+    assert cfg.data.wedge_band_n_radius_patches is None
+
+
+def test_wedge_bands_require_dual_branch_wedge() -> None:
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_wedge": False,
+                            "wedge_band_edges_t": [0.0, 0.6, 1.0],
+                            "wedge_band_n_angle_patches": [97, 161],
+                            "wedge_band_n_radius_patches": [23, 21]},
+                      model={"use_density_head": True})
+    # with dual_branch_wedge=True it's valid
+    OtolithConfig(data={"dual_branch_wedge": True, "mask_background": True,
+                        "wedge_band_edges_t": [0.0, 0.6, 1.0],
+                        "wedge_band_n_angle_patches": [97, 161],
+                        "wedge_band_n_radius_patches": [23, 21]},
+                  model={"use_density_head": True})
+
+
+def test_wedge_bands_must_all_be_set_together() -> None:
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_wedge": True, "mask_background": True,
+                            "wedge_band_edges_t": [0.0, 0.6, 1.0]},
+                      model={"use_density_head": True})
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_wedge": True, "mask_background": True,
+                            "wedge_band_n_angle_patches": [97, 161]},
+                      model={"use_density_head": True})
+
+
+def test_wedge_bands_length_mismatch_rejected() -> None:
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_wedge": True, "mask_background": True,
+                            "wedge_band_edges_t": [0.0, 0.6, 1.0],
+                            "wedge_band_n_angle_patches": [97],  # should have 2 entries
+                            "wedge_band_n_radius_patches": [23, 21]},
+                      model={"use_density_head": True})
+
+
+def test_wedge_bands_edges_must_span_zero_to_one_and_be_increasing() -> None:
+    from pydantic import ValidationError
+    from src.config import OtolithConfig
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_wedge": True, "mask_background": True,
+                            "wedge_band_edges_t": [0.1, 0.6, 1.0],  # doesn't start at 0.0
+                            "wedge_band_n_angle_patches": [97, 161],
+                            "wedge_band_n_radius_patches": [23, 21]},
+                      model={"use_density_head": True})
+    with pytest.raises((ValidationError, ValueError)):
+        OtolithConfig(data={"dual_branch_wedge": True, "mask_background": True,
+                            "wedge_band_edges_t": [0.0, 0.6, 0.6, 1.0],  # not strictly increasing
+                            "wedge_band_n_angle_patches": [97, 0, 161],
+                            "wedge_band_n_radius_patches": [23, 1, 21]},
+                      model={"use_density_head": True})
+
+
+def test_wedge_bands_production_numbers_from_faza8() -> None:
+    """Pins the 09.09 Faza 8 measurement (analyze_real_otolith_size_distribution.py + analyze_
+    wedge_angular_resolution.py) — a silent drift in these numbers should fail this test."""
+    from src.config import OtolithConfig
+    cfg = OtolithConfig(data={
+        "dual_branch_wedge": True, "mask_background": True,
+        "wedge_band_edges_t": [0.0, 0.6, 0.8, 0.9, 1.0],
+        "wedge_band_n_angle_patches": [97, 129, 145, 161],
+        "wedge_band_n_radius_patches": [11, 12, 9, 12],
+    }, model={"use_density_head": True})
+    total_patches = sum(a * b for a, b in zip(cfg.data.wedge_band_n_angle_patches,
+                                               cfg.data.wedge_band_n_radius_patches))
+    assert total_patches == 5852
+    assert sum(cfg.data.wedge_band_n_radius_patches) == cfg.data.wedge_n_radius_patches
+
+
+def test_wedge_geometry_defaults_match_measured_values() -> None:
+    """Pins the 09.09 empirical measurement (analyze_zegar_wedge_geometry.py) as the config
+    default — a silent change to these numbers should fail this test, not pass unnoticed."""
+    from src.config import get_default_config
+    cfg = get_default_config()
+    assert cfg.data.wedge_delta_theta_deg == pytest.approx(98.7)
+    assert cfg.data.wedge_n_angle_patches == 13
+    assert cfg.data.wedge_n_radius_patches == 44
+
+
 def test_entrypoint_info_mode(tmp_path) -> None:
     from src.entrypoint import run
     code = run(["--config", str(CONFIG_PATH), "--mode", "info"])

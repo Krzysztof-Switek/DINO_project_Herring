@@ -600,6 +600,182 @@ def test_forward_density_image_path_blocks_backbone_gradient_entirely():
     assert dh_grad, "density head received no gradient"
 
 
+# ---------------------------------------------------------------------------
+# density_polar_t/theta/valid (09.09, polar-wedge experiment) — separate positional
+# coordinates for a density_image whose geometry differs from `image`'s own.
+# ---------------------------------------------------------------------------
+
+def test_forward_density_polar_args_ignored_without_density_image():
+    """density_polar_* must be inert when there is no density_image at all — they only
+    ever apply inside that branch (see the forward() docstring)."""
+    model = _make_radial_attention_density_model()
+    images = torch.randn(2, 3, 56, 56)  # 4x4 patch grid (patch_size=14 for _GradPatchBackbone)
+    t, theta, valid = _grid_polar_tensors(2, 4, 4)
+    bogus_t, bogus_theta, bogus_valid = _grid_polar_tensors(2, 4, 4, valid=False)
+    out_a = model(images, polar_t=t, polar_theta=theta, polar_valid=valid)
+    out_b = model(images, polar_t=t, polar_theta=theta, polar_valid=valid,
+                  density_polar_t=bogus_t, density_polar_theta=bogus_theta,
+                  density_polar_valid=bogus_valid)
+    assert torch.equal(out_a["density"], out_b["density"])
+
+
+def test_forward_density_polar_args_used_when_density_image_given():
+    """When density_image IS given, density_polar_* (not polar_t/theta/valid, which
+    describe `image`'s own grid) must be what the density head actually receives —
+    proof by contradiction: swapping in a different valid-mask changes the output."""
+    model = _make_radial_attention_density_model()
+    images = torch.randn(2, 3, 56, 56)          # 4x4 grid
+    density_images = torch.randn(2, 3, 56, 56)  # also 4x4 grid, but a SEPARATE geometry
+    t_img, theta_img, valid_img = _grid_polar_tensors(2, 4, 4, valid=True)
+    t_dens, theta_dens, valid_dens_all_true = _grid_polar_tensors(2, 4, 4, valid=True)
+    _, _, valid_dens_all_false = _grid_polar_tensors(2, 4, 4, valid=False)
+
+    out_true = model(images, density_image=density_images,
+                     polar_t=t_img, polar_theta=theta_img, polar_valid=valid_img,
+                     density_polar_t=t_dens, density_polar_theta=theta_dens,
+                     density_polar_valid=valid_dens_all_true)
+    out_false = model(images, density_image=density_images,
+                      polar_t=t_img, polar_theta=theta_img, polar_valid=valid_img,
+                      density_polar_t=t_dens, density_polar_theta=theta_dens,
+                      density_polar_valid=valid_dens_all_false)
+    assert not torch.equal(out_true["density"], out_false["density"]), (
+        "density output did not change when density_polar_valid changed — "
+        "density head is not actually consuming density_polar_* "
+    )
+
+
+def test_forward_density_polar_args_fallback_matches_polar_args():
+    """Omitting density_polar_* (None, default) when density_image IS given must fall
+    back to polar_t/theta/valid — the documented "zero behaviour change" path for any
+    caller that doesn't know about the new params."""
+    model = _make_radial_attention_density_model()
+    images = torch.randn(2, 3, 56, 56)
+    density_images = torch.randn(2, 3, 56, 56)
+    t, theta, valid = _grid_polar_tensors(2, 4, 4)
+
+    out_fallback = model(images, density_image=density_images,
+                         polar_t=t, polar_theta=theta, polar_valid=valid)
+    out_explicit = model(images, density_image=density_images,
+                         polar_t=t, polar_theta=theta, polar_valid=valid,
+                         density_polar_t=t, density_polar_theta=theta, density_polar_valid=valid)
+    assert torch.equal(out_fallback["density"], out_explicit["density"])
+
+
+# ---------------------------------------------------------------------------
+# Angular-resolution bands (09.09) — density_image_bands + density_bands_polar_*
+# ---------------------------------------------------------------------------
+
+def test_forward_density_image_bands_concatenates_across_bands():
+    model = _make_radial_attention_density_model()
+    images = torch.randn(2, 3, 56, 56)
+    band0 = torch.randn(2, 3, 28, 42)   # 2x3 = 6 patches
+    band1 = torch.randn(2, 3, 42, 70)   # 3x5 = 15 patches
+    t0, th0, v0 = _grid_polar_tensors(2, 2, 3)
+    t1, th1, v1 = _grid_polar_tensors(2, 3, 5)
+
+    out = model(images, density_image_bands=[band0, band1],
+               density_bands_polar_t=[t0, t1], density_bands_polar_theta=[th0, th1],
+               density_bands_polar_valid=[v0, v1])
+    assert out["density"].shape == (2, 21)
+    assert out["density_count"].shape == (2,)
+    d = out["density"].detach()
+    assert float(d.min()) >= 0.0 and float(d.max()) <= 1.0
+
+
+def test_forward_density_image_bands_requires_polar_aware_head():
+    from src.config import OtolithConfig
+    from src.model import OtolithModel
+    cfg = OtolithConfig()
+    cfg.model.num_age_classes = 10
+    cfg.model.head_type = "coral"
+    cfg.model.use_density_head = True
+    cfg.model.density_head_type = "mlp"
+    model = OtolithModel(cfg, backbone=_GradPatchBackbone())
+    band0 = torch.randn(2, 3, 28, 42)
+    with pytest.raises(NotImplementedError):
+        model(torch.randn(2, 3, 56, 56), density_image_bands=[band0])
+
+
+def test_forward_density_image_bands_positions_actually_used():
+    """Passing real (non-None) per-band polar positions must change the output relative to
+    omitting them — otherwise concatenation silently drops positional information."""
+    model = _make_radial_attention_density_model()
+    images = torch.randn(2, 3, 56, 56)
+    band0 = torch.randn(2, 3, 28, 42)
+    band1 = torch.randn(2, 3, 42, 70)
+    t0, th0, v0 = _grid_polar_tensors(2, 2, 3)
+    t1, th1, v1 = _grid_polar_tensors(2, 3, 5)
+
+    with_pos = model(images, density_image_bands=[band0, band1],
+                     density_bands_polar_t=[t0, t1], density_bands_polar_theta=[th0, th1],
+                     density_bands_polar_valid=[v0, v1])
+    without_pos = model(images, density_image_bands=[band0, band1])
+    assert with_pos["density"].shape == without_pos["density"].shape
+    assert not torch.allclose(with_pos["density"], without_pos["density"])
+
+
+def test_forward_density_image_bands_stop_gradient():
+    """No gradient may reach the backbone from the bands path — same stop-gradient guarantee
+    as the single-canvas density_image path."""
+    model = _make_radial_attention_density_model()
+    images = torch.randn(2, 3, 56, 56)
+    band0 = torch.randn(2, 3, 28, 42)
+    band1 = torch.randn(2, 3, 42, 70)
+    out = model(images, density_image_bands=[band0, band1])
+    out["density"].sum().backward()
+    assert model.backbone.proj.weight.grad is None
+
+
+def test_forward_density_image_bands_matches_manual_per_band_backbone_calls():
+    """The internal K-separate-forward-passes-then-concatenate must equal manually running
+    the SAME backbone on each band and concatenating the resulting tokens — pins the actual
+    mechanism, not just shapes."""
+    model = _make_radial_attention_density_model()
+    images = torch.randn(2, 3, 56, 56)
+    band0 = torch.randn(2, 3, 28, 42)
+    band1 = torch.randn(2, 3, 42, 70)
+    t0, th0, v0 = _grid_polar_tensors(2, 2, 3)
+    t1, th1, v1 = _grid_polar_tensors(2, 3, 5)
+
+    out = model(images, density_image_bands=[band0, band1],
+               density_bands_polar_t=[t0, t1], density_bands_polar_theta=[th0, th1],
+               density_bands_polar_valid=[v0, v1])
+
+    with torch.no_grad():
+        tok0 = model.backbone.forward_features(band0)["x_norm_patchtokens"]
+        tok1 = model.backbone.forward_features(band1)["x_norm_patchtokens"]
+    detached = torch.cat([tok0, tok1], dim=1)
+    t_cat = torch.cat([t0, t1], dim=1)
+    theta_cat = torch.cat([th0, th1], dim=1)
+    valid_cat = torch.cat([v0, v1], dim=1)
+    expected_logits = model.density_head(detached, polar_t=t_cat, polar_theta=theta_cat,
+                                         polar_valid=valid_cat).squeeze(-1)
+    expected_density = torch.sigmoid(expected_logits)
+    assert torch.allclose(out["density"], expected_density)
+
+
+def test_get_density_probs_bands_shape_and_range():
+    model = _make_radial_attention_density_model()
+    band0 = torch.randn(2, 3, 28, 42)   # 6 patches
+    band1 = torch.randn(2, 3, 42, 70)   # 15 patches
+    t0, th0, v0 = _grid_polar_tensors(2, 2, 3)
+    t1, th1, v1 = _grid_polar_tensors(2, 3, 5)
+    density = model.get_density_probs_bands([band0, band1], polar_t=[t0, t1],
+                                            polar_theta=[th0, th1], polar_valid=[v0, v1])
+    assert density.shape == (2, 21)
+    assert float(density.min()) >= 0.0 and float(density.max()) <= 1.0
+
+
+def test_get_density_probs_bands_raises_without_density_head():
+    from src.config import OtolithConfig
+    from src.model import OtolithModel
+    cfg = OtolithConfig()
+    cfg.model.use_density_head = False
+    model = OtolithModel(cfg, backbone=_GradPatchBackbone())
+    with pytest.raises(RuntimeError):
+        model.get_density_probs_bands([torch.randn(1, 3, 28, 42)])
+
+
 def test_get_density_probs_explicit_patch_grid_non_square():
     model = _make_density_model()
     images = torch.randn(2, 3, 28, 70)   # N=10, not a perfect square

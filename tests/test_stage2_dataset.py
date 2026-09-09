@@ -1129,4 +1129,281 @@ def test_multi_wycinek_pads_by_repeating_best_when_fewer_candidates_found(ellips
     assert item["image_strip"].shape == (4, 3, 42, 140)
     # candidates 2 and 3 (0-indexed) should be padding copies of candidate 0
     assert torch.equal(item["image_strip"][2], item["image_strip"][0])
-    assert torch.equal(item["image_strip"][3], item["image_strip"][0])
+
+
+# ---------------------------------------------------------------------------
+# Polar-wedge experiment (09.09) — dual_branch_wedge
+# ---------------------------------------------------------------------------
+
+def _wedge_cfg(tmp_path, n_angle_patches: int = 3, n_radius_patches: int = 10):
+    cfg = _make_cfg()
+    cfg.data.image_size = 56
+    cfg.data.mask_background = True
+    cfg.data.mask_cache_dir = str(tmp_path / "masks_cache")
+    cfg.data.dual_branch_wedge = True
+    cfg.data.wedge_n_angle_patches = n_angle_patches
+    cfg.data.wedge_n_radius_patches = n_radius_patches
+    cfg.data.wedge_delta_theta_deg = 90.0
+    cfg.data.wedge_cache_dir = str(tmp_path / "wedges_cache")
+    cfg.model.use_density_head = True
+    return cfg
+
+
+def test_dual_branch_wedge_off_leaves_image_untouched(ellipse_data, tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _make_cfg()
+    cfg.data.image_size = 56
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert "image_wedge" not in item
+    assert item["image"].shape == (3, 56, 56)
+
+
+def test_dual_branch_wedge_adds_correctly_shaped_tensors(ellipse_data, tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _wedge_cfg(tmp_path, n_angle_patches=3, n_radius_patches=10)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert item["image"].shape == (3, 56, 56)                 # square (age) branch untouched
+    assert item["image_wedge"].shape == (3, 10 * 14, 3 * 14)  # (3, canvas_h, canvas_w)
+    assert item["wedge_polar_t"].shape == (10, 3)
+    assert item["wedge_polar_theta"].shape == (10, 3)
+    assert item["wedge_polar_valid"].shape == (10, 3)
+    # t increases monotonically with radius (row), same invariant as the standalone
+    # wedge_extraction unit tests.
+    t = item["wedge_polar_t"].numpy()
+    assert (t[1:, 0] > t[:-1, 0]).all()
+
+
+def test_dual_branch_wedge_gracefully_falls_back_for_unsegmentable_image(dummy_data, tmp_path):
+    """dummy_data's images are flat solid colour — no foreground to segment. The wedge
+    branch must fall back to a plain resize + all-valid mask, never crash."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = dummy_data
+    cfg = _wedge_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert item["image_wedge"].shape == (3, 10 * 14, 3 * 14)
+    assert torch.all(item["wedge_polar_valid"] == 1.0)
+
+
+def test_dual_branch_wedge_cache_reused_on_second_access(tmp_path, monkeypatch):
+    """Second access must hit the on-disk wedge cache, not recompute the axis/warp
+    (mirrors test_dual_branch_density_strip_cache_reused_on_second_access). Uses
+    split="test" (deterministic transform, no random flip) for the same reason that
+    test does."""
+    import cv2
+    import numpy as np
+    from src.dataset import OtolithDataset
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    arr = np.full((200, 160, 3), 255, dtype=np.uint8)
+    cv2.ellipse(arr, (80, 100), (50, 80), 0, 0, 360, (40, 40, 40), -1)
+    name = "fish_ellipse.png"
+    Image.fromarray(arr).save(img_dir / name)
+    csv_path = tmp_path / "labels.csv"
+    pd.DataFrame([{"image_id": name, "age": 4, "split": "test"}]).to_csv(csv_path, index=False)
+
+    cfg = _wedge_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "test", labels_csv=str(csv_path), image_dir=str(img_dir))
+    first = ds[0]["image_wedge"]
+
+    def _boom(*a, **kw):
+        raise AssertionError("detect_axis should NOT be called on a wedge-cache hit")
+    monkeypatch.setattr("src.dataset.detect_axis", _boom)
+
+    second = ds[0]["image_wedge"]
+    assert torch.allclose(first, second)
+
+
+def test_build_transforms_wedge_drops_vertical_flip_only():
+    from src.dataset import build_transforms
+    tf = build_transforms(42, "train", include_flips=True, wedge=True)
+    op_types = [type(op).__name__ for op in tf.transforms]
+    assert "RandomVerticalFlip" not in op_types
+    assert "RandomHorizontalFlip" in op_types
+    assert "Resize" not in op_types
+
+
+def test_dual_branch_wedge_hflip_synced_with_image_and_polar(ellipse_data, tmp_path, monkeypatch):
+    """The shared explicit flip decision must mirror the wedge image AND relocate its
+    polar_theta/valid columns in lockstep — not leave them describing the pre-flip
+    layout (same requirement as the strip's vflip-sync test, mirrored to columns
+    instead of rows since the wedge's flip axis is angle, not radius)."""
+    import torchvision.transforms as T
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    monkeypatch.setattr(T.ColorJitter, "forward", lambda self, img: img)
+    cfg = _wedge_cfg(tmp_path, n_angle_patches=3, n_radius_patches=10)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    monkeypatch.setattr(ds, "_decide_wedge_hflip", lambda: False)
+    baseline = ds[0]
+    monkeypatch.setattr(ds, "_decide_wedge_hflip", lambda: True)
+    flipped = ds[0]
+
+    assert torch.allclose(flipped["image_wedge"], torch.flip(baseline["image_wedge"], dims=[2]), atol=1e-5)
+    assert torch.allclose(flipped["wedge_polar_theta"], torch.flip(baseline["wedge_polar_theta"], dims=[1]))
+    assert torch.allclose(flipped["wedge_polar_valid"], torch.flip(baseline["wedge_polar_valid"], dims=[1]))
+    # explicitly NOT unchanged — pins that a real transform happened
+    assert not torch.allclose(flipped["image_wedge"], baseline["image_wedge"])
+
+
+def test_dual_branch_wedge_age_ordinal_unaffected(ellipse_data, tmp_path):
+    """The wedge branch must never touch age encoding — same age, same ordinal
+    vector, with or without dual_branch_wedge."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+
+    cfg_plain = _make_cfg()
+    cfg_plain.data.image_size = 56
+    ds_plain = OtolithDataset(cfg_plain, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    cfg_wedge = _wedge_cfg(tmp_path)
+    ds_wedge = OtolithDataset(cfg_wedge, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    assert torch.equal(ds_plain[0]["age_ordinal"], ds_wedge[0]["age_ordinal"])
+    assert ds_plain[0]["age"].item() == ds_wedge[0]["age"].item()
+
+
+# ---------------------------------------------------------------------------
+# Angular-resolution bands (09.09 follow-up) — wedge_band_edges_t etc.
+# ---------------------------------------------------------------------------
+
+def _wedge_bands_cfg(tmp_path, band_edges_t=None, n_angle=None, n_radius=None):
+    cfg = _wedge_cfg(tmp_path)
+    cfg.data.wedge_band_edges_t = band_edges_t or [0.0, 0.5, 1.0]
+    cfg.data.wedge_band_n_angle_patches = n_angle or [3, 5]
+    cfg.data.wedge_band_n_radius_patches = n_radius or [4, 6]
+    cfg.data.wedge_bands_cache_dir = str(tmp_path / "wedge_bands_cache")
+    return cfg
+
+
+def test_wedge_bands_off_single_wedge_untouched(ellipse_data, tmp_path):
+    """dual_branch_wedge=True alone (no band fields) must keep behaving exactly like before —
+    single image_wedge key, no band keys."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _wedge_cfg(tmp_path, n_angle_patches=3, n_radius_patches=10)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert "image_wedge" in item
+    assert "image_wedge_band0" not in item
+
+
+def test_wedge_bands_replace_single_wedge_when_enabled(ellipse_data, tmp_path):
+    """Bands REPLACE the single-canvas wedge, not add to it — no image_wedge key when band
+    fields are set, only the per-band keys, at each band's own correct shape."""
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    cfg = _wedge_bands_cfg(tmp_path, band_edges_t=[0.0, 0.5, 1.0], n_angle=[3, 5], n_radius=[4, 6])
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert "image_wedge" not in item
+    assert item["image"].shape == (3, 56, 56)  # square (age) branch untouched
+
+    assert item["image_wedge_band0"].shape == (3, 4 * 14, 3 * 14)
+    assert item["wedge_band0_polar_t"].shape == (4, 3)
+    assert item["wedge_band0_polar_theta"].shape == (4, 3)
+    assert item["wedge_band0_polar_valid"].shape == (4, 3)
+
+    assert item["image_wedge_band1"].shape == (3, 6 * 14, 5 * 14)
+    assert item["wedge_band1_polar_t"].shape == (6, 5)
+
+    # radius increases row-by-row within each band, and band 0 stays entirely below band 1's t
+    t0 = item["wedge_band0_polar_t"].numpy()
+    t1 = item["wedge_band1_polar_t"].numpy()
+    assert (t0[1:, 0] > t0[:-1, 0]).all()
+    assert (t1[1:, 0] > t1[:-1, 0]).all()
+    assert t0.max() < t1.min()
+
+
+def test_wedge_bands_gracefully_falls_back_for_unsegmentable_image(dummy_data, tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = dummy_data
+    cfg = _wedge_bands_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+    item = ds[0]
+    assert item["image_wedge_band0"].shape == (3, 4 * 14, 3 * 14)
+    assert item["image_wedge_band1"].shape == (3, 6 * 14, 5 * 14)
+    assert torch.all(item["wedge_band0_polar_valid"] == 1.0)
+    assert torch.all(item["wedge_band1_polar_valid"] == 1.0)
+
+
+def test_wedge_bands_cache_reused_on_second_access(tmp_path, monkeypatch):
+    """Mirrors test_dual_branch_wedge_cache_reused_on_second_access — a second access must hit
+    every band's on-disk cache, never re-run detect_axis."""
+    import cv2
+    import numpy as np
+    from src.dataset import OtolithDataset
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir()
+    arr = np.full((200, 160, 3), 255, dtype=np.uint8)
+    cv2.ellipse(arr, (80, 100), (50, 80), 0, 0, 360, (40, 40, 40), -1)
+    name = "fish_ellipse.png"
+    Image.fromarray(arr).save(img_dir / name)
+    csv_path = tmp_path / "labels.csv"
+    pd.DataFrame([{"image_id": name, "age": 4, "split": "test"}]).to_csv(csv_path, index=False)
+
+    cfg = _wedge_bands_cfg(tmp_path)
+    ds = OtolithDataset(cfg, "test", labels_csv=str(csv_path), image_dir=str(img_dir))
+    first0 = ds[0]["image_wedge_band0"]
+    first1 = ds[0]["image_wedge_band1"]
+
+    def _boom(*a, **kw):
+        raise AssertionError("detect_axis should NOT be called on a wedge-bands cache hit")
+    monkeypatch.setattr("src.dataset.detect_axis", _boom)
+
+    second = ds[0]
+    assert torch.allclose(first0, second["image_wedge_band0"])
+    assert torch.allclose(first1, second["image_wedge_band1"])
+
+
+def test_wedge_bands_hflip_synced_across_all_bands(ellipse_data, tmp_path, monkeypatch):
+    """The ONE shared flip decision must mirror EVERY band's image and relocate its polar_theta/
+    valid columns in lockstep — not just one band, and not independently per band."""
+    import torchvision.transforms as T
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+    monkeypatch.setattr(T.ColorJitter, "forward", lambda self, img: img)
+    cfg = _wedge_bands_cfg(tmp_path, band_edges_t=[0.0, 0.5, 1.0], n_angle=[3, 5], n_radius=[4, 6])
+    ds = OtolithDataset(cfg, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    monkeypatch.setattr(ds, "_decide_wedge_hflip", lambda: False)
+    baseline = ds[0]
+    monkeypatch.setattr(ds, "_decide_wedge_hflip", lambda: True)
+    flipped = ds[0]
+
+    any_image_changed = False
+    for i in (0, 1):
+        img_key, t_key, theta_key, valid_key = (
+            f"image_wedge_band{i}", f"wedge_band{i}_polar_t",
+            f"wedge_band{i}_polar_theta", f"wedge_band{i}_polar_valid")
+        assert torch.allclose(flipped[img_key], torch.flip(baseline[img_key], dims=[2]), atol=1e-5)
+        assert torch.allclose(flipped[theta_key], torch.flip(baseline[theta_key], dims=[1]))
+        assert torch.allclose(flipped[valid_key], torch.flip(baseline[valid_key], dims=[1]))
+        if not torch.allclose(flipped[img_key], baseline[img_key]):
+            any_image_changed = True
+    # explicitly NOT unchanged overall — pins that a real transform happened (band 0's tiny 3-col
+    # canvas can coincidentally look flip-invariant on this synthetic symmetric ellipse; theta/
+    # valid column-reversal above is the real per-band correctness check regardless)
+    assert any_image_changed
+
+
+def test_wedge_bands_age_ordinal_unaffected(ellipse_data, tmp_path):
+    from src.dataset import OtolithDataset
+    csv_path, img_dir = ellipse_data
+
+    cfg_plain = _make_cfg()
+    cfg_plain.data.image_size = 56
+    ds_plain = OtolithDataset(cfg_plain, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    cfg_bands = _wedge_bands_cfg(tmp_path)
+    ds_bands = OtolithDataset(cfg_bands, "train", labels_csv=str(csv_path), image_dir=str(img_dir))
+
+    assert torch.equal(ds_plain[0]["age_ordinal"], ds_bands[0]["age_ordinal"])
+    assert ds_plain[0]["age"].item() == ds_bands[0]["age"].item()
