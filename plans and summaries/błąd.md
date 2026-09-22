@@ -1,27 +1,29 @@
-(.venv) kswitek@labworks:~/Documents/DINO_project_Herring$ D=/home/kswitek/Documents/DINO_project_Herring                                                                                                                                                                                   
-  C=$D/data/wedge_bands_cache/band3_168x2254_98.7deg                                                                                                                                                                               
-  echo "=== godzina teraz ==="; date +%H:%M:%S                                                                                                                                                                                     
-  echo "=== 3 NAJNOWSZE pliki cache (kluczowe: godzina zapisu) ==="                                                                                                                                                                
-  ls -lt --time-style=+%H:%M:%S $C | head -4                                                                                                                                                                                       
-  echo "=== log: rozmiar i godzina modyfikacji ==="                                                                                                                                                                                
-  ls -l --time-style=+%H:%M:%S $D/outputs/data/22.09_wedge_b/logs/embedded/train.log                                                                                                                                               
-  echo "=== proces: czas, CPU, PAMIEC, stan ==="                                                                                                                                                                                   
-  ps -eo pid,etime,%cpu,%mem,rss,stat,cmd | grep main_wedge_b | grep -v grep                                                                                                                                                       
-  echo "=== RAM i SWAP ==="                                                                                                                                                                                                        
-  free -h  
-=== godzina teraz ===
-17:16:15
-=== 3 NAJNOWSZE pliki cache (kluczowe: godzina zapisu) ===
-total 1073512
--rw-rw-r-- 1 kswitek kswitek   4462 17:16:11 2023_BITS4q_HER_GlebiaGdanska_Embedded_Sharpest_FishIndex45_Single2_Left_wedge_band3.geom.npz
--rw-rw-r-- 1 kswitek kswitek 175448 17:16:11 2023_BITS4q_HER_GlebiaGdanska_Embedded_Sharpest_FishIndex45_Single2_Left_wedge_band3.png
--rw-rw-r-- 1 kswitek kswitek   4462 17:16:11 2023_BITS4q_HER_GlebiaGdanska_Embedded_Sharpest_FishIndex45_Single1_Right_wedge_band3.geom.npz
-=== log: rozmiar i godzina modyfikacji ===
--rw-rw-r-- 1 kswitek kswitek 442 15:04:12 /home/kswitek/Documents/DINO_project_Herring/outputs/data/22.09_wedge_b/logs/embedded/train.log
-=== proces: czas, CPU, PAMIEC, stan ===
-2002677    05:12:53 1959  0.2 2763856 Rl /home/kswitek/Documents/DINO_project_Herring/.venv/bin/python /home/kswitek/Documents/DINO_project_Herring/main_wedge_b.py
-=== RAM i SWAP ===
-               total        used        free      shared  buff/cache   available
-Mem:           1,0Ti        36Gi       147Gi       196Mi       823Gi       964Gi
-Swap:          2,0Gi       2,0Gi        13Mi
-(.venv) kswitek@labworks:~/Documents/DINO_project_Herring$ 
+/home/kswitek/Documents/DINO_project_Herring/.venv/bin/python /home/kswitek/Documents/DINO_project_Herring/main_wedge_b.py 
+[main_wedge_b] LOCATION=server  IMAGE_DIR=/home/kswitek/Documents/Photo/Otolithes/HER/Processed  RESCAN=False
+[main_wedge_b] BASE_CONFIG=/home/kswitek/Documents/DINO_project_Herring/configs/config_wedge_b.yaml
+[main_wedge_b] OUTPUT_DIR=/home/kswitek/Documents/DINO_project_Herring/outputs/data/22.09_wedge_b
+[main_wedge_b] Karty raportu SA swiadome galezi wycinka/pasm od 22.09 (sekcja G2: sektor na zdjeciu, kanwy pasm, density, zdekodowane piki). Koszt: 5852 patchy/probke na galezi density, 4,27x wiecej niz Run N. Niezalezna ocena liczbowa: scripts/diagnostics/expert_annotation_eval_wedge.py.
+============================================================
+OtolithDino — pipeline Embedded vs NotEmbedded
+============================================================
+
+[1/9] SCAN — pominięty (używam istniejących data/labels_*.csv; --rescan wymusza skan)
+
+[2/9] TRAIN — Embedded
+Using cache found in /home/kswitek/.cache/torch/hub/facebookresearch_dinov2_main
+/home/kswitek/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:45: UserWarning: xFormers is disabled (SwiGLU)
+  warnings.warn("xFormers is disabled (SwiGLU)")
+/home/kswitek/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:51: UserWarning: xFormers is not available (SwiGLU)
+  warnings.warn("xFormers is not available (SwiGLU)")
+/home/kswitek/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:29: UserWarning: xFormers is disabled (Attention)
+  warnings.warn("xFormers is disabled (Attention)")
+/home/kswitek/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:33: UserWarning: xFormers is not available (Attention)
+  warnings.warn("xFormers is not available (Attention)")
+/home/kswitek/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:35: UserWarning: xFormers is disabled (Block)
+  warnings.warn("xFormers is disabled (Block)")
+/home/kswitek/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:40: UserWarning: xFormers is not available (Block)
+  warnings.warn("xFormers is not available (Block)")
+[2026-09-22 12:04:18] RUN IDENTITY  model.backbone=dinov2_vits14_reg  model.use_density_head=True  model.density_head_type=radial_attention  data.mask_background=True  data.dual_branch_density=False  data.dual_branch_wedge=True  data.wedge_band_edges_t=[0.0, 0.6, 0.8, 0.9, 1.0]  data.multi_wycinek_k=1  data.strip_mask_background_loss=False  data.quarter_age_adjustment_enabled=False
+[2026-09-22 12:04:18] Backbone frozen for first 5 epochs
+
+[2026-09-22 17:33:11] epoch=  1  train_loss=42.5955  val_loss=4.0634  val_mae=1.612  lr=1.00e-04  coral_loss=0.1204  mil_loss=0.0176  mil_active=31.3151  density_loss=3.9255  density_active=0.0000  mean_age=3.8102
