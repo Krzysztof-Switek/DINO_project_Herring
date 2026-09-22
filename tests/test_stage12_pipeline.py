@@ -919,3 +919,51 @@ def test_card_path_leaves_non_wedge_configs_completely_untouched(tmp_path):
     _grids, axis_data, _wt = _compute_axis_data_for_samples(
         samples, img_dir, cfg, ckpt, tmp_path / "cond")
     assert axis_data[fname]["wedge"] is None
+
+
+def test_wedge_survives_from_the_card_path_into_the_rendered_report(tmp_path):
+    """The LAST link: wedge data computed in the card path must actually reach the HTML.
+
+    _compute_axis_data_for_samples -> _step_cards -> build_comparison_report -> section G2.
+    Each half is unit-tested elsewhere; this pins the join, which is the kind of link that breaks
+    silently and leaves a report that simply omits the section without any error.
+    """
+    import cv2
+    from scripts.run_pipeline import _compute_axis_data_for_samples
+    from src.comparison_report import build_comparison_report
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True)
+    img = np.full((300, 220, 3), 255, dtype=np.uint8)
+    cv2.ellipse(img, (110, 150), (60, 100), 0, 0, 360, (40, 40, 40), -1)
+    fname = "2022_BIAS_HER_Loc_Embedded_Sharp_FishIndex0_Single1_Left.png"
+    PILImage.fromarray(img, "RGB").save(img_dir / fname)
+    rows = [{"image_id": fname, "age": 4, "split": s} for s in ("train", "val", "test")]
+    labels_csv = tmp_path / "labels.csv"
+    pd.DataFrame(rows).to_csv(labels_csv, index=False)
+
+    cfg = _wedge_cfg(tmp_path, labels_csv, img_dir)
+    ckpt = _save_mock_checkpoint(cfg, labels_csv, img_dir)
+
+    samples = [{"image_id": fname, "age": 4, "predicted_age": 4}]
+    _grids, _axis_data, walkthrough = _compute_axis_data_for_samples(
+        samples, img_dir, cfg, ckpt, tmp_path / "cond")
+
+    assert walkthrough is not None, "payload walkthrough nie powstał"
+    assert walkthrough.get("wedge") is not None, "wycinek nie trafił do payloadu walkthrough"
+
+    out = tmp_path / "report.html"
+    preds = pd.DataFrame({
+        "image_id": [f"img{i}.png" for i in range(12)],
+        "age": [i % 5 for i in range(12)],
+        "predicted_age": [(i % 5) + (i % 2) for i in range(12)],
+    })
+    build_comparison_report(
+        results={"emb_on_emb": preds},
+        training_logs={}, increment_cards={},
+        dataset_stats={"counts": {}, "orphan_count": 0, "age_distributions": {}},
+        output_path=out, localization_walkthrough=walkthrough,
+    )
+    html = out.read_text(encoding="utf-8")
+    assert "Ścieżka decyzyjna — wycinek kątowy" in html
+    assert "Krok 1" in html and "Krok 4" in html

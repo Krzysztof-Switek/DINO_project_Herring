@@ -870,6 +870,16 @@ def _compute_axis_data_for_samples(
             "wedge": wedge_card,
         }
 
+        # (22.09) The wedge section must NOT depend on the DP walkthrough succeeding. The two are
+        # built in separate try/except blocks above, and the DP one is the more fragile of the
+        # pair — without this, one exception in DP would silently delete the whole wedge section
+        # from the report even though its data was computed fine. Carry the wedge on its own.
+        if wedge_card is not None and iid == walkthrough_iid:
+            if walkthrough_payload is None:
+                walkthrough_payload = {"image_id": iid, "wedge": wedge_card}
+            else:
+                walkthrough_payload["wedge"] = wedge_card
+
     total = len(samples)
     summary_line = (f"[cards] {cond_dir.name}: gridy {len(grids)}/{total} "
                     f"(brak obrazu: {missing_images}, segmentacja nieudana: {failed_axes})")
