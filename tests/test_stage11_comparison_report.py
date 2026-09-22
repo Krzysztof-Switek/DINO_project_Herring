@@ -429,3 +429,71 @@ def test_section_localization_methods_removed(tmp_path):
     for sec in ('id="I"', 'id="J"', 'id="K"', 'id="L"'):
         assert sec not in content
     assert "density (model)" not in content
+
+
+# ---------------------------------------------------------------------------
+# (22.09) Section G2 — the wedge decision path.
+#
+# Until 22.09 the report showed a density signal computed on the square 518px image even for a
+# wedge-trained checkpoint, i.e. on a geometry the head never saw. This section is what replaced
+# that silence; these tests pin down that it appears for wedge runs and stays INVISIBLE for every
+# other run (no empty placeholder in reports that have no wedge).
+# ---------------------------------------------------------------------------
+
+def _wedge_payload():
+    return {
+        "mode": "bands", "n_bands": 4, "delta_theta_deg": 98.7, "k": 2,
+        "image_id": "Z38.jpg", "true_age": 6, "pred_age": 6,
+        "peaks": [
+            {"band": 0, "row": 5, "col": 2, "t": 0.31, "theta": 0.12, "score": 0.44,
+             "x": 101.0, "y": 88.0},
+            {"band": 3, "row": 9, "col": 80, "t": 0.94, "theta": -0.30, "score": 0.61,
+             "x": 300.0, "y": 120.0},
+        ],
+        "band_shapes": [[11, 97], [12, 129], [9, 145], [12, 161]],
+        "band_t_ranges": [[0.0, 0.3], [0.3, 0.6], [0.6, 0.8], [0.8, 1.0]],
+        "overlay_big_b64": "data:image/png;base64,AAA",
+        "panel_raw_b64": "data:image/png;base64,BBB",
+        "panel_density_b64": "data:image/png;base64,CCC",
+    }
+
+
+def test_wedge_section_is_empty_without_a_wedge_payload():
+    from src.comparison_report import _section_wedge_walkthrough
+    assert _section_wedge_walkthrough(None) == ""
+    assert _section_wedge_walkthrough({}) == ""
+
+
+def test_wedge_section_renders_all_four_steps_and_the_peak_table():
+    from src.comparison_report import _section_wedge_walkthrough
+    html = _section_wedge_walkthrough(_wedge_payload())
+    for step in ("Krok 1", "Krok 2", "Krok 3", "Krok 4"):
+        assert step in html, step
+    assert "98.7" in html                      # the analysed angular width
+    assert "161" in html                       # widest band's column count
+    assert "0.940" in html or "0.94" in html   # the edge peak's t
+    assert "(300, 120)" in html                # its real pixel position
+    # layout rule this project learned the hard way (flex twice failed to render side-by-side)
+    assert "display:inline-block" in html
+    assert "display:flex" not in html
+
+
+def test_report_includes_wedge_section_only_when_the_walkthrough_carries_one(tmp_path):
+    from src.comparison_report import build_comparison_report
+
+    common = dict(
+        results={"emb_on_emb": _make_predictions(seed=0)},
+        training_logs={},
+        increment_cards={},
+        dataset_stats={"counts": {}, "orphan_count": 0, "age_distributions": {}},
+    )
+
+    with_wedge = tmp_path / "with.html"
+    build_comparison_report(output_path=with_wedge,
+                            localization_walkthrough={"wedge": _wedge_payload()}, **common)
+    assert "Ścieżka decyzyjna — wycinek kątowy" in with_wedge.read_text(encoding="utf-8")
+
+    without = tmp_path / "without.html"
+    build_comparison_report(output_path=without,
+                            localization_walkthrough={"wedge": None}, **common)
+    assert "wycinek kątowy" not in without.read_text(encoding="utf-8")

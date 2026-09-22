@@ -341,6 +341,7 @@ def _compute_axis_data_for_samples(
     import torch
     from PIL import Image as PILImage
 
+    from src import wedge_cards as wc
     from src.candidates import find_candidate_peaks
     from src.dataset import build_transforms
     from src.inference import load_model_from_checkpoint
@@ -532,8 +533,33 @@ def _compute_axis_data_for_samples(
         density_axis_info = axis_info
         dH_img, dW_img = H_img, W_img
         crop_x0 = crop_y0 = 0
+
+        # (22.09) POLAR-WEDGE BRANCH. A wedge/bands-trained density head learned on the wedge
+        # canvas, not on this square image — feeding it `grid` here is what made both wedge
+        # configs carry the warning "karty report.html NIE są świadome gałęzi wycinka/pasm".
+        # Now the head is run on its OWN geometry, the peaks are decoded there, and the result is
+        # re-projected into an image-space grid so everything below (axis profile, density_peaks,
+        # fuse_increments, the DP walkthrough) keeps working — on the real signal this time.
+        # Full rationale: src/wedge_cards.py, plans and summaries/22.09_wedge_b_analiza.md.
+        wedge_payload = None
+        if (wc.wedge_enabled(cfg) and getattr(model, "use_density_head", False)
+                and hasattr(model, "density_head") and mask_arr is not None):
+            try:
+                wedge_payload = wc.build_wedge_card_data(
+                    model, orig_rgb, mask_arr, axis_info, cfg,
+                    k=int(row.get("predicted_age", 0)),
+                    out_h_p=grid.shape[0], out_w_p=grid.shape[1], device=device,
+                )
+                density_grid = wedge_payload["image_density"]
+                density_axis_info = axis_info
+                dH_img, dW_img = H_img, W_img
+            except Exception as e:
+                print(f"    [cards] gałąź wycinka błąd dla {iid}: {e}")
+                wedge_payload = None
+
         need_hires_density = (
-            getattr(model, "use_density_head", False) and hasattr(model, "density_head")
+            wedge_payload is None
+            and getattr(model, "use_density_head", False) and hasattr(model, "density_head")
             and (cfg.candidates.density_crop_to_otolith
                  or cfg.candidates.density_image_size not in (None, cfg.data.image_size))
         )
@@ -679,6 +705,63 @@ def _compute_axis_data_for_samples(
         except Exception as e:
             print(f"    [cards] localization I/J/K błąd dla {iid}: {e}")
 
+        # (22.09) Panele gałęzi wycinka — to, czego użytkownik nie mógł dotąd zobaczyć: sam
+        # klin, jego mapa density, zdekodowane piki i ich powrót na zdjęcie. Dla KAŻDEJ karty
+        # tanio: nakładka sektora na zdjęciu (360px). Dla JEDNEGO otolitu (tego samego, co
+        # walkthrough DP) pełna ścieżka: surowe kanwy pasm, kanwy z density, duża nakładka.
+        wedge_card = None
+        if wedge_payload is not None:
+            try:
+                import base64 as _b64wg
+                import io as _iowg
+
+                from src.visualization import (render_wedge_canvas_panel,
+                                               render_wedge_sector_on_photo)
+
+                def _wg_b64(arr, target_w):
+                    h0, w0 = arr.shape[:2]
+                    s = min(1.0, target_w / max(w0, 1))
+                    im = PILImage.fromarray(arr)
+                    if s < 1.0:
+                        im = im.resize((max(1, int(w0 * s)), max(1, int(h0 * s))))
+                    bb = _iowg.BytesIO()
+                    im.save(bb, format="PNG")
+                    return "data:image/png;base64," + _b64wg.b64encode(bb.getvalue()).decode("ascii")
+
+                geom0 = wedge_payload["bands"][0].geom
+                peaks = wedge_payload["peaks"]
+                overlay = render_wedge_sector_on_photo(
+                    orig_rgb, axis_info, geom0, peaks=peaks, classical_pts=classical_pts)
+                wedge_card = {
+                    "mode": wedge_payload["mode"],
+                    "n_bands": len(wedge_payload["bands"]),
+                    "delta_theta_deg": wedge_payload["delta_theta_deg"],
+                    "k": wedge_payload["k"],
+                    "peaks": [{kk: (round(vv, 4) if isinstance(vv, float) else vv)
+                               for kk, vv in pk.items()} for pk in peaks],
+                    "overlay_b64": _wg_b64(overlay, 360),
+                }
+                if iid == walkthrough_iid:
+                    wedge_card["panel_raw_b64"] = _wg_b64(
+                        render_wedge_canvas_panel(wedge_payload["canvases"], None, None,
+                                                  patch_size=cfg.data.patch_size), 1100)
+                    wedge_card["panel_density_b64"] = _wg_b64(
+                        render_wedge_canvas_panel(wedge_payload["canvases"],
+                                                  wedge_payload["band_density"], peaks,
+                                                  patch_size=cfg.data.patch_size), 1100)
+                    wedge_card["overlay_big_b64"] = _wg_b64(overlay, 760)
+                    wedge_card["band_shapes"] = [list(d.shape) for d in wedge_payload["band_density"]]
+                    wedge_card["band_t_ranges"] = [
+                        [round(float(b.row_frac_lo), 4), round(float(b.row_frac_hi), 4)]
+                        for b in wedge_payload["bands"]
+                    ]
+                    wedge_card["image_id"] = iid
+                    wedge_card["true_age"] = int(row.get("age", 0))
+                    wedge_card["pred_age"] = int(row.get("predicted_age", 0))
+            except Exception as e:
+                print(f"    [cards] panele wycinka błąd dla {iid}: {e}")
+                wedge_card = None
+
         # Sekcja „krok po kroku" (jeden przykładowy otolit): pełne dane DP + panele przestrzenne.
         if iid == walkthrough_iid:
             try:
@@ -760,6 +843,9 @@ def _compute_axis_data_for_samples(
                     "panel_rings_b64": _wb64(_p3),
                     "panel_ray_examples_b64": [_wb64(_p2, (_wdw2, _wdh2)) for _p2 in _p2_list],
                     "krok4_interactive": _interactive,
+                    # (22.09) Wedge decision path for THIS otolith — None for every non-wedge
+                    # config, so the report section simply doesn't render (no empty placeholder).
+                    "wedge": wedge_card,
                     "data": _wd,
                 }
                 print(f"    [cards] walkthrough zbudowany dla {iid} (wiek {_wage})")
@@ -781,6 +867,7 @@ def _compute_axis_data_for_samples(
             "cls_is_fallback": cls_is_fallback,
             "classical_pts":  classical_pts,
             "localization_overlays": localization_overlays,
+            "wedge": wedge_card,
         }
 
     total = len(samples)

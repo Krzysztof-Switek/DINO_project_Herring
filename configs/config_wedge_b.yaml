@@ -138,9 +138,11 @@ interpretation:
   disable_fused_attention: true
 
 candidates:
-  # UWAGA: te pola sterują ścieżką kart raportu (_compute_axis_data_for_samples), która NIE jest
-  # świadoma gałęzi wycinka/pasm — zostawione identyczne z Run N dla spójności configu, ale ich
-  # wyjście dla tego biegu jest bez znaczenia. Prawdziwa lokalizacja tego modelu wymaga
+  # (22.09) Ścieżka kart raportu JEST już świadoma gałęzi wycinka/pasm: density liczone jest na
+  # kanwach klina (geometria treningowa), piki dekodowane tam, a wynik rzutowany z powrotem do
+  # przestrzeni obrazu — src/wedge_cards.py, sekcja G2 raportu. Te pola sterują dalszym ciągiem
+  # (profil wzdłuż osi, fuzja z klasyką, DP) i działają teraz na prawdziwym sygnale wycinka.
+  # Niezależna ocena liczbowa względem adnotacji eksperckich nadal:
   # scripts/diagnostics/expert_annotation_eval_wedge.py (wykrywa pasma automatycznie z configu).
   min_peak_distance: 5
   prominence_threshold: 0.1

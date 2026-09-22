@@ -955,3 +955,219 @@ def save_reasoning_cards(
 
     return saved
 
+
+
+# ---------------------------------------------------------------------------
+# Polar wedge — decision-path panels (22.09)
+#
+# The wedge branch is where a wedge-trained model ACTUALLY looks, so the report has to show it
+# in the wedge's own coordinates (what the backbone saw) AND back on the photo (what it means).
+# Both renderers below are deliberately geometry-only: they take plain arrays and dicts, never
+# a model or a config, exactly like every other render_* in this module.
+# ---------------------------------------------------------------------------
+
+
+_DEJAVU_CACHE: dict = {}
+
+
+def _unicode_font(size: int):
+    """A TrueType font that can actually draw Polish diacritics.
+
+    ``cv2.putText`` uses Hershey vector fonts, which are ASCII-only: every ą/ę/ó/ż silently
+    becomes ``?``. Caught by LOOKING at a rendered panel, not by any test — the first wedge panel
+    came out titled "Wycinek k??towy ??? brzeg u g??ry". DejaVuSans ships with matplotlib, which
+    is already a hard dependency of this project's reports, so this needs no new package. Returns
+    ``None`` if it cannot be loaded, and callers then fall back to cv2's ASCII rendering.
+    """
+    if size in _DEJAVU_CACHE:
+        return _DEJAVU_CACHE[size]
+    font = None
+    try:
+        import matplotlib
+        from PIL import ImageFont
+        ttf = (Path(matplotlib.__file__).parent / "mpl-data" / "fonts" / "ttf" / "DejaVuSans.ttf")
+        if ttf.exists():
+            font = ImageFont.truetype(str(ttf), size)
+    except Exception:
+        font = None
+    _DEJAVU_CACHE[size] = font
+    return font
+
+
+def _put_text_pl(img: np.ndarray, text: str, org: tuple, size: int = 13,
+                 color: tuple = (255, 255, 255), bg: Optional[tuple] = (0, 0, 0)) -> None:
+    """Draw ``text`` (Polish diacritics included) at ``org`` = top-left, in place."""
+    font = _unicode_font(size)
+    if font is None:
+        cv2.putText(img, text, (org[0], org[1] + size), cv2.FONT_HERSHEY_SIMPLEX,
+                    size / 32.0, color, 1, cv2.LINE_AA)
+        return
+    from PIL import Image as _PILImage, ImageDraw as _ImageDraw
+    pil = _PILImage.fromarray(img)
+    draw = _ImageDraw.Draw(pil)
+    if bg is not None:
+        x0, y0, x1, y1 = draw.textbbox(org, text, font=font)
+        draw.rectangle((x0 - 3, y0 - 2, x1 + 3, y1 + 2), fill=tuple(bg))
+    draw.text(org, text, font=font, fill=tuple(color))
+    img[...] = np.asarray(pil)
+
+
+_WEDGE_SECTOR_COLOR = (255, 120, 220)    # magenta — the analysed angular sector on the photo
+_WEDGE_GRID_COLOR   = (255, 255, 255)    # white   — patch-row/column gridlines on the canvas
+_WEDGE_PEAK_COLOR   = (230, 30, 30)      # red     — decoded increment peaks (same as _FINAL_COLOR)
+_BAND_LABEL_COLOR   = (255, 255, 255)
+
+
+def render_wedge_canvas_panel(
+    canvases: list,
+    band_density: Optional[list] = None,
+    peaks: Optional[list] = None,
+    patch_size: int = 14,
+    alpha: float = 0.35,
+    flip_display: bool = True,
+    band_labels: Optional[list] = None,
+) -> np.ndarray:
+    """The wedge itself: every band's canvas, optionally under its own density heat-map, with
+    patch gridlines and the decoded peaks marked.
+
+    ``flip_display=True`` (default) draws the EDGE at the top and the nucleus at the bottom.
+    That is display-only — no geometry is touched — and it exists because a reader scans
+    top-down while the information (tightly packed increments) lives at the edge; the raw canvas
+    is built nucleus-first. Same reasoning, and same choice, as
+    ``scripts/diagnostics/visualize_wedge_geometry_v2.py``.
+
+    Bands of different widths are centred on a common canvas rather than stretched, so the
+    growing angular resolution toward the edge stays VISIBLE instead of being normalised away —
+    that widening is the entire point of the bands variant.
+    """
+    if not canvases:
+        return _placeholder_panel(120, 320, "brak wycinka")
+
+    n = len(canvases)
+    order = list(range(n - 1, -1, -1)) if flip_display else list(range(n))
+    gap = 10
+    out_w = max(c.shape[1] for c in canvases)
+    # Labels scale with panel width: a production band is ~2250px wide (161 patches), a test
+    # fixture ~180px — one fixed point size either looks microscopic or runs off the edge.
+    _label_size = int(np.clip(out_w // 55, 11, 26))
+    tiles = []
+
+    for b in order:
+        canvas = np.ascontiguousarray(canvases[b][..., :3]).copy()
+        h, w = canvas.shape[:2]
+
+        if band_density is not None and band_density[b] is not None:
+            dens = np.asarray(band_density[b], dtype=np.float32)
+            lo, hi = float(dens.min()), float(dens.max())
+            norm = (dens - lo) / (hi - lo) if hi - lo > 1e-9 else np.zeros_like(dens)
+            heat = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+            heat = cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
+            heat = cv2.resize(heat, (w, h), interpolation=cv2.INTER_NEAREST)
+            canvas = cv2.addWeighted(canvas, 1.0 - alpha, heat, alpha, 0.0)
+
+        for y in range(0, h + 1, patch_size):
+            cv2.line(canvas, (0, min(y, h - 1)), (w - 1, min(y, h - 1)), _WEDGE_GRID_COLOR, 1)
+        for x in range(0, w + 1, patch_size):
+            cv2.line(canvas, (min(x, w - 1), 0), (min(x, w - 1), h - 1), _WEDGE_GRID_COLOR, 1)
+
+        for p in (peaks or []):
+            if int(p.get("band", 0)) != b:
+                continue
+            px = int((p["col"] + 0.5) * patch_size)
+            py = int((p["row"] + 0.5) * patch_size)
+            if flip_display:
+                py = h - 1 - py
+            cv2.circle(canvas, (px, py), max(4, patch_size // 2), _WEDGE_PEAK_COLOR, 2, cv2.LINE_AA)
+            cv2.circle(canvas, (px, py), 2, _WEDGE_PEAK_COLOR, -1, cv2.LINE_AA)
+
+        if flip_display:
+            canvas = canvas[::-1].copy()
+
+        label = (band_labels[b] if band_labels and b < len(band_labels)
+                 else (f"pasmo {b}" if n > 1 else "wycinek"))
+        _put_text_pl(canvas, f"{label} — {w // patch_size}×{h // patch_size} patchy",
+                     (4, 3), size=_label_size, color=_BAND_LABEL_COLOR, bg=(0, 0, 0))
+
+        pad_l = (out_w - w) // 2
+        tile = np.zeros((h, out_w, 3), dtype=np.uint8)
+        tile[:, pad_l:pad_l + w] = canvas
+        tiles.append(tile)
+        tiles.append(np.zeros((gap, out_w, 3), dtype=np.uint8))
+
+    # Keep the trailing gap: without it the last (nucleus) band ends flush with the image
+    # edge and reads as cropped — spotted by looking at a rendered panel, not by a test.
+    panel = np.vstack(tiles) if tiles else _placeholder_panel(120, 320, "brak wycinka")
+    side = "brzeg u góry, jądro na dole" if flip_display else "jądro u góry, brzeg na dole"
+    title_size = int(np.clip(panel.shape[1] // 50, 12, 28))
+    bar = np.zeros((title_size + 9, panel.shape[1], 3), dtype=np.uint8)
+    _put_text_pl(bar, f"Wycinek kątowy — {side}", (5, 3), size=title_size, bg=None)
+    return np.vstack([bar, panel])
+
+
+def render_wedge_sector_on_photo(
+    image: np.ndarray,
+    axis_info: Optional[dict],
+    geom,
+    peaks: Optional[list] = None,
+    classical_pts: Optional[list] = None,
+    n_arc: int = 64,
+) -> np.ndarray:
+    """The same wedge, drawn back on the real otolith: contour + axis + the magenta angular
+    sector that was actually analysed + the decoded peaks at their real pixels.
+
+    ``geom`` is a ``wedge_extraction.WedgeGeometry`` (any band's — they all share centroid, axis
+    angle and angular width). Drawing the sector is the point: it makes immediately visible
+    whether a missed increment was missed by the MODEL or simply never fell inside the analysed
+    slice — the Z15-type case the wedge geometry report already documents.
+    """
+    img = np.ascontiguousarray(image[..., :3]).copy()
+    H = img.shape[0]
+    lt = max(2, H // 300)
+
+    if axis_info is not None:
+        contour = axis_info.get("contour")
+        if contour is not None:
+            cv2.drawContours(img, [contour], -1, _CONTOUR_COLOR, lt)
+
+    if geom is not None:
+        cx, cy = geom.centroid
+        half = geom.delta_theta_rad / 2.0
+        n = len(geom.R_theta)
+
+        def _r(theta):
+            idx = int(round((theta + np.pi) / (2 * np.pi) * n)) % n
+            return float(geom.R_theta[idx])
+
+        for sgn in (-1.0, 1.0):
+            th = geom.axis_angle_rad + sgn * half
+            r = _r(th)
+            cv2.line(img, (int(round(cx)), int(round(cy))),
+                     (int(round(cx + r * np.cos(th))), int(round(cy + r * np.sin(th)))),
+                     _WEDGE_SECTOR_COLOR, lt, cv2.LINE_AA)
+        arc = []
+        for k in range(n_arc + 1):
+            th = geom.axis_angle_rad - half + (2 * half) * k / n_arc
+            r = _r(th)
+            arc.append([int(round(cx + r * np.cos(th))), int(round(cy + r * np.sin(th)))])
+        cv2.polylines(img, [np.asarray(arc, dtype=np.int32)], False,
+                      _WEDGE_SECTOR_COLOR, lt, cv2.LINE_AA)
+        if axis_info is not None and axis_info.get("far_edge"):
+            fx, fy = axis_info["far_edge"]
+            cv2.line(img, (int(round(cx)), int(round(cy))), (int(fx), int(fy)), _AXIS_COLOR, lt)
+
+    if classical_pts:
+        _draw_small_points(img, classical_pts, _CLASSICAL_COLOR, max(2, H // 400))
+    if peaks:
+        # Numbered nucleus-outwards, so a reader can line each dot up with the table of
+        # (t, theta, score) the report prints next to this panel.
+        r = max(3, H // 130)
+        font = max(0.4, r / 14.0)
+        thick = max(1, int(font * 2))
+        for i, p in enumerate(peaks, start=1):
+            x, y = int(round(p["x"])), int(round(p["y"]))
+            cv2.circle(img, (x, y), r + 1, (30, 30, 30), -1)
+            cv2.circle(img, (x, y), r, _WEDGE_PEAK_COLOR, -1)
+            (tw, th), _ = cv2.getTextSize(str(i), cv2.FONT_HERSHEY_SIMPLEX, font, thick)
+            cv2.putText(img, str(i), (x - tw // 2, y - r - 3), cv2.FONT_HERSHEY_SIMPLEX,
+                        font, (255, 255, 255), thick, cv2.LINE_AA)
+    return img

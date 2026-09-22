@@ -814,3 +814,108 @@ def test_real_wedge_b_config_is_present_and_actually_enables_bands():
     cfg_b = load_merged_config(PROJECT_ROOT / "configs" / "config_wedge_b.yaml", None)
     assert cfg_b.data.wedge_band_edges_t is not None
     assert len(cfg_b.data.wedge_band_n_angle_patches) == len(cfg_b.data.wedge_band_edges_t) - 1
+
+
+# ---------------------------------------------------------------------------
+# (22.09) The card path must read the density signal from the WEDGE for a wedge config.
+#
+# Regression guard for the gap that made both wedge configs carry the warning "karty report.html
+# NIE są świadome gałęzi wycinka/pasm": the card path ran get_density_probs on the square 518px
+# image regardless, i.e. on a geometry a wedge-trained head never saw.
+# ---------------------------------------------------------------------------
+
+def _wedge_cfg(tmp_path, labels_csv, img_dir):
+    cfg = _make_cfg(tmp_path, labels_csv, img_dir)
+    cfg.model.use_density_head = True
+    cfg.model.density_head_type = "radial_attention"
+    cfg.data.dual_branch_wedge = True
+    # Both real wedge configs set this; OtolithDataset only creates mask_cache_dir when
+    # mask_background is on, and every wedge path needs that mask, so a wedge config with
+    # mask_background=false dies with a bare "NoneType / str" TypeError deep in the dataset.
+    cfg.data.mask_background = True
+    cfg.data.wedge_delta_theta_deg = 98.7
+    cfg.data.wedge_n_angle_patches = 6
+    cfg.data.wedge_n_radius_patches = 8
+    return cfg
+
+
+def test_card_path_runs_density_on_the_wedge_not_on_the_square_image(tmp_path, monkeypatch):
+    """The wedge branch must fire: density comes from the wedge canvas, and the resulting
+    image-space grid must be sparse (a 98.7° sector cannot cover the whole image) — which a
+    square-image density grid never is."""
+    import cv2
+    from scripts.run_pipeline import _compute_axis_data_for_samples
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True)
+    img = np.full((300, 220, 3), 255, dtype=np.uint8)
+    cv2.ellipse(img, (110, 150), (60, 100), 0, 0, 360, (40, 40, 40), -1)
+    fname = "2022_BIAS_HER_Loc_Embedded_Sharp_FishIndex0_Single1_Left.png"
+    PILImage.fromarray(img, "RGB").save(img_dir / fname)
+    rows = [{"image_id": fname, "age": 4, "split": s} for s in ("train", "val", "test")]
+    labels_csv = tmp_path / "labels.csv"
+    pd.DataFrame(rows).to_csv(labels_csv, index=False)
+
+    cfg = _wedge_cfg(tmp_path, labels_csv, img_dir)
+    ckpt = _save_mock_checkpoint(cfg, labels_csv, img_dir)
+
+    seen: dict = {}
+    import src.wedge_cards as _wc
+    real_build = _wc.build_wedge_card_data
+
+    def _spy(model, rgb, mask, axis_info, cfg_, k, **kwargs):
+        out = real_build(model, rgb, mask, axis_info, cfg_, k, **kwargs)
+        seen["k"] = k
+        seen["mode"] = out["mode"]
+        seen["n_bands"] = len(out["bands"])
+        seen["density_shape"] = out["image_density"].shape
+        return out
+
+    monkeypatch.setattr("src.wedge_cards.build_wedge_card_data", _spy)
+
+    samples = [{"image_id": fname, "age": 4, "predicted_age": 4}]
+    _grids, axis_data, _wt = _compute_axis_data_for_samples(
+        samples, img_dir, cfg, ckpt, tmp_path / "cond")
+
+    assert seen, "gałąź wycinka w ogóle nie została wywołana"
+    assert seen["k"] == 4                       # decode exactly as many increments as the age head predicts
+    assert seen["mode"] == "single"
+    assert seen["n_bands"] == 1
+    assert seen["density_shape"] == (56 // 14, 56 // 14)
+
+    wedge = axis_data[fname]["wedge"]
+    assert wedge is not None
+    assert wedge["mode"] == "single"
+    assert wedge["delta_theta_deg"] == pytest.approx(98.7)
+    assert wedge["overlay_b64"].startswith("data:image/png;base64,")
+    assert len(wedge["peaks"]) <= 4
+    for p in wedge["peaks"]:
+        assert 0.0 <= p["t"] <= 1.0
+        assert {"band", "row", "col", "t", "theta", "score", "x", "y"} <= set(p)
+
+
+def test_card_path_leaves_non_wedge_configs_completely_untouched(tmp_path):
+    """The wedge branch must be a no-op for every existing config — axis_data carries
+    ``wedge=None`` and the density signal keeps coming from the square image."""
+    import cv2
+    from scripts.run_pipeline import _compute_axis_data_for_samples
+
+    img_dir = tmp_path / "images"
+    img_dir.mkdir(parents=True)
+    img = np.full((300, 220, 3), 255, dtype=np.uint8)
+    cv2.ellipse(img, (110, 150), (60, 100), 0, 0, 360, (40, 40, 40), -1)
+    fname = "2022_BIAS_HER_Loc_Embedded_Sharp_FishIndex0_Single1_Left.png"
+    PILImage.fromarray(img, "RGB").save(img_dir / fname)
+    rows = [{"image_id": fname, "age": 4, "split": s} for s in ("train", "val", "test")]
+    labels_csv = tmp_path / "labels.csv"
+    pd.DataFrame(rows).to_csv(labels_csv, index=False)
+
+    cfg = _make_cfg(tmp_path, labels_csv, img_dir)
+    cfg.model.use_density_head = True
+    assert cfg.data.dual_branch_wedge is False
+    ckpt = _save_mock_checkpoint(cfg, labels_csv, img_dir)
+
+    samples = [{"image_id": fname, "age": 4, "predicted_age": 4}]
+    _grids, axis_data, _wt = _compute_axis_data_for_samples(
+        samples, img_dir, cfg, ckpt, tmp_path / "cond")
+    assert axis_data[fname]["wedge"] is None

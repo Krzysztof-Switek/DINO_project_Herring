@@ -83,8 +83,8 @@ if __name__ == "__main__":
     print(f"[main_wedge_b] LOCATION={LOCATION}  IMAGE_DIR={IMAGE_DIR}  RESCAN={RESCAN}")
     print(f"[main_wedge_b] BASE_CONFIG={BASE_CONFIG}")
     print(f"[main_wedge_b] OUTPUT_DIR={OUTPUT_DIR}")
-    print("[main_wedge_b] UWAGA: karty report.html (density/kandydaci) NIE są świadome gałęzi "
-          "wycinka/pasm — ufać tylko predictions.csv/pipeline_summary.json (wiek); lokalizacja "
-          "wymaga scripts/diagnostics/expert_annotation_eval_wedge.py (wykrywa pasma automatycznie "
-          "z configu). Koszt: 5852 patchy/próbkę na gałęzi density, 4,27x więcej niż Run N.")
+    print("[main_wedge_b] Karty raportu SA swiadome galezi wycinka/pasm od 22.09 "
+          "(sekcja G2: sektor na zdjeciu, kanwy pasm, density, zdekodowane piki). "
+          "Koszt: 5852 patchy/probke na galezi density, 4,27x wiecej niz Run N. "
+          "Niezalezna ocena liczbowa: scripts/diagnostics/expert_annotation_eval_wedge.py.")
     main(ARGV)

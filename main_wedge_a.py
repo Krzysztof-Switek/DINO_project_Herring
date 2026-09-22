@@ -83,7 +83,7 @@ if __name__ == "__main__":
     print(f"[main_wedge_a] LOCATION={LOCATION}  IMAGE_DIR={IMAGE_DIR}  RESCAN={RESCAN}")
     print(f"[main_wedge_a] BASE_CONFIG={BASE_CONFIG}")
     print(f"[main_wedge_a] OUTPUT_DIR={OUTPUT_DIR}")
-    print("[main_wedge_a] UWAGA: karty report.html (density/kandydaci) NIE są świadome gałęzi "
-          "wycinka — ufać tylko predictions.csv/pipeline_summary.json (wiek); lokalizacja wymaga "
-          "osobnego eval skryptu, wzorem scripts/diagnostics/expert_annotation_eval_strip.py.")
+    print("[main_wedge_a] Karty raportu SA swiadome galezi wycinka od 22.09 "
+          "(sekcja G2: sektor na zdjeciu, kanwa klina, density, zdekodowane piki). "
+          "Niezalezna ocena liczbowa: scripts/diagnostics/expert_annotation_eval_wedge.py.")
     main(ARGV)

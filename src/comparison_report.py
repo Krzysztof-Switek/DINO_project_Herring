@@ -11,6 +11,7 @@ Generates a self-contained HTML file with sections:
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import matplotlib
@@ -1472,6 +1473,110 @@ _LOC_METHOD_META = {
 }
 
 
+
+def _section_wedge_walkthrough(payload: dict | None) -> str:
+    """(22.09) Ścieżka decyzyjna gałęzi WYCINKA KĄTOWEGO — to, czego raport dotąd nie pokazywał.
+
+    Do 22.09 karty raportu liczyły density na kwadratowym obrazie 518px, czyli na geometrii,
+    której głowica wycinka nigdy nie widziała podczas treningu (oba configi wycinka nosiły o tym
+    ostrzeżenie w nagłówku). Ta sekcja pokazuje prawdziwą ścieżkę: zdjęcie → sektor → kanwy pasm
+    → mapa density na tych kanwach → zdekodowane piki → ich powrót na zdjęcie.
+
+    ``payload`` to ``axis_data[iid]["wedge"]`` z ``run_pipeline`` (klucz ``wedge`` w payloadzie
+    walkthrough). Zwraca pusty string dla configów bez wycinka — sekcja po prostu się nie pojawia.
+
+    Uwaga na układ: panele są ``display:inline-block;vertical-align:top``, nie ``flex`` —
+    ``flex`` dwukrotnie nie zadziałał w przeglądarce, w której użytkownik otwiera te raporty.
+    """
+    if not payload:
+        return ""
+
+    mode = payload.get("mode", "single")
+    n_bands = int(payload.get("n_bands", 1))
+    dtheta = float(payload.get("delta_theta_deg", 0.0))
+    k = int(payload.get("k", 0))
+    peaks = payload.get("peaks") or []
+    iid = payload.get("image_id", "")
+    true_age = payload.get("true_age")
+    pred_age = payload.get("pred_age")
+
+    tryb = (f"{n_bands} pasm promieniowych o rosnącej ku brzegowi rozdzielczości kątowej"
+            if mode == "bands" else "pojedyncza kanwa")
+
+    head = f"""<section>
+<h2>G2. Ścieżka decyzyjna — wycinek kątowy (klin)</h2>
+<p class="cap">Otolit <b>{iid}</b> — wiek prawdziwy <b>{true_age}</b>, przewidziany <b>{pred_age}</b>.
+Tryb: <b>{tryb}</b>, szerokość sektora Δθ = <b>{dtheta:.1f}°</b>, dekodowanych pików: <b>{k}</b>
+(= przewidziany wiek).</p>
+<p class="cap">To jest geometria, na której głowica density była <i>trenowana</i> — w odróżnieniu od
+kwadratowego obrazu 518&nbsp;px, na którym liczyły ją karty do 22.09.</p>
+"""
+
+    krok1 = ""
+    if payload.get("overlay_big_b64"):
+        krok1 = f"""<h3>Krok 1 — który fragment otolitu w ogóle jest analizowany</h3>
+<p class="cap">Cyjan: kontur segmentacji. Żółty: oś pomiaru (jądro → brzeg odczytu).
+<span style="color:#ff78dc"><b>Magenta</b></span>: sektor klina — <b>jedyny</b> obszar, jaki widzi
+głowica density. Czerwone numerowane kropki: finalne piki, numerowane od jądra na zewnątrz.
+Jeśli prawdziwy przyrost leży poza magentą, żadna poprawa modelu go nie znajdzie — to ograniczenie
+geometryczne, nie błąd głowicy.</p>
+<div style="display:inline-block;vertical-align:top;">{_img_tag(payload["overlay_big_b64"], "760px")}</div>
+"""
+
+    krok2 = ""
+    if payload.get("panel_raw_b64"):
+        shapes = payload.get("band_shapes") or []
+        ranges = payload.get("band_t_ranges") or []
+        rows = "".join(
+            f"<tr><td>pasmo {i}</td><td>{s[0]}×{s[1]} patchy</td>"
+            f"<td>row_frac {r[0]:.3f}–{r[1]:.3f}</td></tr>"
+            for i, (s, r) in enumerate(zip(shapes, ranges))
+        )
+        tab = (f'<table border="1" style="font-size:88%;"><tr><th>pasmo</th><th>siatka</th>'
+               f'<th>zakres promienia</th></tr>{rows}</table>') if rows else ""
+        krok2 = f"""<h3>Krok 2 — rozwinięcie sektora do kanw (to widzi backbone)</h3>
+<p class="cap">Każda kolumna to osobny kierunek kątowy, każdy wiersz to promień t∈[0,1].
+Białe linie = granice patchy 14&nbsp;px, czyli realna rozdzielczość w danym miejscu. Kanwy ułożone
+<b>brzegiem do góry</b>: im niżej, tym bliżej jądra. Widać wprost, że pasma przy brzegu mają
+więcej kolumn — o to w tym wariancie chodzi.</p>
+<div style="display:inline-block;vertical-align:top;">{_img_tag(payload["panel_raw_b64"], "1100px")}</div>
+{tab}
+"""
+
+    krok3 = ""
+    if payload.get("panel_density_b64"):
+        krok3 = f"""<h3>Krok 3 — mapa density na tych samych kanwach + zdekodowane piki</h3>
+<p class="cap">Kolor JET nałożony na kanwę (normalizacja <b>per pasmo</b>, więc kolory porównywać
+w obrębie jednego pasma, nie między pasmami). Czerwone okręgi: wybrane piki. Wybór jest zachłanny
+po całej sklejonej sekwencji pasm w <b>rzeczywistej</b> przestrzeni t, z wymuszonym minimalnym
+odstępem — pasma się uzupełniają, nie konkurują, więc pik nie jest wybierany osobno w każdym
+paśmie.</p>
+<div style="display:inline-block;vertical-align:top;">{_img_tag(payload["panel_density_b64"], "1100px")}</div>
+"""
+
+    krok4 = ""
+    if peaks:
+        rows = "".join(
+            f"<tr><td>{i}</td><td>{p.get('band', 0)}</td><td>{p.get('t', 0):.3f}</td>"
+            f"<td>{math.degrees(float(p.get('theta', 0.0))):.1f}°</td>"
+            f"<td>{p.get('score', 0):.4f}</td>"
+            f"<td>({p.get('x', 0):.0f}, {p.get('y', 0):.0f})</td></tr>"
+            for i, p in enumerate(peaks, start=1)
+        )
+        krok4 = f"""<h3>Krok 4 — liczby, nie tylko obrazki</h3>
+<p class="cap">Każdy pik w obu układach współrzędnych naraz: w przestrzeni klina (pasmo, t, θ)
+i w pikselach zdjęcia (x, y). Numeracja zgodna z kropkami w Kroku&nbsp;1.</p>
+<table border="1" style="font-size:90%;">
+<tr><th>#</th><th>pasmo</th><th>t (promień)</th><th>θ od osi</th><th>density</th><th>piksel (x, y)</th></tr>
+{rows}</table>
+<p class="cap">θ liczone jako kąt bezwzględny patcha; 0° ≈ kierunek osi odczytu. Wartość
+<b>density</b> to surowe wyjście sigmoidy głowicy — przy nieuczonej głowicy będzie bliska 0,5
+i płaska, co samo w sobie jest informacją diagnostyczną.</p>
+"""
+
+    return head + krok1 + krok2 + krok3 + krok4 + "</section>"
+
+
 def _section_localization_methods(localization_methods: dict | None) -> str:
     """Bake-off metod lokalizacji: sekcje I / J / K / L (density | klasyka | konsensus | DP).
 
@@ -1567,6 +1672,8 @@ def build_comparison_report(
     # Sekcja H (_section_opencv) oraz bake-off I/J/K/L (_section_localization_methods) USUNIĘTE
     # 20.07 — nie wnoszą na tym etapie; wracamy do wielu otolitów po dopracowaniu kart i procesu
     # decyzji. Zostaje sekcja „krok po kroku" (do redesignu). Metryki per_method dalej w JSON.
+    body += _section_wedge_walkthrough(
+        (localization_walkthrough or {}).get("wedge"))
     body += _section_localization_walkthrough(localization_walkthrough)
 
     html = f"""<!DOCTYPE html>
