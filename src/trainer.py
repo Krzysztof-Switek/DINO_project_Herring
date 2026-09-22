@@ -520,6 +520,8 @@ class Trainer:
         then unfrozen. Checkpoint is saved after every epoch. best.pt is
         updated whenever the monitored metric improves.
         """
+        self._log_run_identity()
+
         freeze_until = self.cfg.training.freeze_backbone_epochs
         if freeze_until > 0:
             self.model.freeze_backbone()
@@ -716,6 +718,32 @@ class Trainer:
         print(line)
         with self.log_path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+
+    # Config fields that DEFINE which experiment a run is. Logged as the very first line of
+    # every training log (22.09) so a mis-loaded config is visible in 30 seconds instead of
+    # after a night — `outputs/09.09_wedge_b` trained pure defaults for 19h41m and neither the
+    # log nor the report said so (`plans and summaries/22.09_wedge_b_analiza.md`).
+    _RUN_IDENTITY_FIELDS = (
+        ("model", "backbone"),
+        ("model", "use_density_head"),
+        ("model", "density_head_type"),
+        ("data", "mask_background"),
+        ("data", "dual_branch_density"),
+        ("data", "dual_branch_wedge"),
+        ("data", "wedge_band_edges_t"),
+        ("data", "multi_wycinek_k"),
+        ("data", "strip_mask_background_loss"),
+        ("data", "quarter_age_adjustment_enabled"),
+    )
+
+    def _log_run_identity(self) -> None:
+        parts = []
+        for section, field in self._RUN_IDENTITY_FIELDS:
+            sec = getattr(self.cfg, section, None)
+            if sec is None or not hasattr(sec, field):
+                continue
+            parts.append(f"{section}.{field}={getattr(sec, field)}")
+        self._log("RUN IDENTITY  " + "  ".join(parts))
 
     def _log_epoch(
         self, epoch: int, train_loss: float, val_loss: float, val_mae: float,

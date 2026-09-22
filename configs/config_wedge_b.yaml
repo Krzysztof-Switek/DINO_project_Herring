@@ -1,0 +1,161 @@
+# 09.09 — Eksperyment "wycinek kątowy" WARIANT B: adaptacyjna rozdzielczość kątowa (pasma
+# promieniowe). Follow-up do config_wedge_a.yaml (wariant A, pojedyncza kanwa 13 kolumn x 44
+# wiersze) — odpowiedź na zmierzony problem: przy STAŁEJ liczbie kolumn kątowych realna długość
+# łuku na jedną kolumnę rośnie liniowo z promieniem (średnio 5,49x kompresji przy brzegu, max
+# 8,57x na 42 realnych zdjęciach ZEGAR, scripts/diagnostics/analyze_wedge_angular_resolution.py).
+#
+# Pełny opis, literatura (DarSwin/Daugman/Gillert — ŻADEN nie rozwiązuje tego konkretnego
+# problemu, sprawdzone wyszukiwaniem), pomiar i decyzja kosztowa:
+# plans and summaries/09.09_wycinek_pasma_katowe_plan.md,
+# outputs/09.09_masked_wizualizacje/report4.html (§6).
+#
+# JEDYNA różnica względem config_wedge_a.yaml: promień podzielony na 4 pasma (granice t reużyte
+# z §3b: [0, 0,6), [0,6, 0,8), [0,8, 0,9), [0,9, 1,0)), każde pasmo to osobny obraz kątowy o
+# WŁASNEJ, rosnącej ku brzegowi liczbie kolumn (97/129/145/161) — Faza 8, zmierzone na 400 realnych
+# zdjęciach Embedded (nie tylko 42 ZEGAR), cel kompresji=1,0x (pełna wierność, bez kompromisu na
+# koszt — decyzja świadomie podtrzymana PO zobaczeniu realnego kosztu: 5852 patchy/próbkę, 4,27x
+# drożej niż jeden przebieg Run N). Wszystko inne — backbone, receptura CORAL+MIL, splity,
+# augmentacje, harmonogram treningu — identyczne z Wariantem A i Run N.
+#
+# `wedge_n_angle_patches`/`wedge_n_radius_patches` poniżej zostają (wymagane przez walidator
+# configu niezależnie od pasm) ale są NIEUŻYWANE, gdy `wedge_band_edges_t` jest ustawione — pasma
+# ZASTĘPUJĄ pojedynczą kanwę (src/dataset.py, Faza 11), nie dodają się do niej.
+#
+# NIEZWERYFIKOWANE wprost dla TEJ geometrii (jawnie, nie ukryte): density_attn_radial_bins/
+# window_deg SKOPIOWANE z Run N/Wariantu A, dostrojone do INNEJ gęstości promieniowej (48 promieni
+# pełnego obrazu) — czy przenoszą się sensownie na sklejoną sekwencję 4 pasm nie zostało zmierzone.
+# Pierwszy bieg tego configu jest też pierwszą realną oceną tego pytania.
+
+project:
+  name: OtolithDinoStandalone
+  version: "0.1.0"
+  seed: 42
+
+model:
+  backbone: dinov2_vits14_reg     # niezmienione względem Run N / Wariantu A
+  use_metadata: false
+  target_type: ordinal            # regression | ordinal | count_aware
+  num_age_classes: 17             # max observed age = 16 (real data)
+  dropout: 0.1
+  head_type: both                 # coral | mil | both — MIL nadal sprzężony z backbone jak w Run N
+  mil_count_weight: 1.0
+  mil_sparsity_weight: 1.0
+  mil_hidden_dim: 64
+  coral_loss_weight: 0.5
+  use_density_head: true
+  density_count_weight: 1.0
+  density_conc_weight: 1.0        # wewnętrzny człon top-k w density_count_loss (NIE E9)
+  density_tv_weight: 0.03         # jak Wariant A
+
+  # ROZWIĄZANIE DOCELOWE — wprost radial_attention, WYMAGANE dla density_image_bands (src/model.py
+  # rzuca NotImplementedError dla "mlp"). density_attn_* SKOPIOWANE z Run N/Wariantu A,
+  # NIEZWERYFIKOWANE dla sklejonej sekwencji 4 pasm — patrz nagłówek pliku.
+  density_head_type: radial_attention
+  density_attn_num_heads: 4
+  density_attn_num_layers: 1
+  density_attn_num_angle_freqs: 4
+  density_attn_num_radius_freqs: 4
+  density_attn_radial_bins: 12
+  density_attn_window_deg: 45.0
+
+  # E9 WYŁĄCZONE — ten sam powód co Wariant A/pasek.
+  density_concentricity_weight: 0.0
+  density_concentricity_bins: 12
+  density_concentricity_window_deg: 45.0   # nieużywane przy wadze 0,0, zostawione dla spójności
+
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  labels_csv: data/labels.csv
+  image_size: 518
+  patch_size: 14
+  train_split: 0.7
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0
+  metadata_cols:
+    - length_mm
+    - weight_g
+    - sex
+    - population
+  mask_background: true
+  mask_cache_dir: null
+
+  dual_branch_wedge: true
+  wedge_delta_theta_deg: 98.7
+  wedge_n_angle_patches: 13    # nieużywane, gdy wedge_band_edges_t ustawione (patrz nagłówek)
+  wedge_n_radius_patches: 44   # nieużywane, gdy wedge_band_edges_t ustawione (patrz nagłówek)
+  wedge_cache_dir: null
+
+  # Pasma promieniowe (09.09 follow-up) — Faza 8: granice t reużyte z §3b (scalenie 8 stref po
+  # dwie), liczba kolumn per pasmo zmierzona na 400 realnych zdjęciach Embedded (nie tylko 42
+  # ZEGAR — rozmiar otolitu jest wielkością czysto geometryczną, nie wymaga adnotacji), cel
+  # kompresji=1,0x przy prawdziwym zmierzonym maksimum (1305,1px, o 44% większym niż maksimum z
+  # samego ZEGAR). Liczba wierszy per pasmo wzięta wprost z już zaimplementowanego
+  # _RADIAL_WARP_T/_RADIAL_WARP_ROW_FRAC (src/wedge_extraction.py), nie liczona od nowa.
+  wedge_band_edges_t: [0.0, 0.6, 0.8, 0.9, 1.0]
+  wedge_band_n_angle_patches: [97, 129, 145, 161]
+  wedge_band_n_radius_patches: [11, 12, 9, 12]
+  wedge_bands_cache_dir: null
+
+  # Zmiana C WYŁĄCZONA — spójne z Run N / Wariantem A.
+  quarter_age_adjustment_enabled: false
+  quarter_age_adjustment_campaigns:
+    - BITS1q
+    - BITS2q
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  freeze_backbone_epochs: 5
+  density_lr_mult: 2.0
+  early_stopping_patience: 8
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_ema: 0.3
+  min_epochs: 12
+  min_density_active: 1.0
+  device: auto
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  keep_only_best: true
+
+inference:
+  output_dir: outputs
+  save_heatmaps: true
+  save_overlays: true
+  save_candidates: true
+  increment_samples:
+    top_k_best: 15
+    top_k_worst: 15
+    annotate_all: false
+
+interpretation:
+  method: auto
+  heatmap_alpha: 0.5
+  disable_fused_attention: true
+
+candidates:
+  # UWAGA: te pola sterują ścieżką kart raportu (_compute_axis_data_for_samples), która NIE jest
+  # świadoma gałęzi wycinka/pasm — zostawione identyczne z Run N dla spójności configu, ale ich
+  # wyjście dla tego biegu jest bez znaczenia. Prawdziwa lokalizacja tego modelu wymaga
+  # scripts/diagnostics/expert_annotation_eval_wedge.py (wykrywa pasma automatycznie z configu).
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  inner_margin: 0.20
+  density_image_size: 728
+  density_crop_to_otolith: true
+  density_crop_pad_frac: 0.02
+  width_decay_weight: 1.0
+  width_ceiling_weight: 3.0
+  classical_concentricity_weight: 0.0
+
+segmentation:
+  method: radial
+  frac: 0.18
+  background_k: 3.0
+  n_angles: 720
+  smooth_sigma: 4.0
+  gap_tolerance: 8

@@ -54,21 +54,40 @@ def _deep_update(base: dict, override: dict) -> dict:
     return result
 
 
+def _load_required_yaml(path: Path | None, role: str) -> dict:
+    """Read one config YAML. ``None`` means "no config of this role" (legal); a path that
+    is GIVEN but does not exist is a hard error.
+
+    (22.09) This used to fall through silently to ``{}`` — which is how `outputs/09.09_wedge_b`
+    burned 19h41m training pure `OtolithConfig()` defaults instead of the wedge-bands experiment:
+    `configs/config_wedge_b.yaml` had never been committed, so it simply was not on the server,
+    and nothing said so. Full post-mortem: `plans and summaries/22.09_wedge_b_analiza.md`.
+    """
+    if path is None:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Plik configu ({role}) nie istnieje: {p}\n"
+            f"       Bieg zostaje PRZERWANY zamiast po cichu wziąć wartości domyślne — "
+            f"to dokładnie ten błąd, który unieważnił bieg 09.09_wedge_b.\n"
+            f"       Najczęstsza przyczyna: config powstał lokalnie, ale nie został "
+            f"zacommitowany, więc nie dojechał na serwer (sprawdź `git status`)."
+        )
+    raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+    return raw if raw else {}
+
+
 def load_merged_config(base_path: Path | None, override_path: Path | None):
-    """Load base + override YAML files and return merged OtolithConfig."""
+    """Load base + override YAML files and return merged OtolithConfig.
+
+    Either path may be ``None`` (that role is simply absent). A path that is given but missing
+    raises — see :func:`_load_required_yaml`.
+    """
     from src.config import OtolithConfig
 
-    base_raw: dict = {}
-    if base_path and Path(base_path).exists():
-        raw = yaml.safe_load(Path(base_path).read_text(encoding="utf-8"))
-        if raw:
-            base_raw = raw
-
-    override_raw: dict = {}
-    if override_path and Path(override_path).exists():
-        raw = yaml.safe_load(Path(override_path).read_text(encoding="utf-8"))
-        if raw:
-            override_raw = raw
+    base_raw = _load_required_yaml(base_path, "base")
+    override_raw = _load_required_yaml(override_path, "override")
 
     merged = _deep_update(base_raw, override_raw)
     return OtolithConfig(**merged)

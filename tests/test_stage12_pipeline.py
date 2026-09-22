@@ -753,3 +753,64 @@ def test_hires_density_off_by_default_matches_today(tmp_path, monkeypatch):
 
     assert captured["grid_shape"] == (56 // 14, 56 // 14)   # data.image_size grid, unchanged
     assert captured["dims"] == (300, 220)                    # full image dims, unchanged
+
+
+# ---------------------------------------------------------------------------
+# (22.09) A config path that is GIVEN but missing must fail loudly.
+#
+# Regression guard for the failure that voided `outputs/09.09_wedge_b`: the run's own
+# `configs/config_wedge_b.yaml` had never been committed, so it was absent on the server;
+# load_merged_config silently fell back to `{}` and trained pure OtolithConfig() defaults for
+# 19h41m. Post-mortem: `plans and summaries/22.09_wedge_b_analiza.md`.
+# ---------------------------------------------------------------------------
+
+def test_load_merged_config_raises_when_base_config_missing(tmp_path):
+    from scripts.run_pipeline import load_merged_config
+
+    with pytest.raises(FileNotFoundError) as exc:
+        load_merged_config(tmp_path / "nie_istnieje.yaml", None)
+    assert "nie_istnieje.yaml" in str(exc.value)
+
+
+def test_load_merged_config_raises_when_override_config_missing(tmp_path):
+    from scripts.run_pipeline import load_merged_config
+
+    base = tmp_path / "base.yaml"
+    base.write_text("model:\n  use_density_head: true\n", encoding="utf-8")
+    with pytest.raises(FileNotFoundError):
+        load_merged_config(base, tmp_path / "brak_override.yaml")
+
+
+def test_load_merged_config_accepts_none_paths_and_still_merges(tmp_path):
+    from scripts.run_pipeline import load_merged_config
+
+    base = tmp_path / "base.yaml"
+    base.write_text("model:\n  use_density_head: true\n", encoding="utf-8")
+    override = tmp_path / "over.yaml"
+    override.write_text("model:\n  dropout: 0.25\n", encoding="utf-8")
+
+    cfg_none = load_merged_config(None, None)          # both absent by design — still legal
+    assert cfg_none.model.use_density_head is False    # pure defaults, explicitly asked for
+
+    cfg = load_merged_config(base, override)
+    assert cfg.model.use_density_head is True          # base survives
+    assert cfg.model.dropout == 0.25                   # override wins
+
+
+def test_real_wedge_b_config_is_present_and_actually_enables_bands():
+    """The exact check nobody made before the 09.09 run: the shipped config for each wedge
+    experiment exists AND turns the experiment on. A config that parses but leaves
+    dual_branch_wedge False is the same silent failure by another route."""
+    from scripts.run_pipeline import load_merged_config
+
+    for name in ("config_wedge_a.yaml", "config_wedge_b.yaml"):
+        path = PROJECT_ROOT / "configs" / name
+        assert path.is_file(), f"brak {name} — nie dojedzie na serwer"
+        cfg = load_merged_config(path, PROJECT_ROOT / "configs" / "config_embedded.yaml")
+        assert cfg.data.dual_branch_wedge is True, name
+        assert cfg.model.use_density_head is True, name
+        assert cfg.model.density_head_type == "radial_attention", name
+
+    cfg_b = load_merged_config(PROJECT_ROOT / "configs" / "config_wedge_b.yaml", None)
+    assert cfg_b.data.wedge_band_edges_t is not None
+    assert len(cfg_b.data.wedge_band_n_angle_patches) == len(cfg_b.data.wedge_band_edges_t) - 1

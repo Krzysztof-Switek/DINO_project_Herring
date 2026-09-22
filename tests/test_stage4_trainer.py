@@ -1289,3 +1289,23 @@ def test_fit_ema_selection_runs_and_saves_best(tmp_path):
     trainer.fit()
     assert (trainer.checkpoint_dir / "best.pt").exists()
     assert "Training complete" in trainer.log_path.read_text(encoding="utf-8")
+
+
+def test_fit_logs_run_identity_as_first_line(tmp_path):
+    """(22.09) Every training log must open with the config fields that DEFINE the experiment.
+
+    `outputs/09.09_wedge_b` trained pure OtolithConfig() defaults for 19h41m because its config
+    never reached the server, and nothing in the log or the report said so — the whole run looked
+    normal. See `plans and summaries/22.09_wedge_b_analiza.md`.
+    """
+    trainer = _make_trainer(tmp_path, epochs=1)
+    trainer.cfg.data.dual_branch_wedge = True
+    trainer.cfg.data.wedge_band_edges_t = [0.0, 0.6, 0.8, 0.9, 1.0]
+    trainer.fit()
+
+    lines = trainer.log_path.read_text(encoding="utf-8").splitlines()
+    assert "RUN IDENTITY" in lines[0], lines[:3]
+    assert "data.dual_branch_wedge=True" in lines[0]
+    assert "data.wedge_band_edges_t=[0.0, 0.6, 0.8, 0.9, 1.0]" in lines[0]
+    assert "model.backbone=" in lines[0]
+    assert "model.use_density_head=" in lines[0]

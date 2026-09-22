@@ -60,6 +60,20 @@ def _make_segmentable_dataset(tmp_path: Path) -> tuple[Path, Path]:
     return labels_csv, img_dir
 
 
+def _make_empty_override_yaml(tmp_path: Path) -> Path:
+    """An EXISTING but empty override config — "no embedded override" for these tests.
+
+    (22.09) These tests used to pass a path that did not exist, relying on
+    load_merged_config silently treating a missing file as {}. That silence is exactly what
+    voided the 09.09_wedge_b run (its base config was never committed, so the server trained
+    pure defaults for 19h41m — `plans and summaries/22.09_wedge_b_analiza.md`), so the loader
+    now raises instead. An empty YAML says the same thing explicitly.
+    """
+    path = tmp_path / "empty_override.yaml"
+    path.write_text("", encoding="utf-8")
+    return path
+
+
 def _make_config_yaml(tmp_path: Path) -> Path:
     cfg_dict = {
         "project": {"seed": 42},
@@ -123,7 +137,7 @@ def test_finetune_only_moves_density_head_weights(tmp_path, monkeypatch):
 
     ft.main([
         "--config", str(cfg_path),
-        "--config-embedded", str(tmp_path / "does_not_exist.yaml"),
+        "--config-embedded", str(_make_empty_override_yaml(tmp_path)),
         "--checkpoint", str(initial_ckpt),
         "--output", str(out_ckpt),
         "--labels", str(labels_csv),
@@ -171,7 +185,7 @@ def test_finetune_output_checkpoint_has_metadata(tmp_path, monkeypatch):
 
     ft.main([
         "--config", str(cfg_path),
-        "--config-embedded", str(tmp_path / "does_not_exist.yaml"),
+        "--config-embedded", str(_make_empty_override_yaml(tmp_path)),
         "--checkpoint", str(initial_ckpt),
         "--output", str(out_ckpt),
         "--labels", str(labels_csv),
@@ -210,7 +224,7 @@ def test_finetune_requires_density_head(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="use_density_head"):
         ft.main([
             "--config", str(cfg_dict_path),
-            "--config-embedded", str(tmp_path / "does_not_exist.yaml"),
+            "--config-embedded", str(_make_empty_override_yaml(tmp_path)),
             "--checkpoint", str(initial_ckpt),
             "--output", str(tmp_path / "out.pt"),
             "--labels", str(labels_csv),

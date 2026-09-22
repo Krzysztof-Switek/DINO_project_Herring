@@ -69,6 +69,17 @@ if __name__ == "__main__":
             f"       LOCATION = {LOCATION!r} — sprawdź czy to właściwa maszyna,\n"
             f"       albo popraw IMAGE_DIR_SERVER / IMAGE_DIR_LOCAL powyżej."
         )
+    # (22.09) Sanity-check the BASE_CONFIG the same way — a config that exists locally but was
+    # never committed does NOT reach the server, and scripts/run_pipeline.py used to fall back to
+    # pure OtolithConfig() defaults without a word (19h41m wasted, see
+    # plans and summaries/22.09_wedge_b_analiza.md). Fail here, in 2 seconds, not after a night.
+    if not Path(BASE_CONFIG).is_file():
+        sys.exit(
+            f"[main_wedge_a] BASE_CONFIG nie istnieje: {BASE_CONFIG!r}\n"
+            f"       Ten plik DEFINIUJE eksperyment — bez niego bieg wytrenowałby zupełnie co\n"
+            f"       innego. Najczęstsza przyczyna: config nie został zacommitowany i nie\n"
+            f"       dojechał na serwer (sprawdź `git status` na maszynie lokalnej)."
+        )
     print(f"[main_wedge_a] LOCATION={LOCATION}  IMAGE_DIR={IMAGE_DIR}  RESCAN={RESCAN}")
     print(f"[main_wedge_a] BASE_CONFIG={BASE_CONFIG}")
     print(f"[main_wedge_a] OUTPUT_DIR={OUTPUT_DIR}")
