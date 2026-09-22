@@ -9,3 +9,4 @@
   tail -n 3 $D/outputs/data/22.09_wedge_b/logs/embedded/train.log                                                                                                                                                                  
   echo "--- miejsce na dysku ---"                                                                                                                                                                                                  
   df -h $D | tail -1     
+ 
