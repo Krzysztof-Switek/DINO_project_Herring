@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 
 from src.config import OtolithConfig
 from src.dataset import decode_age_ordinal
+from src.report_common import compute_metrics
 from src.model import OtolithModel
 from src.utils import resolve_device
 
@@ -31,6 +32,15 @@ def run_inference(
 
     Returns a summary dict with n_samples, mean_mae, median_mae.
     target_age and abs_error are None when the dataset has no labels.
+
+    With ``cfg.inference.dump_coral_logits`` (default False) each record also carries
+    ``coral_logit_00 .. coral_logit_{K-2}`` — the raw boundary logits before the sigmoid.
+    Off by default so existing outputs stay byte-identical.
+
+    With ``cfg.inference.aggregate_per_fish`` (default False) a second file is written,
+    ``output_dir/predictions_per_fish.csv``, holding one age per fish; the returned summary
+    then also carries ``n_fish``, ``mean_mae_fish`` and ``exact_fish``. ``predictions.csv``
+    is unchanged in either case.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -42,6 +52,9 @@ def run_inference(
     records: List[Dict] = []
 
     K = cfg.model.num_age_classes
+    dump_logits = bool(getattr(cfg.inference, "dump_coral_logits", False))
+    per_fish = bool(getattr(cfg.inference, "aggregate_per_fish", False))
+    logit_rows: List[np.ndarray] = []      # only filled when per_fish is on
 
     with torch.no_grad():
         for batch in loader:
@@ -73,6 +86,18 @@ def run_inference(
                     "abs_error": None,
                     "metadata_used": bool(cfg.model.use_metadata),
                 }
+
+                # Optional raw CORAL logits (24.09). Without them predictions.csv holds
+                # only the decoded integer, so no threshold/calibration/top-k analysis is
+                # possible after the fact. Column k is `g - theta_k`; since the thetas are
+                # fixed per model, column 0 is an affine image of the scalar `g` itself —
+                # which is why every possible decoder is just a partition of one axis.
+                if dump_logits and "coral_logits" in out:
+                    for k in range(out["coral_logits"].shape[-1]):
+                        record[f"coral_logit_{k:02d}"] = round(
+                            float(out["coral_logits"][i, k].item()), 6)
+                if per_fish and "coral_logits" in out:
+                    logit_rows.append(out["coral_logits"][i].detach().cpu().numpy())
 
                 if has_labels:
                     target_age = int(batch["age"][i].item())
@@ -111,7 +136,89 @@ def run_inference(
     if mean_mae is not None:
         print(f"  MAE  mean={mean_mae:.3f}  median={median_mae:.3f}")
 
+    if per_fish and logit_rows:
+        fish_summary = _write_per_fish(cfg, df, np.stack(logit_rows), output_dir)
+        summary.update(fish_summary)
+        if fish_summary.get("mean_mae_fish") is not None:
+            print(f"  per ryba: n={fish_summary['n_fish']}  "
+                  f"MAE={fish_summary['mean_mae_fish']:.3f}  "
+                  f"exact={100 * fish_summary['exact_fish']:.2f}%")
+
     return summary
+
+
+def _fish_keys_for(cfg: OtolithConfig, image_ids: pd.Series) -> Optional[pd.Series]:
+    """``image_id -> fish key`` from the labels CSV, or None when it cannot be resolved.
+
+    Read from ``cfg.data.labels_csv`` rather than from the loader, because the loader may be
+    a ``Subset`` and because the label file is the authoritative source of the fish grouping
+    that the train/val/test split itself was built on
+    (``scripts/prepare_labels.py::assign_split_by_fish``).
+    """
+    path = Path(cfg.data.labels_csv)
+    if not path.is_absolute():
+        root = Path(__file__).resolve().parents[1]
+        path = root / path
+    if not path.exists():
+        return None
+    try:
+        lab = pd.read_csv(path, usecols=["image_id", "neutral_fish_key"])
+    except (ValueError, KeyError):
+        return None
+    mapping = lab.set_index("image_id")["neutral_fish_key"]
+    mapped = image_ids.map(mapping)
+    return None if mapped.isna().all() else mapped
+
+
+def _write_per_fish(cfg: OtolithConfig, df: pd.DataFrame, logits: np.ndarray,
+                    output_dir: Path) -> Dict:
+    """One age per fish: mean CORAL logits over its photos, then decode once.
+
+    Averaging the LOGITS is the same thing as averaging the scalar ``g`` the head computes,
+    because every logit is ``g - theta_k`` and the thetas are constant — so this halves the
+    variance of the decision variable. Averaging the two already-decoded integers cannot do
+    that, and rounding their mean is not even well defined for a 0.5 split.
+    """
+    fish = _fish_keys_for(cfg, df["image_id"])
+    if fish is None:
+        print("  per ryba: pominiete — brak neutral_fish_key w labels_csv")
+        return {"n_fish": 0, "mean_mae_fish": None, "median_mae_fish": None,
+                "exact_fish": None,
+                "per_fish_note": "no neutral_fish_key resolved from labels_csv"}
+
+    n_unmapped = int(fish.isna().sum())
+    if n_unmapped:
+        print(f"  per ryba: {n_unmapped} z {len(fish)} zdjec bez neutral_fish_key "
+              f"w labels_csv — pominiete w agregacji")
+
+    work = pd.DataFrame({"fish_id": fish.values, "target_age": df["target_age"].values})
+    for k in range(logits.shape[1]):
+        work[f"_l{k}"] = logits[:, k]
+    lcols = [f"_l{k}" for k in range(logits.shape[1])]
+    grouped = work.groupby("fish_id", dropna=True)
+    agg = grouped[lcols].mean()
+    agg["n_images"] = grouped.size()
+    # A fish has one age; take the first non-null label of the group.
+    agg["target_age"] = grouped["target_age"].first()
+
+    pred = decode_age_ordinal(torch.from_numpy(agg[lcols].to_numpy(dtype=np.float32)))
+    out = pd.DataFrame({
+        "fish_id": agg.index.astype(str),
+        "predicted_age": pred.numpy().astype(int),
+        "target_age": agg["target_age"].values,
+        "n_images": agg["n_images"].values.astype(int),
+    })
+    out["abs_error"] = (out["predicted_age"] - out["target_age"]).abs()
+    out.to_csv(output_dir / "predictions_per_fish.csv", index=False)
+
+    labelled = out.dropna(subset=["target_age"])
+    if labelled.empty:
+        return {"n_fish": int(len(out)), "mean_mae_fish": None,
+                "median_mae_fish": None, "exact_fish": None}
+    m = compute_metrics(labelled["target_age"].values, labelled["predicted_age"].values)
+    return {"n_fish": int(len(out)), "mean_mae_fish": m["MAE"],
+            "median_mae_fish": m["MedAE"], "exact_fish": m["Exact"],
+            "n_images_without_fish_key": n_unmapped}
 
 
 def load_model_from_checkpoint(

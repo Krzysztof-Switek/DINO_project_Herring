@@ -1291,6 +1291,8 @@ def _write_pipeline_summary(
     completed_steps: list[str],
 ) -> None:
     """Zapisuje pipeline_summary.json — szybka weryfikacja wyników bez otwierania HTML."""
+    import pandas as _pd
+
     from src.comparison_report import compute_metrics
 
     training_summary: dict[str, dict] = {}
@@ -1319,13 +1321,37 @@ def _write_pipeline_summary(
             inference_summary[cond_key] = {"n_samples": len(df), "error": "missing columns"}
             continue
         m = compute_metrics(df["age"].values, df["predicted_age"].values)
-        inference_summary[cond_key] = {
+        entry = {
             "n_samples": int(len(df)),
             "MAE":    round(m["MAE"],    4),
             "RMSE":   round(m["RMSE"],   4),
             "Acc1yr": round(m["Acc1yr"], 4),
             "Bias":   round(m["Bias"],   4),
+            # 24.09: Exact is the metric the CORAL work targets and it was persisted
+            # nowhere — every run's exact accuracy had to be recomputed from
+            # predictions.csv after the fact. Added alongside the originals, not instead.
+            "Exact":  round(m["Exact"],  4),
+            "MedAE":  round(m["MedAE"],  4),
         }
+        # Per-fish block when `inference.aggregate_per_fish` produced one. A fish has one
+        # age, so this is the operational unit; kept separate from the per-image numbers
+        # rather than replacing them, since the project's history is per-image.
+        fish_csv = output_dir / cond_key / "predictions_per_fish.csv"
+        if fish_csv.exists():
+            try:
+                fdf = _pd.read_csv(fish_csv).dropna(subset=["target_age"])
+            except Exception:
+                fdf = None
+            if fdf is not None and not fdf.empty:
+                fm = compute_metrics(fdf["target_age"].values, fdf["predicted_age"].values)
+                entry["per_fish"] = {
+                    "n_fish":  int(len(fdf)),
+                    "MAE":     round(fm["MAE"],    4),
+                    "Exact":   round(fm["Exact"],  4),
+                    "Acc1yr":  round(fm["Acc1yr"], 4),
+                    "Bias":    round(fm["Bias"],   4),
+                }
+        inference_summary[cond_key] = entry
 
     summary = {
         "generated_at":    _time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1354,7 +1380,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    dest="config_not_embedded")
     p.add_argument("--train", type=float, default=0.70)
     p.add_argument("--val", type=float, default=0.15)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=42,
+                   help="seed for the train/val/test SPLIT (scan step only)")
+    # 24.09 — a separate knob for the TRAINING seed. `--seed` above reseeds the data split,
+    # which must stay frozen across a seed-replicate experiment or the arms would be compared
+    # on different data. This overrides `project.seed` only, so N replicates of one config
+    # need N invocations rather than N near-identical YAML files.
+    p.add_argument("--train-seed", type=int, default=None,
+                   help="override project.seed (training/init only; leaves the split alone)")
     p.add_argument("--rescan", action="store_true",
                    help="Rebuild data/labels_*.csv from scratch (default: reuse "
                         "data/labels_*.csv if present — splits are deterministic)")
@@ -1373,6 +1406,11 @@ def main(argv: list[str] | None = None) -> None:
     base_cfg_path = Path(args.base_config)
     cfg_emb = load_merged_config(base_cfg_path, Path(args.config_embedded))
     cfg_notemb = load_merged_config(base_cfg_path, Path(args.config_not_embedded))
+    if args.train_seed is not None:
+        cfg_emb.project.seed = args.train_seed
+        cfg_notemb.project.seed = args.train_seed
+        print(f"[run_pipeline] project.seed nadpisany na {args.train_seed} "
+              f"(podzial danych NIE jest ruszany)")
 
     # Must run before the DINOv2 backbone is imported (torch.hub load in _step_train)
     # so XFORMERS_DISABLED takes effect and true CLS attention can be captured.

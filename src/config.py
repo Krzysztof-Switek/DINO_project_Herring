@@ -449,6 +449,20 @@ class InferenceConfig(BaseModel):
     save_heatmaps: bool = True
     save_overlays: bool = True
     save_candidates: bool = True
+    # 24.09 — also write the raw CORAL boundary logits to predictions.csv/json.
+    # Default False keeps every existing run's output byte-for-byte identical.
+    # Needed because `run_inference` consumed `out["coral_logits"]` and threw it away,
+    # so nothing on disk allowed re-decoding, threshold search or calibration without a
+    # fresh forward pass. See "plans and summaries/24.09_CORAL_plan.md" (Etap 1).
+    dump_coral_logits: bool = False
+    # 24.09 — also emit predictions_per_fish.csv: one age per fish, obtained by averaging
+    # the CORAL logits over that fish's photos and decoding once. 91 % of Embedded test fish
+    # have two photos (left + right otolith of the same individual, same true age), and a
+    # fish has one age, so the fish is the operational unit. Measured on
+    # outputs/06.08_attention_first: +5.8 pp exact and MAE 0.6824 -> 0.6125 over the same
+    # per-image rule. Default False keeps every existing output untouched; predictions.csv
+    # is never modified either way, the per-fish table is a separate file.
+    aggregate_per_fish: bool = False
     increment_samples: IncrementSamplesConfig = Field(
         default_factory=IncrementSamplesConfig)
 

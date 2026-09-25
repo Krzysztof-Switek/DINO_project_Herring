@@ -1,0 +1,38 @@
+{
+  "Z20": {
+    "axis_len_px": 514.7756793011885,
+    "gt_offsets_px": [
+      103.4,
+      131.0,
+      144.4,
+      156.4,
+      104.3,
+      130.1,
+      145.2,
+      158.6
+    ],
+    "corridor_half_px": 49.0,
+    "patches_off_tissue": 13,
+    "patches_total": 665
+  },
+  "Z38": {
+    "axis_len_px": 736.8371597578396,
+    "gt_offsets_px": [
+      44.2,
+      46.1,
+      46.1,
+      46.8,
+      47.7,
+      47.7,
+      43.8,
+      46.1,
+      46.4,
+      46.8,
+      47.1,
+      48.3
+    ],
+    "corridor_half_px": 49.0,
+    "patches_off_tissue": 6,
+    "patches_total": 665
+  }
+}

@@ -77,6 +77,12 @@ training:
   keep_only_best: true            # trzymaj tylko best.pt w katalogu runu; kasuj checkpointy epok (każdy ~265 MB)
 
 inference:
+  # 24.09 — obok predictions.csv zapisz predictions_per_fish.csv: jeden wiek na
+  # rybe, ze sredniej logitow CORAL po jej zdjeciach. 91 % ryb testowych ma dwa
+  # zdjecia (lewy + prawy otolit, ten sam wiek), a ryba ma jeden wiek. Zmierzone
+  # na 06.08_attention_first: +5,8 pkt proc. exact, MAE 0,6824 -> 0,6125.
+  # predictions.csv sie NIE zmienia.
+  aggregate_per_fish: true
   output_dir: outputs
   save_heatmaps: true
   save_overlays: true

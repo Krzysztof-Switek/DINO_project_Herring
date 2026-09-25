@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 from typing import Dict
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -349,3 +350,275 @@ def test_load_checkpoint_drops_shape_mismatched_keys_instead_of_crashing(tmp_pat
     with pytest.warns(RuntimeWarning, match="shape-mismatched"):
         loaded = load_model_from_checkpoint(cfg, ckpt_path, backbone=_MockDinoBackbone())
     assert loaded is not None   # did not raise
+
+
+# ---------------------------------------------------------------------------
+# CORAL logit dump (24.09) — gated, additive, must not change the default output
+# ---------------------------------------------------------------------------
+
+def test_logit_dump_is_off_by_default(tmp_path):
+    """Default output must stay exactly what every recorded run already produced."""
+    from src.inference import run_inference
+    cfg = _make_cfg(tmp_path)
+    run_inference(cfg, _make_model(cfg), _make_loader(), tmp_path / "out")
+    df = pd.read_csv(tmp_path / "out" / "predictions.csv")
+    assert list(df.columns) == [
+        "image_id", "predicted_age", "target_age", "abs_error", "metadata_used"]
+
+
+def test_logit_dump_adds_one_column_per_boundary(tmp_path):
+    from src.inference import run_inference
+    cfg = _make_cfg(tmp_path)
+    cfg.inference.dump_coral_logits = True
+    run_inference(cfg, _make_model(cfg), _make_loader(), tmp_path / "out")
+    df = pd.read_csv(tmp_path / "out" / "predictions.csv")
+    expected = [f"coral_logit_{k:02d}" for k in range(cfg.model.num_age_classes - 1)]
+    assert expected == [c for c in df.columns if c.startswith("coral_logit_")]
+    assert df[expected].notna().all().all()
+
+
+def test_dumped_logits_reproduce_the_predicted_age_at_threshold_0_5(tmp_path):
+    """The dump must be the decoder's own input, not a re-derived approximation.
+
+    This is the guard for Etap 1: if counting sigmoid(logit) > 0.5 over the dumped
+    columns ever disagrees with predicted_age, then any threshold search run on the
+    dumped file is measuring a different model than the pipeline reports.
+    """
+    from src.inference import run_inference
+    cfg = _make_cfg(tmp_path)
+    cfg.inference.dump_coral_logits = True
+    run_inference(cfg, _make_model(cfg), _make_loader(), tmp_path / "out")
+    df = pd.read_csv(tmp_path / "out" / "predictions.csv")
+    cols = [c for c in df.columns if c.startswith("coral_logit_")]
+    probs = torch.sigmoid(torch.from_numpy(df[cols].to_numpy())).numpy()
+    recomputed = (probs > 0.5).sum(axis=1)
+    assert list(recomputed) == list(df["predicted_age"])
+
+
+def test_dumped_logits_are_monotone_decreasing(tmp_path):
+    """Rank consistency is structural (single g minus increasing thetas) — pin it.
+
+    It is the reason `(p > 0.5).sum()` is a valid decoder at all, and the reason every
+    candidate age ranking has adjacent runners-up.
+    """
+    from src.inference import run_inference
+    cfg = _make_cfg(tmp_path)
+    cfg.inference.dump_coral_logits = True
+    run_inference(cfg, _make_model(cfg), _make_loader(), tmp_path / "out")
+    df = pd.read_csv(tmp_path / "out" / "predictions.csv")
+    vals = df[[c for c in df.columns if c.startswith("coral_logit_")]].to_numpy()
+    assert np.all(np.diff(vals, axis=1) <= 1e-9)
+
+
+def test_logit_dump_leaves_json_and_summary_consistent(tmp_path):
+    from src.inference import run_inference
+    cfg = _make_cfg(tmp_path)
+    cfg.inference.dump_coral_logits = True
+    summary = run_inference(cfg, _make_model(cfg), _make_loader(), tmp_path / "out")
+    records = json.loads((tmp_path / "out" / "predictions.json").read_text(encoding="utf-8"))
+    assert summary["n_samples"] == len(records)
+    assert "coral_logit_00" in records[0]
+
+
+# ---------------------------------------------------------------------------
+# Per-fish aggregation (24.09) — gated, separate file, predictions.csv untouched
+# ---------------------------------------------------------------------------
+
+class _TwoPhotoDataset(Dataset):
+    """Two photos per fish, both carrying that fish's single true age."""
+
+    def __init__(self, n_fish: int = 6, num_age_classes: int = 10):
+        self.n_fish = n_fish
+        self.num_age_classes = num_age_classes
+
+    def __len__(self) -> int:
+        return self.n_fish * 2
+
+    def __getitem__(self, idx: int) -> Dict:
+        fish = idx // 2
+        age = (fish % (self.num_age_classes - 1)) + 1
+        return {
+            "image": torch.randn(3, 56, 56),
+            "age_ordinal": encode_age_ordinal(age, self.num_age_classes),
+            "age": torch.tensor(age, dtype=torch.long),
+            "image_id": f"2022_BITS4q_HER_Loc_Embedded_Sharpest_FishIndex{fish}"
+                        f"_Single{idx % 2 + 1}_Left.jpg",
+        }
+
+
+def _write_two_photo_labels(tmp_path: Path, n_fish: int = 6) -> Path:
+    rows = []
+    for fish in range(n_fish):
+        for s in (1, 2):
+            rows.append({
+                "image_id": f"2022_BITS4q_HER_Loc_Embedded_Sharpest_FishIndex{fish}"
+                            f"_Single{s}_Left.jpg",
+                "neutral_fish_key": f"2022_BITS4q_HER_Loc_FishIndex{fish}",
+            })
+    path = tmp_path / "labels_two_photo.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+def _cfg_with_fish(tmp_path: Path):
+    cfg = _make_cfg(tmp_path)
+    cfg.inference.aggregate_per_fish = True
+    cfg.data.labels_csv = str(_write_two_photo_labels(tmp_path))
+    return cfg
+
+
+def test_per_fish_is_off_by_default(tmp_path):
+    from src.inference import run_inference
+    cfg = _make_cfg(tmp_path)
+    summary = run_inference(cfg, _make_model(cfg), _make_loader(), tmp_path / "out")
+    assert not (tmp_path / "out" / "predictions_per_fish.csv").exists()
+    assert "n_fish" not in summary
+
+
+def test_per_fish_does_not_touch_predictions_csv(tmp_path):
+    """The per-image file must stay exactly what every downstream consumer expects."""
+    from src.inference import run_inference
+    loader = DataLoader(_TwoPhotoDataset(), batch_size=4, shuffle=False)
+
+    plain = _make_cfg(tmp_path)
+    plain.data.labels_csv = str(_write_two_photo_labels(tmp_path))
+    torch.manual_seed(0)
+    model = _make_model(plain)
+    run_inference(plain, model, loader, tmp_path / "a")
+
+    withfish = _cfg_with_fish(tmp_path)
+    run_inference(withfish, model, loader, tmp_path / "b")
+
+    assert ((tmp_path / "a" / "predictions.csv").read_bytes()
+            == (tmp_path / "b" / "predictions.csv").read_bytes())
+    assert (tmp_path / "b" / "predictions_per_fish.csv").exists()
+
+
+def test_per_fish_collapses_two_photos_into_one_row(tmp_path):
+    from src.inference import run_inference
+    cfg = _cfg_with_fish(tmp_path)
+    loader = DataLoader(_TwoPhotoDataset(n_fish=6), batch_size=4, shuffle=False)
+    summary = run_inference(cfg, _make_model(cfg), loader, tmp_path / "out")
+    fish = pd.read_csv(tmp_path / "out" / "predictions_per_fish.csv")
+
+    assert len(fish) == 6
+    assert summary["n_fish"] == 6
+    assert set(fish["n_images"]) == {2}
+    assert list(fish.columns) == ["fish_id", "predicted_age", "target_age",
+                                 "n_images", "abs_error"]
+    # one age per fish, carried through the grouping
+    assert fish["target_age"].notna().all()
+    assert summary["exact_fish"] is not None
+
+
+def test_per_fish_decodes_the_mean_of_the_logits(tmp_path):
+    """Averaging logits == averaging the scalar g, which is the whole point.
+
+    Every logit is ``g - theta_k`` with constant thetas, so the mean over a fish's photos is
+    ``mean(g) - theta_k``. Decoding that is decoding the averaged decision variable — which
+    halves its variance. Averaging two already-rounded integers cannot, and a 0.5 mean is not
+    even well defined. This reproduces the aggregation by hand and demands a match.
+    """
+    from src.inference import run_inference
+    cfg = _cfg_with_fish(tmp_path)
+    cfg.inference.dump_coral_logits = True
+    loader = DataLoader(_TwoPhotoDataset(n_fish=5), batch_size=4, shuffle=False)
+    run_inference(cfg, _make_model(cfg), loader, tmp_path / "out")
+
+    per_img = pd.read_csv(tmp_path / "out" / "predictions.csv")
+    fish = pd.read_csv(tmp_path / "out" / "predictions_per_fish.csv").set_index("fish_id")
+    cols = [c for c in per_img.columns if c.startswith("coral_logit_")]
+    per_img["fish"] = per_img["image_id"].str.replace(
+        r"_Embedded_Sharpest_(FishIndex\d+)_Single\d+_Left\.jpg", r"_\1", regex=True)
+    for fish_id, grp in per_img.groupby("fish"):
+        mean_logits = grp[cols].to_numpy().mean(axis=0)
+        expected = int((mean_logits > 0).sum())        # sigmoid(x) > 0.5  <=>  x > 0
+        key = [k for k in fish.index if k.endswith(fish_id.split("FishIndex")[1])]
+        assert len(key) == 1
+        assert int(fish.loc[key[0], "predicted_age"]) == expected
+
+
+def test_per_fish_error_never_exceeds_the_worse_of_the_two_photos(tmp_path):
+    """Both photos share one true age, so the averaged decode sits between the two errors."""
+    from src.inference import run_inference
+    n = 8
+    cfg = _make_cfg(tmp_path)
+    cfg.inference.aggregate_per_fish = True
+    cfg.data.labels_csv = str(_write_two_photo_labels(tmp_path, n_fish=n))
+    loader = DataLoader(_TwoPhotoDataset(n_fish=n), batch_size=4, shuffle=False)
+    run_inference(cfg, _make_model(cfg), loader, tmp_path / "out")
+    per_img = pd.read_csv(tmp_path / "out" / "predictions.csv")
+    fish = pd.read_csv(tmp_path / "out" / "predictions_per_fish.csv")
+    assert len(fish) == n
+    worst = per_img.groupby(per_img.index // 2)["abs_error"].max().values
+    assert (fish["abs_error"].values <= worst).all()
+
+
+def test_per_fish_reports_images_it_could_not_map(tmp_path):
+    """Images with no fish key are excluded — that must be counted, not silent."""
+    from src.inference import run_inference
+    cfg = _make_cfg(tmp_path)
+    cfg.inference.aggregate_per_fish = True
+    # labels cover only 6 of the 8 fish in the loader
+    cfg.data.labels_csv = str(_write_two_photo_labels(tmp_path, n_fish=6))
+    loader = DataLoader(_TwoPhotoDataset(n_fish=8), batch_size=4, shuffle=False)
+    summary = run_inference(cfg, _make_model(cfg), loader, tmp_path / "out")
+    assert summary["n_fish"] == 6
+    assert summary["n_images_without_fish_key"] == 4
+
+
+def test_per_fish_skips_gracefully_without_fish_keys(tmp_path):
+    """A labels file with no neutral_fish_key must not crash the run."""
+    from src.inference import run_inference
+    cfg = _make_cfg(tmp_path)
+    cfg.inference.aggregate_per_fish = True
+    bad = tmp_path / "no_key.csv"
+    pd.DataFrame({"image_id": ["x.jpg"], "age": [3]}).to_csv(bad, index=False)
+    cfg.data.labels_csv = str(bad)
+    summary = run_inference(cfg, _make_model(cfg), _make_loader(), tmp_path / "out")
+    assert summary["n_fish"] == 0
+    assert summary["exact_fish"] is None
+    assert not (tmp_path / "out" / "predictions_per_fish.csv").exists()
+
+
+def test_per_fish_skips_gracefully_when_labels_csv_is_missing(tmp_path):
+    from src.inference import run_inference
+    cfg = _make_cfg(tmp_path)
+    cfg.inference.aggregate_per_fish = True
+    cfg.data.labels_csv = str(tmp_path / "does_not_exist.csv")
+    summary = run_inference(cfg, _make_model(cfg), _make_loader(), tmp_path / "out")
+    assert summary["n_fish"] == 0
+
+
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parents[1] / "experiments" / "logits" /
+         "06.08_attention_first__best" / "test" / "predictions.csv").exists(),
+    reason="needs the logit dump from scripts/diagnostics/coral_score_splits.py")
+def test_production_per_fish_matches_the_diagnostic_on_real_data(tmp_path):
+    """The production path and the diagnostic must agree on the real dump, exactly.
+
+    Two independent implementations of the same aggregation (src/inference.py::_write_per_fish
+    and coral_decode_lab.py::fish_level_rule) would otherwise be free to drift, and the
+    +5.8 pp reported for per-fish aggregation would stop being the number production emits.
+    """
+    import json
+    import numpy as np
+    from src.config import OtolithConfig
+    from src.inference import _write_per_fish
+
+    root = Path(__file__).resolve().parents[1]
+    dump = root / "experiments" / "logits" / "06.08_attention_first__best" / "test" / "predictions.csv"
+    lab_json = root / "experiments" / "threshold" / "06.08_attention_first__best" / "metrics.json"
+    if not lab_json.exists():
+        pytest.skip("needs coral_decode_lab.py output")
+
+    df = pd.read_csv(dump)
+    cols = sorted(c for c in df.columns if c.startswith("coral_logit_"))
+    cfg = OtolithConfig()
+    cfg.data.labels_csv = "data/labels_embedded.csv"
+    got = _write_per_fish(cfg, df, df[cols].to_numpy(dtype=np.float32), tmp_path)
+
+    want = json.loads(lab_json.read_text(encoding="utf-8"))["fish_level"]["test_production"]
+    assert got["n_fish"] == want["n_fish"]
+    assert got["exact_fish"] == pytest.approx(want["Exact"])
+    assert got["mean_mae_fish"] == pytest.approx(want["MAE"])
