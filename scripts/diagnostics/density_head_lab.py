@@ -30,11 +30,12 @@ trains on. Maturity criterion (plan §5): density_active ≥ 1 and zero_ratio < 
 in ≥ 4 of 5 seeds.
 
 Cost per training sample on the 16-core CPU (batch 16, N = 5852): A5 0.023 s (~2 min/epoch),
-A4 0.66 s (~56 min/epoch), A0–A3 ~3 s (dense 5852² mask). So A5 runs locally; A0–A4 go to GPU.
+A4 0.66 s (~56 min/epoch), A0–A3 1.35 s (production mask computed per radial bin, ~2 h/epoch).
+Neither machine has a GPU; the server (128 cores) is the faster CPU lane.
 
     python scripts/diagnostics/density_head_lab.py --cache raw --arms A5 --seeds 0,1,2,3,4
-    python scripts/diagnostics/density_head_lab.py --cache raw --arms A0,A1,A2,A3,A4 --device cuda
-    python scripts/diagnostics/density_head_lab.py --cache wedge_b_best_age --arms A0 --device cuda
+    python scripts/diagnostics/density_head_lab.py --cache raw --arms A0,A1,A2,A3,A4 --device cpu
+    python scripts/diagnostics/density_head_lab.py --cache wedge_b_best_age --arms A0 --device cpu
 
 Writes experiments/density_head_lab/<cache>/<arm>_seed<s>/{metrics.csv, head.pt, summary.json}
 and experiments/density_head_lab/<cache>/summary.csv.
@@ -575,8 +576,8 @@ def main() -> None:
     arms = [ARMS[a.strip()] for a in args.arms.split(",") if a.strip()]
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     if device.type == "cpu" and any(a.head == "radial" for a in arms):
-        print("UWAGA: ramiona z pełną maską 5852² na CPU to ~3 s na próbkę (forward+backward) — "
-              "przeznaczone na serwer GPU.")
+        print("INFO: ramiona A0–A3 (maska produkcyjna liczona blokami binów) to ~1,35 s na próbkę "
+              "na 16 rdzeniach — ~2 h/epokę; serwer (128 rdzeni, bez GPU) szybciej.")
     root = OUT_ROOT / args.cache
     print(f"LAB  cache={args.cache}  label={args.label}  device={device}  arms={[a.name for a in arms]}  "
           f"seeds={seeds}  epochs={args.epochs}  N={cache.meta['n_patches']}  "
