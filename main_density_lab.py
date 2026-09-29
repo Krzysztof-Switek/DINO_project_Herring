@@ -1,8 +1,8 @@
 """30.09 — S2: laboratorium głowicy gęstości na serwerze, od testów do tabeli wyników.
 
 SERWER NIE MA GPU — wszystko liczy się na CPU. Zakres wybrany pod to (30.09, "priorytet
-wedge_c"): serwer liczy główny kandydat A3 × 3 ziarna (~2 h/epokę, maks. 20 epok, stop 3 epoki
-po dojrzeniu, zapis stanu co epokę), komputer lokalny równolegle A5 i A4. A0/A1/A2 i kontrola na
+wedge_c"): serwer liczy A3 × 3 ziarna (~47 min/epokę na serwerze), potem A4 × 3 (maks. 20 epok, stop 3 epoki
+po dojrzeniu, zapis stanu co epokę), komputer lokalny równolegle A5. A0/A1/A2 i kontrola na
 cache (b) są odłożone — można je dopisać do ARMS_RAW / ARMS_CONTROL.
 
 CO ROZSTRZYGA. Który przepis głowicy gęstości dojrzewa niezawodnie na geometrii wycinka
@@ -41,7 +41,7 @@ from pathlib import Path
 
 LOCATION = "server"          # "server" → serwer (Linux)  |  "local" → Twój komp (Windows, Z:)
 
-ARMS_RAW = ["A3"]            # główny kandydat; A0/A1/A2 odłożone (koszt CPU ~2 h/epokę na ramię)
+ARMS_RAW = ["A3", "A4"]      # A3 główny kandydat, A4 okno kanwy (przeniesione z lokalnego: serwer ~3,4× szybszy); A0/A1/A2 odłożone
 ARMS_CONTROL = []            # ["A0"] = kontrola na cache (b), wymaga zbudowania drugiego cache (~28 GB)
 SEEDS = [0, 1, 2]
 EPOCHS = 20                  # bramka patrzy tylko na epoki <= 20
