@@ -475,6 +475,8 @@ def main() -> None:
     ap.add_argument("--max-train", type=int, default=None, help="subsample train (smoke runs)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--threads", type=int, default=None)
+    ap.add_argument("--skip-done", action="store_true",
+                    help="skip arm/seed pairs that already have summary.json (resume)")
     args = ap.parse_args()
 
     from src.utils import resolve_device
@@ -491,17 +493,26 @@ def main() -> None:
     print(f"LAB  cache={args.cache}  label={args.label}  device={device}  arms={[a.name for a in arms]}  "
           f"seeds={seeds}  epochs={args.epochs}  N={cache.meta['n_patches']}  "
           f"train={len(cache.rows_of('train'))}  val={len(cache.rows_of('val'))}", flush=True)
-    rows = []
     for arm in arms:
         for seed in seeds:
-            rows.append(run_arm(arm, cache, seed, args.epochs, args.batch_size, device,
-                                root / f"{arm.name}_seed{seed}", args.max_train,
-                                log=lambda m: print(m, flush=True)))
-            pd.DataFrame(rows).to_csv(root / "summary.csv", index=False)
-    df = pd.DataFrame(rows)
-    print("\n" + df.groupby("arm").agg(matured=("matured", "sum"), seeds=("seed", "count"),
-                                       median_epoch=("matured_epoch", "median"),
-                                       final_zero_ratio=("final_zero_ratio", "median")).to_string())
+            out_dir = root / f"{arm.name}_seed{seed}"
+            if args.skip_done and (out_dir / "summary.json").exists():
+                print(f"  {arm.name} seed{seed}: gotowe wcześniej — pomijam", flush=True)
+                continue
+            run_arm(arm, cache, seed, args.epochs, args.batch_size, device, out_dir,
+                    args.max_train, log=lambda m: print(m, flush=True))
+            collect_summaries(root).to_csv(root / "summary.csv", index=False)
+    df = collect_summaries(root)
+    if not df.empty:
+        print("\n" + df.groupby("arm").agg(matured=("matured", "sum"), seeds=("seed", "count"),
+                                           median_epoch=("matured_epoch", "median"),
+                                           final_zero_ratio=("final_zero_ratio", "median")).to_string())
+
+
+def collect_summaries(root: Path) -> pd.DataFrame:
+    """Every finished arm/seed under ``root`` (from any invocation), one row each."""
+    rows = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(root.glob("*_seed*/summary.json"))]
+    return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":
