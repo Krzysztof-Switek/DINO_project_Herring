@@ -84,3 +84,4 @@ UWAGA: ramiona z pełną maską 5852² na CPU to ~3 s na próbkę (forward+backw
 LAB  cache=raw  label=quarter  device=cpu  arms=['A3']  seeds=[0, 1, 2]  epochs=20  N=5852  train=5150  val=1117
   A3 seed0 e0  zero_ratio=0.677  active=0.00  max_logit=-7.29  prior_bias=-7.45
 A3 seed0 e1  train=3.1719  zero_ratio=0.536  active=1.77  max_logit=-0.05  median_logit=-14.76  Σp/age=1.83  (2804 s/ep)
+A3 seed0 e2  train=2.0568  zero_ratio=0.367  active=2.29  max_logit=0.44  median_logit=-17.15  Σp/age=1.22  (2826 s/ep)
