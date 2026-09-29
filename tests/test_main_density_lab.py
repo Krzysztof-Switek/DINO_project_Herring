@@ -27,6 +27,8 @@ def lab(tmp_path, monkeypatch):
     monkeypatch.setattr(mdl, "LAB_ROOT", tmp_path / "lab")
     monkeypatch.setattr(mdl, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(mdl, "LOG", tmp_path / "log.txt")
+    monkeypatch.setattr(mdl, "SEEDS", [0, 1, 2, 3, 4])
+    monkeypatch.setattr(mdl, "GATE_SEEDS", 4)
     return tmp_path / "lab"
 
 
@@ -42,7 +44,7 @@ def test_report_gate_and_verdicts(lab):
     assert arms[("raw", "A0")]["gate"] == "NIE" and arms[("raw", "A0")]["collapsed_seeds"] == 5
     v = " ".join(out["verdicts"])
     assert "odtwarza zjawisko" in v
-    assert "A3 (4/5" in v
+    assert "A3 (4/5" in v and "(≥ 4/5 ziaren)" in v
     assert "sam brak dryfu nie wystarcza" in v
     md = (lab / "WYNIKI.md").read_text(encoding="utf-8")
     assert "| raw | A3 |" in md and "head.pt" in md

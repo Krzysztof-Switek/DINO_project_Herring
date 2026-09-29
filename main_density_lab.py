@@ -1,5 +1,10 @@
 """30.09 — S2: laboratorium głowicy gęstości na serwerze, od testów do tabeli wyników.
 
+SERWER NIE MA GPU — wszystko liczy się na CPU. Zakres wybrany pod to (30.09, "priorytet
+wedge_c"): serwer liczy główny kandydat A3 × 3 ziarna (~2 h/epokę, maks. 20 epok, stop 3 epoki
+po dojrzeniu, zapis stanu co epokę), komputer lokalny równolegle A5 i A4. A0/A1/A2 i kontrola na
+cache (b) są odłożone — można je dopisać do ARMS_RAW / ARMS_CONTROL.
+
 CO ROZSTRZYGA. Który przepis głowicy gęstości dojrzewa niezawodnie na geometrii wycinka
 (5852 patchy), zanim puścimy kolejny pełny bieg (~5 h/epokę). Bieg wedge_b zapadł się do
 stanu absorbującego (logity ≈ −13). Plan i uzasadnienie ramion:
@@ -7,14 +12,15 @@ stanu absorbującego (logity ≈ −13). Plan i uzasadnienie ramion:
 
 CO ROBI, PO KOLEI (każdy krok pomija to, co już jest gotowe, więc przerwany bieg wznawia
 się zwykłym ponownym uruchomieniem):
-  1. kontrole: katalog zdjęć, checkpoint wedge_b, etykiety, GPU;
+  1. kontrole: katalog zdjęć, etykiety, checkpoint wedge_b (gdy potrzebny), CPU;
   2. testy laboratorium i cache (pytest) — bez zielonych testów nic dalej nie rusza;
-  3. cache tokenów pasm: (a) surowy DINOv2, (b) backbone z best_age.pt wedge_b;
-  4. ramiona A0–A4 × 5 ziaren na cache (a) + kontrola A0 na cache (b);
+  3. cache tokenów pasm: (a) surowy DINOv2; (b) backbone z best_age.pt wedge_b tylko, gdy
+     ARMS_CONTROL nie jest puste;
+  4. ramiona ARMS_RAW × SEEDS na cache (a) (+ ARMS_CONTROL na cache (b));
   5. raport: experiments/density_head_lab/WYNIKI.md + wyniki.json.
 
-A5 (głowica wierszowa) liczy się lokalnie na CPU; jego wyniki dołączy ten sam raport, jeśli
-katalog experiments/density_head_lab/raw/A5_seed* zostanie tu skopiowany.
+A5 i A4 liczą się lokalnie; ich wyniki dołączy ten sam raport, jeśli katalogi
+experiments/density_head_lab/raw/A5_seed*, A4_seed* zostaną tu skopiowane.
 
     python main_density_lab.py              # całość
     python main_density_lab.py --report     # tylko raport z tego, co już policzone
@@ -35,14 +41,14 @@ from pathlib import Path
 
 LOCATION = "server"          # "server" → serwer (Linux)  |  "local" → Twój komp (Windows, Z:)
 
-ARMS_RAW = ["A3", "A0", "A1", "A2", "A4"]   # A3 pierwszy: główny kandydat, najszybszy sygnał
-ARMS_CONTROL = ["A0"]        # na cache (b): A0 musi odtworzyć zapaść wedge_b
-SEEDS = [0, 1, 2, 3, 4]
-EPOCHS = 30
-BATCH_SIZE = 16              # przy "CUDA out of memory" (np. równolegle z innym biegiem): 8
+ARMS_RAW = ["A3"]            # główny kandydat; A0/A1/A2 odłożone (koszt CPU ~2 h/epokę na ramię)
+ARMS_CONTROL = []            # ["A0"] = kontrola na cache (b), wymaga zbudowania drugiego cache (~28 GB)
+SEEDS = [0, 1, 2]
+EPOCHS = 20                  # bramka patrzy tylko na epoki <= 20
+STOP_AFTER_MATURE = 3        # ziarno, które dojrzało, kończy 3 epoki później
+BATCH_SIZE = 16
 LABEL = "quarter"            # cel liczenia: "quarter" (wiek po korekcie kwartalnej) | "recorded"
 CACHE_WORKERS = 8            # procesy ekstrakcji kanw przy budowie cache
-REQUIRE_CUDA = LOCATION == "server"   # na serwerze brak GPU = przerwij, zamiast liczyć dni na CPU
 
 # ============================================================
 
@@ -59,12 +65,13 @@ CACHE_ROOT = PROJECT_ROOT / "data" / "wedge_band_tokens"
 LAB_ROOT = PROJECT_ROOT / "experiments" / "density_head_lab"
 LOG = PROJECT_ROOT / "logs" / "main_density_lab.log"
 
-CACHES = {"raw": [], "wedge_b_best_age": ["--backbone-from", str(CKPT_B)]}
+CACHES = {"raw": []} | ({"wedge_b_best_age": ["--backbone-from", str(CKPT_B)]} if ARMS_CONTROL else {})
 TESTS = ["tests/test_density_head_lab.py", "tests/test_cache_wedge_band_tokens.py",
          "tests/test_stage4_trainer.py"]
 
-# Maturity gate of the plan (§5): active ≥ 1 and zero_ratio < 0.5 before epoch 20, ≥ 4/5 seeds.
-GATE_SEEDS = 4
+# Maturity gate of the plan (§5): active ≥ 1 and zero_ratio < 0.5 before epoch 20, in ≥ 4/5 seeds;
+# with fewer than 5 seeds every seed has to mature.
+GATE_SEEDS = 4 if len(SEEDS) >= 5 else len(SEEDS)
 # wedge_b's own state from e16 on: 97–99 % of the zero-map loss.
 COLLAPSED_RATIO = 0.9
 
@@ -111,7 +118,7 @@ def preflight() -> None:
     problems = []
     if not Path(IMAGE_DIR).is_dir():
         problems.append(f"brak katalogu zdjęć {IMAGE_DIR!r} (LOCATION={LOCATION!r})")
-    if not CKPT_B.exists():
+    if ARMS_CONTROL and not CKPT_B.exists():
         problems.append(f"brak checkpointu wedge_b {CKPT_B}")
     if not LABELS.exists():
         problems.append(f"brak etykiet {LABELS}")
@@ -122,21 +129,10 @@ def preflight() -> None:
         for p in problems:
             log("BŁĄD: " + p)
         sys.exit(1)
+    import os
     import torch
-    if torch.cuda.is_available():
-        free, total = torch.cuda.mem_get_info()
-        log(f"GPU: {torch.cuda.get_device_name(0)}  wolne {free / 2**30:.1f} / {total / 2**30:.1f} GB")
-        if free < 12 * 2**30 and BATCH_SIZE > 8:
-            log("UWAGA: mniej niż 12 GB wolnej pamięci GPU — przy OOM ustaw BATCH_SIZE = 8")
-    elif REQUIRE_CUDA:
-        log(f"BŁĄD: torch {torch.__version__} nie widzi GPU (torch.cuda.is_available() = False). "
-            f"Ramiona A0–A4 na CPU to dziesiątki godzin na ziarno — przerywam. "
-            f"Sprawdź: nvidia-smi; python -c \"import torch; print(torch.__version__, "
-            f"torch.version.cuda, torch.cuda.is_available())\"; zmienną CUDA_VISIBLE_DEVICES. "
-            f"Świadomie na CPU: REQUIRE_CUDA = False.")
-        sys.exit(1)
-    else:
-        log("UWAGA: brak CUDA — ramiona A0–A4 na CPU trwają dziesiątki godzin na ziarno")
+    log(f"CPU: {os.cpu_count()} rdzeni, torch {torch.__version__}, wątki {torch.get_num_threads()} "
+        f"(serwer nie ma GPU — wszystko na CPU)")
 
 
 def step_tests() -> None:
@@ -154,8 +150,11 @@ def step_caches() -> None:
 
 def step_lab() -> None:
     common = ["--seeds", ",".join(map(str, SEEDS)), "--epochs", str(EPOCHS),
+              "--stop-after-mature", str(STOP_AFTER_MATURE), "--device", "cpu",
               "--batch-size", str(BATCH_SIZE), "--label", LABEL, "--skip-done"]
     for cache, arms in (("raw", ARMS_RAW), ("wedge_b_best_age", ARMS_CONTROL)):
+        if not arms:
+            continue
         for arm in arms:           # one arm per call, so a failure costs at most one arm
             run([PY, "scripts/diagnostics/density_head_lab.py", "--cache", cache,
                  "--arms", arm, *common])
@@ -235,7 +234,7 @@ def verdicts(table: list[dict]) -> list[str]:
                         "sam brak dryfu nie wystarcza; przyczyna leży w stracie, inicjalizacji lub oknie."))
     passing = [t for t in table if t["cache"] == "raw" and t["gate"] == "TAK"]
     if passing:
-        lines.append("Ramiona przechodzące bramkę dojrzałości (≥ 4/5 ziaren): "
+        lines.append(f"Ramiona przechodzące bramkę dojrzałości (≥ {GATE_SEEDS}/{len(SEEDS)} ziaren): "
                      + ", ".join(f"{t['arm']} ({t['matured']}/{t['seeds']}, mediana e"
                                  f"{t['median_matured_epoch']:.0f})" for t in passing)
                      + ". Następny krok: ocena ZEGAR ich wag (L8).")
@@ -252,7 +251,7 @@ def write_report() -> None:
                                                       "verdicts": verdicts(table)},
                                                      indent=2, ensure_ascii=False), encoding="utf-8")
     md = ["# Laboratorium głowicy gęstości — wyniki", "",
-          f"Bramka: `active ≥ 1` i `zero_ratio < 0,5` przed epoką 20, w ≥ {GATE_SEEDS}/{len(SEEDS)} ziaren. "
+          f"Bramka: `active ≥ 1` i `zero_ratio < 0,5` w epokach 1–20, w ≥ {GATE_SEEDS}/{len(SEEDS)} ziaren. "
           f"Zapaść: końcowe `zero_ratio > {COLLAPSED_RATIO}` i `active < 1`. Cel liczenia: `{LABEL}`.", "",
           "## Werdykty", ""] + [f"- {v}" for v in verdicts(table)] + [
           "", "## Ramiona", "",

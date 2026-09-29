@@ -51,6 +51,26 @@ def test_canvas_head_is_production_head_with_canvas_mask():
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
 
 
+def test_bin_block_head_equals_production_head():
+    """A0–A3 run the production mask per radial bin — must equal the dense production forward."""
+    from scripts.diagnostics.density_head_lab import BinBlockRadialHead
+    torch.manual_seed(2)
+    fast = BinBlockRadialHead(embed_dim=32, **HEAD_KW).eval()
+    ref = RadialAttentionDensityHead(embed_dim=32, **HEAD_KW).eval()
+    ref.load_state_dict(fast.state_dict())
+    n = 300
+    t = torch.rand(n).expand(3, n)                                   # same t in every image
+    theta = torch.rand(n) * 1.7 - 0.85
+    theta = torch.stack([theta + s for s in (0.0, 1.3, -2.1)])       # per-image axis shift
+    x = torch.randn(3, n, 32)
+    ones = torch.ones(3, n, dtype=torch.bool)
+    with torch.no_grad():
+        torch.testing.assert_close(fast(x, t, theta, ones), ref(x, t, theta, ones),
+                                   rtol=1e-5, atol=1e-5)
+        t2 = torch.rand(3, n)                                        # differing geometry → fallback
+        torch.testing.assert_close(fast(x, t2, theta, ones), ref(x, t2, theta, ones))
+
+
 def test_canvas_neighbourhood_is_21_in_the_interior():
     counts = canvas_neighbour_counts(REAL_SHAPES)
     assert counts.shape == (5852,)
@@ -222,3 +242,52 @@ def test_incomplete_cache_is_refused(tmp_path):
     np.save(tmp_path / "done.npy", np.array([True, False] + [True] * 16))
     with pytest.raises(SystemExit):
         TokenCache(tmp_path, "quarter")
+
+
+def test_resume_after_interruption_gives_identical_history(tmp_path, monkeypatch):
+    """A multi-day CPU seed must survive a restart: interrupted + resumed == uninterrupted."""
+    import scripts.diagnostics.density_head_lab as lab
+    (tmp_path / "cache").mkdir()
+    _fake_cache(tmp_path / "cache")
+    cache = TokenCache(tmp_path / "cache", "quarter")
+    cpu = torch.device("cpu")
+    run_arm(ARMS["A3"], cache, 0, 3, 4, cpu, tmp_path / "full", log=lambda m: None,
+            stop_after_mature=None)
+
+    real_eval = lab.evaluate
+    calls = {"n": 0}
+
+    def crashing(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 3:                      # e0, e1 evaluated; crash while evaluating e2
+            raise KeyboardInterrupt
+        return real_eval(*a, **kw)
+
+    monkeypatch.setattr(lab, "evaluate", crashing)
+    with pytest.raises(KeyboardInterrupt):
+        run_arm(ARMS["A3"], cache, 0, 3, 4, cpu, tmp_path / "resumed", log=lambda m: None,
+                stop_after_mature=None)
+    assert (tmp_path / "resumed" / "state.pt").exists()
+    monkeypatch.setattr(lab, "evaluate", real_eval)
+    run_arm(ARMS["A3"], cache, 0, 3, 4, cpu, tmp_path / "resumed", log=lambda m: None,
+            stop_after_mature=None)
+    import pandas as pd
+    a = pd.read_csv(tmp_path / "full" / "metrics.csv")
+    b = pd.read_csv(tmp_path / "resumed" / "metrics.csv")
+    pd.testing.assert_frame_equal(a, b, check_exact=False, rtol=1e-6)
+    assert not (tmp_path / "resumed" / "state.pt").exists()
+
+
+def test_stop_after_mature(tmp_path, monkeypatch):
+    import scripts.diagnostics.density_head_lab as lab
+    (tmp_path / "cache").mkdir()
+    _fake_cache(tmp_path / "cache")
+    cache = TokenCache(tmp_path / "cache", "quarter")
+    mature = {"loss": 0.1, "active": 3.0, "max_logit": 2.0, "median_logit": -9.0,
+              "sum_p_over_age": 1.0, "zero_ratio": 0.2}
+    monkeypatch.setattr(lab, "evaluate", lambda *a, **kw: dict(mature))
+    s = run_arm(ARMS["A5"], cache, 0, 10, 4, torch.device("cpu"), tmp_path / "out",
+                log=lambda m: None, stop_after_mature=1)
+    import pandas as pd
+    m = pd.read_csv(tmp_path / "out" / "metrics.csv")
+    assert s["matured_epoch"] == 1 and list(m["epoch"]) == [0, 1, 2]

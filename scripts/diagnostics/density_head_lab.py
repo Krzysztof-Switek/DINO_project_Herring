@@ -207,6 +207,68 @@ def local_encoder_layer(layer: nn.TransformerEncoderLayer, x: Tensor,
     return x
 
 
+def grouped_encoder_layer(layer: nn.TransformerEncoderLayer, x: Tensor,
+                          groups: list[tuple[Tensor, Tensor]]) -> Tensor:
+    """``layer(x, mask=M)`` for a block-diagonal M given as ``(indices, blocked (n, n))`` groups.
+
+    Tokens only attend within their own group, so attention is computed per group on the
+    gathered sub-sequence; every other term of the norm_first layer is per-token and unchanged.
+    """
+    assert layer.norm_first
+    attn = layer.self_attn
+    B, N, D = x.shape
+    H = attn.num_heads
+    hd = D // H
+    q, k, v = F.linear(layer.norm1(x), attn.in_proj_weight, attn.in_proj_bias).chunk(3, dim=-1)
+    q = q * (hd ** -0.5)
+    o = torch.zeros_like(q)
+    for idx, blocked in groups:
+        n = idx.numel()
+        qg, kg, vg = (a[:, idx].reshape(B, n, H, hd).transpose(1, 2) for a in (q, k, v))
+        s = (qg @ kg.transpose(-1, -2)).masked_fill(blocked, float("-inf"))
+        w = F.dropout(torch.softmax(s, dim=-1), p=attn.dropout, training=layer.training)
+        o[:, idx] = (w @ vg).transpose(1, 2).reshape(B, n, D)
+    x = x + layer.dropout1(attn.out_proj(o))
+    x = x + layer.dropout2(layer.linear2(layer.dropout(layer.activation(layer.linear1(layer.norm2(x))))))
+    return x
+
+
+class BinBlockRadialHead(RadialAttentionDensityHead):
+    """The production head, computed per radial bin (arms A0–A3; same weights, same output).
+
+    The production mask (`radial_local_attention_mask`) only lets a token attend inside its own
+    radial bin and angular window. On the band canvases every image has the same t per token and
+    θ differing only by the axis angle, so the bins are identical across the batch and the mask is
+    block-diagonal: attention costs Σ n_bin² (5.7 M pairs) instead of N² (34 M). When the batch
+    does not share its geometry the production forward is used unchanged.
+    """
+
+    def forward(self, patches, polar_t=None, polar_theta=None, polar_valid=None):
+        same_geometry = (polar_t is not None and polar_theta is not None
+                         and bool((polar_t == polar_t[:1]).all())
+                         and bool(((polar_theta - polar_theta[:, :1])
+                                   - (polar_theta[:1] - polar_theta[:1, :1])).abs().max() < 1e-4)
+                         and (polar_valid is None or bool(polar_valid.all())))
+        if not same_geometry:
+            return super().forward(patches, polar_t, polar_theta, polar_valid)
+        x = self.input_norm(patches)
+        x = x + self.pos_proj(polar_fourier_features(polar_t, polar_theta,
+                                                     self.num_angle_freqs, self.num_radius_freqs))
+        t0, th0 = polar_t[0], polar_theta[0]
+        bins = torch.clamp((t0 * self.n_radial_bins).long(), 0, self.n_radial_bins - 1)
+        groups = []
+        for b in torch.unique(bins):
+            idx = torch.nonzero(bins == b).squeeze(1)
+            d = th0[idx].unsqueeze(1) - th0[idx].unsqueeze(0)
+            d = torch.atan2(torch.sin(d), torch.cos(d))
+            allowed = (d.abs() <= math.radians(self.window_deg) / 2.0) | torch.eye(
+                idx.numel(), dtype=torch.bool, device=x.device)
+            groups.append((idx, ~allowed))
+        for layer in self.encoder.layers:
+            x = grouped_encoder_layer(layer, x, groups)
+        return self.out_head(x)
+
+
 class CanvasWindowDensityHead(RadialAttentionDensityHead):
     """Production head with the attention window defined in canvas indices (arm A4)."""
 
@@ -358,7 +420,7 @@ class TokenCache:
 
 def build_head(arm: Arm, dim: int, shapes: list[tuple[int, int]]) -> nn.Module:
     if arm.head == "radial":
-        return RadialAttentionDensityHead(embed_dim=dim, **HEAD_KW)
+        return BinBlockRadialHead(embed_dim=dim, **HEAD_KW)
     if arm.head == "canvas":
         return CanvasWindowDensityHead(dim, shapes, **HEAD_KW)
     return RowDensityHead(dim, shapes, hidden_dim=HEAD_KW["hidden_dim"],
@@ -404,13 +466,18 @@ def evaluate(arm: Arm, head: nn.Module, cache: TokenCache, rows: np.ndarray, dev
 def matured(history: list[dict], by_epoch: int = 20) -> Optional[int]:
     """First epoch ≤ by_epoch with density_active ≥ 1 and zero_ratio < 0.5, else None."""
     for h in history:
-        if h["epoch"] <= by_epoch and h["active"] >= 1.0 and h["zero_ratio"] < 0.5:
+        if 1 <= h["epoch"] <= by_epoch and h["active"] >= 1.0 and h["zero_ratio"] < 0.5:
             return h["epoch"]
     return None
 
 
 def run_arm(arm: Arm, cache: TokenCache, seed: int, epochs: int, batch_size: int, device,
-            out_dir: Path, max_train: Optional[int] = None, log=print) -> dict:
+            out_dir: Path, max_train: Optional[int] = None, log=print,
+            stop_after_mature: Optional[int] = 3) -> dict:
+    """Train one arm/seed. Saves ``state.pt`` after every epoch and resumes from it, so a
+    multi-day CPU run survives an interruption. With ``stop_after_mature=k`` a seed that has
+    matured stops k epochs later (the gate only looks at epochs <= 20, the extra epochs show the
+    head stays mature); None trains all ``epochs``."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     dim = int(cache.meta["dim"])
@@ -424,13 +491,27 @@ def run_arm(arm: Arm, cache: TokenCache, seed: int, epochs: int, batch_size: int
     steps = epochs * math.ceil(len(train_rows) / batch_size)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
 
-    history = [{"epoch": 0, "train_loss": float("nan"),
-                **evaluate(arm, head, cache, val_rows, device, batch_size)}]
-    log(f"  {arm.name} seed{seed} e0  zero_ratio={history[0]['zero_ratio']:.3f}  "
-        f"active={history[0]['active']:.2f}  max_logit={history[0]['max_logit']:.2f}"
-        + (f"  prior_bias={bias:.2f}" if bias is not None else ""))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    state_path = out_dir / "state.pt"
+    start = 1
+    if state_path.exists():
+        st = torch.load(state_path, map_location=device, weights_only=False)
+        head.load_state_dict(st["head"]); opt.load_state_dict(st["opt"]); sched.load_state_dict(st["sched"])
+        rng.bit_generator.state = st["rng"]; torch.set_rng_state(st["torch_rng"])
+        history, bias, start = st["history"], st["bias"], st["history"][-1]["epoch"] + 1
+        log(f"  {arm.name} seed{seed}: wznawiam od epoki {start}")
+    else:
+        history = [{"epoch": 0, "train_loss": float("nan"),
+                    **evaluate(arm, head, cache, val_rows, device, batch_size)}]
+        log(f"  {arm.name} seed{seed} e0  zero_ratio={history[0]['zero_ratio']:.3f}  "
+            f"active={history[0]['active']:.2f}  max_logit={history[0]['max_logit']:.2f}"
+            + (f"  prior_bias={bias:.2f}" if bias is not None else ""))
     t0 = time.time()
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start, epochs + 1):
+        mat_epoch = matured(history)
+        if stop_after_mature is not None and mat_epoch is not None                 and epoch > mat_epoch + stop_after_mature:
+            log(f"  {arm.name} seed{seed}: dojrzało w e{mat_epoch}, stop po {stop_after_mature} epokach")
+            break
         head.train()
         order = rng.permutation(train_rows)
         tot, n = 0.0, 0
@@ -448,9 +529,12 @@ def run_arm(arm: Arm, cache: TokenCache, seed: int, epochs: int, batch_size: int
         log(f"  {arm.name} seed{seed} e{epoch}  train={h['train_loss']:.4f}  "
             f"zero_ratio={h['zero_ratio']:.3f}  active={h['active']:.2f}  "
             f"max_logit={h['max_logit']:.2f}  median_logit={h['median_logit']:.2f}  "
-            f"Σp/age={h['sum_p_over_age']:.2f}  ({(time.time() - t0) / epoch:.0f} s/ep)")
+            f"Σp/age={h['sum_p_over_age']:.2f}  ({(time.time() - t0) / (epoch - start + 1):.0f} s/ep)")
+        pd.DataFrame(history).to_csv(out_dir / "metrics.csv", index=False)
+        torch.save({"head": head.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+                    "rng": rng.bit_generator.state, "torch_rng": torch.get_rng_state(),
+                    "history": history, "bias": bias}, state_path)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(history).to_csv(out_dir / "metrics.csv", index=False)
     torch.save({"arm": asdict(arm), "seed": seed, "head_kw": HEAD_KW, "shapes": cache.shapes,
                 "prior_bias": bias, "state_dict": head.state_dict(),
@@ -460,6 +544,7 @@ def run_arm(arm: Arm, cache: TokenCache, seed: int, epochs: int, batch_size: int
                "final_zero_ratio": history[-1]["zero_ratio"], "final_active": history[-1]["active"],
                "min_zero_ratio": min(h["zero_ratio"] for h in history)}
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    state_path.unlink(missing_ok=True)
     return summary
 
 
@@ -468,7 +553,10 @@ def main() -> None:
     ap.add_argument("--cache", required=True, help="tag under data/wedge_band_tokens/")
     ap.add_argument("--arms", default="A4,A5")
     ap.add_argument("--seeds", default="0,1,2,3,4")
-    ap.add_argument("--epochs", type=int, default=30)
+    ap.add_argument("--epochs", type=int, default=20,
+                    help="maximum; the maturity gate only looks at epochs <= 20")
+    ap.add_argument("--stop-after-mature", type=int, default=3,
+                    help="stop a seed this many epochs after it matures; -1 = never")
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--label", choices=["quarter", "recorded"], default="quarter",
                     help="count target; the same for every arm so arms differ in the head only")
@@ -500,7 +588,8 @@ def main() -> None:
                 print(f"  {arm.name} seed{seed}: gotowe wcześniej — pomijam", flush=True)
                 continue
             run_arm(arm, cache, seed, args.epochs, args.batch_size, device, out_dir,
-                    args.max_train, log=lambda m: print(m, flush=True))
+                    args.max_train, log=lambda m: print(m, flush=True),
+                    stop_after_mature=None if args.stop_after_mature < 0 else args.stop_after_mature)
             collect_summaries(root).to_csv(root / "summary.csv", index=False)
     df = collect_summaries(root)
     if not df.empty:
