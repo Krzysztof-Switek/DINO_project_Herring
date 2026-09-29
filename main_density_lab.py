@@ -42,6 +42,7 @@ EPOCHS = 30
 BATCH_SIZE = 16              # przy "CUDA out of memory" (np. równolegle z innym biegiem): 8
 LABEL = "quarter"            # cel liczenia: "quarter" (wiek po korekcie kwartalnej) | "recorded"
 CACHE_WORKERS = 8            # procesy ekstrakcji kanw przy budowie cache
+REQUIRE_CUDA = LOCATION == "server"   # na serwerze brak GPU = przerwij, zamiast liczyć dni na CPU
 
 # ============================================================
 
@@ -127,6 +128,13 @@ def preflight() -> None:
         log(f"GPU: {torch.cuda.get_device_name(0)}  wolne {free / 2**30:.1f} / {total / 2**30:.1f} GB")
         if free < 12 * 2**30 and BATCH_SIZE > 8:
             log("UWAGA: mniej niż 12 GB wolnej pamięci GPU — przy OOM ustaw BATCH_SIZE = 8")
+    elif REQUIRE_CUDA:
+        log(f"BŁĄD: torch {torch.__version__} nie widzi GPU (torch.cuda.is_available() = False). "
+            f"Ramiona A0–A4 na CPU to dziesiątki godzin na ziarno — przerywam. "
+            f"Sprawdź: nvidia-smi; python -c \"import torch; print(torch.__version__, "
+            f"torch.version.cuda, torch.cuda.is_available())\"; zmienną CUDA_VISIBLE_DEVICES. "
+            f"Świadomie na CPU: REQUIRE_CUDA = False.")
+        sys.exit(1)
     else:
         log("UWAGA: brak CUDA — ramiona A0–A4 na CPU trwają dziesiątki godzin na ziarno")
 

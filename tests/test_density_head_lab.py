@@ -86,7 +86,12 @@ def test_prior_init_starts_integral_near_age_not_n_over_2():
 def test_bce_gradient_does_not_vanish_where_squared_loss_does():
     """An 'on' cell stuck at logit −13: the gradient reaching it (wedge_b's absorbing state)."""
     n = 200
-    z = torch.full((1, n), -13.0, requires_grad=True)
+    # The 3 "on" cells sit slightly above the rest, so top-k is unambiguous: with all logits tied
+    # the sort's tie order is platform-dependent (the first version of this test passed on the
+    # workstation and failed on the server for exactly that reason).
+    z0 = torch.full((1, n), -13.0)
+    z0[0, :3] = -12.5
+    z = z0.clone().requires_grad_(True)
     age = torch.tensor([3])
     valid = torch.ones(1, n)
     g = {}
