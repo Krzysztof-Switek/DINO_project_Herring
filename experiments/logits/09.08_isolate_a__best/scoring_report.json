@@ -1,0 +1,24 @@
+{
+  "run": "09.08_isolate_a",
+  "ckpt": "best.pt",
+  "epoch": 28,
+  "splits": {
+    "val": {
+      "n_samples": 1117,
+      "mean_mae": 0.8263205013428827,
+      "median_mae": 1.0
+    },
+    "test": {
+      "n_samples": 1105,
+      "mean_mae": 0.8361990950226245,
+      "median_mae": 1.0,
+      "verification": {
+        "checked": true,
+        "n_common": 1105,
+        "redecode_matches_dump": 1105,
+        "matches_production": 1105,
+        "ok": true
+      }
+    }
+  }
+}

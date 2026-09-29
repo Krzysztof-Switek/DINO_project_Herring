@@ -1,0 +1,24 @@
+{
+  "run": "06.08_attention_first",
+  "ckpt": "best.pt",
+  "epoch": 36,
+  "splits": {
+    "val": {
+      "n_samples": 1117,
+      "mean_mae": 0.7421665174574754,
+      "median_mae": 0.0
+    },
+    "test": {
+      "n_samples": 1105,
+      "mean_mae": 0.6968325791855203,
+      "median_mae": 0.0,
+      "verification": {
+        "checked": true,
+        "n_common": 1105,
+        "redecode_matches_dump": 1105,
+        "matches_production": 1105,
+        "ok": true
+      }
+    }
+  }
+}

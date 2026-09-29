@@ -1,0 +1,121 @@
+# RAMIE OFF — korekta kwartalna WYLACZONA
+#
+# 24.09 — CZYSTY A/B korekty kwartalnej (plans and summaries/24.09_CORAL_plan.md, Etap 4 krok 0).
+#
+# Dwa configi tej pary roznia sie DOKLADNIE jednym polem:
+#   data.quarter_age_adjustment_enabled: False
+# Wszystko inne jest identyczne, wygenerowane z configs/config_attention_first.yaml.
+#
+# Dlaczego ten eksperyment w ogole: 06.08_attention_first (korekta ON) daje 53,85 % exact,
+# 09.08_isolate_a (OFF) 43,71 % — ale te dwa biegi roznily sie TAKZE
+# density_concentricity_weight (E9, 1,0 vs 0,0) i cala trajektoria. +10,1 pkt proc. nie jest
+# wiec przypisane fladze. Tutaj E9 jest wylaczone w OBU ramionach, co usuwa te zmienna.
+#
+# Zmiany wzgledem config_attention_first.yaml (identyczne w obu ramionach):
+#   model.use_density_head: false           # galaz density jest odcieta gradientowo
+#   model.density_concentricity_weight: 0.0 #   (src/model.py:992), wiec jej wylaczenie NIE
+#   training.min_density_active: 0.0        #   moze zmienic wieku, a skraca epoke i znosi
+#                                           #   bramke psujaca wybor checkpointu
+# MIL zostaje wlaczony (head_type: both) tak jak w oba porownywanych biegach — jego
+# odciecie to osobny eksperyment, nie element tego A/B.
+#
+# Jak uruchomic 3 ziarna (project.seed nadpisywany z CLI, podzial danych NIE ruszany):
+#   for s in 42 7 13; do
+#     python scripts/run_pipeline.py --base-config configs/config_quarter_ab_off.yaml #       --image-dir <IMAGE_DIR> --output-dir outputs/data/quarter_ab_off_seed$s #       --embedded-only --train-seed $s
+#   done
+
+candidates:
+  classical_concentricity_weight: 0.0
+  density_crop_pad_frac: 0.02
+  density_crop_to_otolith: true
+  density_image_size: 728
+  inner_margin: 0.2
+  min_peak_distance: 5
+  prominence_threshold: 0.1
+  width_ceiling_weight: 3.0
+  width_decay_weight: 1.0
+data:
+  image_dir: Z:/Photo/Otolithes/HER/Processed
+  image_size: 518
+  labels_csv: data/labels.csv
+  mask_background: true
+  mask_cache_dir: null
+  metadata_cols:
+  - length_mm
+  - weight_g
+  - sex
+  - population
+  num_workers: 0
+  patch_size: 14
+  quarter_age_adjustment_campaigns:
+  - BITS1q
+  - BITS2q
+  quarter_age_adjustment_enabled: false
+  test_split: 0.15
+  train_split: 0.7
+  val_split: 0.15
+inference:
+  increment_samples:
+    annotate_all: false
+    top_k_best: 15
+    top_k_worst: 15
+  output_dir: outputs
+  save_candidates: true
+  save_heatmaps: true
+  save_overlays: true
+  dump_coral_logits: true
+  aggregate_per_fish: true
+interpretation:
+  disable_fused_attention: true
+  heatmap_alpha: 0.5
+  method: auto
+model:
+  backbone: dinov2_vits14_reg
+  coral_loss_weight: 0.5
+  density_attn_num_heads: 4
+  density_attn_num_layers: 1
+  density_conc_weight: 1.0
+  density_concentricity_bins: 12
+  density_concentricity_weight: 0.0
+  density_concentricity_window_deg: 45.0
+  density_count_weight: 1.0
+  density_head_type: attention
+  density_tv_weight: 0.03
+  dropout: 0.1
+  head_type: both
+  mil_count_weight: 1.0
+  mil_hidden_dim: 64
+  mil_sparsity_weight: 1.0
+  num_age_classes: 17
+  target_type: ordinal
+  use_density_head: false
+  use_metadata: false
+project:
+  name: OtolithDinoStandalone
+  seed: 42
+  version: 0.1.0
+segmentation:
+  background_k: 3.0
+  frac: 0.18
+  gap_tolerance: 8
+  method: radial
+  n_angles: 720
+  smooth_sigma: 4.0
+training:
+  batch_size: 16
+  checkpoint_dir: checkpoints
+  density_lr_mult: 2.0
+  device: auto
+  early_stopping_ema: 0.3
+  early_stopping_metric: val_mae
+  early_stopping_min_delta: 0.005
+  early_stopping_patience: 8
+  epochs: 50
+  freeze_backbone_epochs: 5
+  keep_only_best: true
+  log_dir: logs
+  lr: 0.0001
+  min_density_active: 0.0
+  min_epochs: 12
+  scheduler: cosine
+  weight_decay: 0.0001
