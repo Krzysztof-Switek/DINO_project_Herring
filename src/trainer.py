@@ -175,9 +175,8 @@ class Trainer:
         if "density" in out:
             # Computed on the STOP-GRADIENT density output → updates only the density
             # head, never the backbone / CORAL / MIL (age head safe by construction).
-            density_valid_mask = (strip_valid_mask if strip_valid_mask is not None
-                                  else wedge_valid_mask if wedge_valid_mask is not None
-                                  else wedge_bands_valid_mask)
+            density_valid_mask = self._density_valid_mask(
+                strip_valid_mask, wedge_valid_mask, wedge_bands_valid_mask)
             parts["density"] = self.density_w * density_count_loss(
                 out["density"], ages, self.density_conc_w, self.density_tv_w,
                 valid_mask=density_valid_mask,
@@ -207,6 +206,12 @@ class Trainer:
             raise RuntimeError("Model produced no recognised head outputs")
         parts["total"] = torch.stack(list(parts.values())).sum()
         return parts
+
+    @staticmethod
+    def _density_valid_mask(strip_valid_mask, wedge_valid_mask, wedge_bands_valid_mask):
+        return (strip_valid_mask if strip_valid_mask is not None
+                else wedge_valid_mask if wedge_valid_mask is not None
+                else wedge_bands_valid_mask)
 
     def _combined_loss(self, out: dict, targets: torch.Tensor, ages: torch.Tensor,
                        polar_grid: Optional[torch.Tensor] = None,
@@ -407,7 +412,10 @@ class Trainer:
         age_sum    = 0.0
         density_sum = 0.0
         density_active_sum = 0.0
+        density_zero_sum = 0.0      # same loss on an all-zero map (L4 collapse reference)
+        density_max_logit_sum = 0.0
         density_conc_sum = 0.0
+        exact_sum = 0.0
         zegar_position_sum = 0.0
         has_coral = has_mil = has_density = has_density_conc = has_zegar_position = False
         n = 0
@@ -475,6 +483,7 @@ class Trainer:
                 bs = images.size(0)
                 total_loss += parts["total"].item() * bs
                 total_mae  += (pred_ages - ages).abs().float().sum().item()
+                exact_sum  += (pred_ages == ages).float().sum().item()
                 if "coral" in parts:
                     coral_sum += parts["coral"].item() * bs; has_coral = True
                 if "mil" in parts:
@@ -483,6 +492,18 @@ class Trainer:
                 if "density" in parts:
                     density_sum += parts["density"].item() * bs; has_density = True
                     density_active_sum += (out["density"] > 0.5).sum(dim=1).float().sum().item()
+                    # Reference for density_zero_ratio: the SAME loss function, weights and
+                    # validity mask on an all-zero map — so the ratio is ~1 exactly when
+                    # the head has collapsed to "nothing anywhere", whatever the geometry.
+                    density_zero_sum += (self.density_w * density_count_loss(
+                        torch.zeros_like(out["density"]), ages, self.density_conc_w,
+                        self.density_tv_w, valid_mask=self._density_valid_mask(
+                            strip_valid_mask, wedge_valid_mask, wedge_bands_valid_mask),
+                    )).item() * bs
+                    # Per-image max logit, recovered from the probabilities (the head
+                    # returns sigmoid outputs). eps keeps -inf out when p underflows.
+                    density_max_logit_sum += torch.logit(
+                        out["density"].amax(dim=1).double(), eps=1e-15).sum().item()
                 if "density_concentricity" in parts:
                     density_conc_sum += parts["density_concentricity"].item() * bs
                     has_density_conc = True
@@ -493,6 +514,8 @@ class Trainer:
                 n += bs
 
         denom = max(n, 1)
+        if n:
+            self.last_val_metrics["val_exact"] = exact_sum / denom
         if has_coral:
             self.last_val_metrics["coral_loss"] = coral_sum / denom
         if has_mil:
@@ -503,6 +526,9 @@ class Trainer:
             self.last_val_metrics["density_loss"] = density_sum / denom
             self.last_val_metrics["density_active"] = density_active_sum / denom
             self.last_val_metrics["mean_age"] = age_sum / denom
+            if density_zero_sum > 0.0:
+                self.last_val_metrics["density_zero_ratio"] = density_sum / density_zero_sum
+            self.last_val_metrics["density_max_logit"] = density_max_logit_sum / denom
         if has_density_conc:
             self.last_val_metrics["density_conc_loss"] = density_conc_sum / denom
         if has_zegar_position:
@@ -558,6 +584,11 @@ class Trainer:
         # if there were no density head/gate at all. Used below to give up waiting on a
         # density head that never matures (see the gate block).
         age_patience_counter = 0
+        # L4 collapse guard: consecutive epochs with density_zero_ratio above threshold.
+        collapse_action = getattr(self.cfg.training, "density_collapse_action", "off")
+        collapse_ratio = getattr(self.cfg.training, "density_collapse_ratio", 0.9)
+        collapse_patience = getattr(self.cfg.training, "density_collapse_patience", 3)
+        collapse_counter = 0
 
         for epoch in range(1, self.cfg.training.epochs + 1):
             if freeze_until > 0 and epoch == freeze_until + 1:
@@ -576,7 +607,12 @@ class Trainer:
                             getattr(self, "last_val_metrics", None))
             ckpt_path = self.save_checkpoint(epoch, val_loss)
 
-            raw_metric = val_mae if metric_name == "val_mae" else val_loss
+            if metric_name == "val_exact":
+                # Minimised like the others: 1 - exact. NaN when there is no val loader.
+                exact = (getattr(self, "last_val_metrics", None) or {}).get("val_exact")
+                raw_metric = 1.0 - exact if exact is not None else float("nan")
+            else:
+                raw_metric = val_mae if metric_name == "val_mae" else val_loss
             # Smooth the noisy monitored metric (raw val_mae is chunky) so best.pt and
             # early stopping don't hinge on a single lucky epoch (13.07 diagnosis).
             # ema_alpha == 0 → use the raw metric (previous behaviour).
@@ -650,6 +686,18 @@ class Trainer:
                 patience_counter += 1
             # gate closed → hold patience (training continues until density wakes)
 
+            # L4 collapse guard — only watches, never touches selection above.
+            zero_ratio = (getattr(self, "last_val_metrics", None) or {}).get("density_zero_ratio")
+            stop_collapsed = False
+            if collapse_action != "off" and zero_ratio is not None:
+                collapse_counter = collapse_counter + 1 if zero_ratio > collapse_ratio else 0
+                if collapse_counter >= collapse_patience:
+                    self._log(f"UWAGA: zapaść głowicy gęstości — density_zero_ratio > "
+                              f"{collapse_ratio} przez {collapse_counter} epok "
+                              f"(teraz {zero_ratio:.3f}, max logit "
+                              f"{self.last_val_metrics.get('density_max_logit', float('nan')):.2f})")
+                    stop_collapsed = collapse_action == "stop"
+
             # Keep only best.pt — drop this epoch's checkpoint (best.pt already holds the
             # best model). Stops the run dir ballooning (each checkpoint ~265 MB).
             if getattr(self.cfg.training, "keep_only_best", True) and ckpt_path.name != "best.pt":
@@ -664,6 +712,10 @@ class Trainer:
                     f"Early stopping — brak poprawy {metric_name} przez {patience} epok "
                     f"(best={best_metric:.4f})"
                 )
+                break
+            if stop_collapsed:
+                self._log("Stop — density_collapse_action=stop (głowica gęstości w stanie "
+                          "absorbującym, dalszy trening jej nie wybudzi)")
                 break
 
         self._log("Training complete")
@@ -759,8 +811,9 @@ class Trainer:
             line += f"  lr={lr:.2e}"
         # Section-B diagnostics (only present with the relevant heads active).
         if extra:
-            for key in ("coral_loss", "mil_loss", "mil_active",
-                        "density_loss", "density_active", "density_conc_loss", "mean_age"):
+            for key in ("val_exact", "coral_loss", "mil_loss", "mil_active",
+                        "density_loss", "density_active", "density_zero_ratio",
+                        "density_max_logit", "density_conc_loss", "mean_age"):
                 if key in extra and extra[key] == extra[key]:   # skip NaN
                     line += f"  {key}={extra[key]:.4f}"
         self._log(line)

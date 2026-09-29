@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from scripts.prepare_labels import extract_campaign_token
 from src.config import OtolithConfig
 from src.dataset import decode_age_ordinal
 from src.report_common import compute_metrics
@@ -41,6 +42,11 @@ def run_inference(
     ``output_dir/predictions_per_fish.csv``, holding one age per fish; the returned summary
     then also carries ``n_fish``, ``mean_mae_fish`` and ``exact_fish``. ``predictions.csv``
     is unchanged in either case.
+
+    With ``cfg.inference.rebase_quarter_offset`` (default False) and the quarter adjustment
+    enabled, ``predicted_age`` / ``target_age`` (and so every metric) are on the recorded-age
+    scale, and the raw ring-scale values are kept in ``predicted_rings`` / ``target_rings``.
+    See :func:`quarter_offsets`.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -55,6 +61,10 @@ def run_inference(
     dump_logits = bool(getattr(cfg.inference, "dump_coral_logits", False))
     per_fish = bool(getattr(cfg.inference, "aggregate_per_fish", False))
     logit_rows: List[np.ndarray] = []      # only filled when per_fish is on
+    rebase = quarter_rebase_active(cfg)
+    if cfg.data.quarter_age_adjustment_enabled and not rebase:
+        print("  UWAGA: quarter_age_adjustment_enabled=True bez inference.rebase_quarter_offset "
+              "— predicted_age to liczba stref, nie wiek zapisany (metryki nieporownywalne)")
 
     with torch.no_grad():
         for batch in loader:
@@ -78,14 +88,18 @@ def run_inference(
 
             for i in range(batch_size):
                 pred_age = int(pred_ages[i].item())
+                offset = int(quarter_offsets(cfg, [batch["image_id"][i]])[0]) if rebase else 0
 
                 record: Dict = {
                     "image_id": batch["image_id"][i],
-                    "predicted_age": pred_age,
+                    "predicted_age": pred_age + offset,
                     "target_age": None,
                     "abs_error": None,
                     "metadata_used": bool(cfg.model.use_metadata),
                 }
+                if rebase:
+                    record["predicted_rings"] = pred_age
+                    record["target_rings"] = None
 
                 # Optional raw CORAL logits (24.09). Without them predictions.csv holds
                 # only the decoded integer, so no threshold/calibration/top-k analysis is
@@ -101,8 +115,10 @@ def run_inference(
 
                 if has_labels:
                     target_age = int(batch["age"][i].item())
-                    record["target_age"] = target_age
+                    record["target_age"] = target_age + offset
                     record["abs_error"] = abs(pred_age - target_age)
+                    if rebase:
+                        record["target_rings"] = target_age
 
                 records.append(record)
 
@@ -145,6 +161,28 @@ def run_inference(
                   f"exact={100 * fish_summary['exact_fish']:.2f}%")
 
     return summary
+
+
+def quarter_rebase_active(cfg: OtolithConfig) -> bool:
+    """True when predictions must be moved from the ring scale back to recorded age."""
+    return bool(getattr(cfg.inference, "rebase_quarter_offset", False)) and bool(
+        cfg.data.quarter_age_adjustment_enabled)
+
+
+def quarter_offsets(cfg: OtolithConfig, image_ids) -> np.ndarray:
+    """Season offset per image: 1 for the quarter-adjusted campaigns, else 0.
+
+    Inverse of ``OtolithDataset._effective_age`` (same campaign parser, same campaign list),
+    so ``ring_scale + offset`` is the recorded age. The only case it cannot invert is the
+    ``max(age - 1, 0)`` clamp of a recorded age-0 Q1 fish; the Embedded labels have none
+    (checked on outputs/06.08_attention_first: target_rings + offset == recorded for all
+    1105 test images). Every error is unchanged by the rebase (the same offset lands on
+    prediction and target); what it fixes is the scale reported to the user and compared
+    across runs.
+    """
+    campaigns = set(cfg.data.quarter_age_adjustment_campaigns)
+    return np.asarray([1 if extract_campaign_token(str(i)) in campaigns else 0
+                       for i in image_ids], dtype=int)
 
 
 def _fish_keys_for(cfg: OtolithConfig, image_ids: pd.Series) -> Optional[pd.Series]:
@@ -202,12 +240,22 @@ def _write_per_fish(cfg: OtolithConfig, df: pd.DataFrame, logits: np.ndarray,
     agg["target_age"] = grouped["target_age"].first()
 
     pred = decode_age_ordinal(torch.from_numpy(agg[lcols].to_numpy(dtype=np.float32)))
+    pred = pred.numpy().astype(int)
+    rebase = quarter_rebase_active(cfg)
+    if rebase:
+        # target_age in df is already on the recorded scale; both photos of a fish come
+        # from the same haul, so the first image's campaign gives the fish's offset.
+        first_iid = pd.Series(df["image_id"].values, index=work.index).groupby(
+            work["fish_id"], dropna=True).first().reindex(agg.index)
+        offset = quarter_offsets(cfg, first_iid.values)
     out = pd.DataFrame({
         "fish_id": agg.index.astype(str),
-        "predicted_age": pred.numpy().astype(int),
+        "predicted_age": pred + offset if rebase else pred,
         "target_age": agg["target_age"].values,
         "n_images": agg["n_images"].values.astype(int),
     })
+    if rebase:
+        out["predicted_rings"] = pred
     out["abs_error"] = (out["predicted_age"] - out["target_age"]).abs()
     out.to_csv(output_dir / "predictions_per_fish.csv", index=False)
 

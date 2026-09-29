@@ -311,6 +311,20 @@ def _step_infer(cfg, ckpt_path: Path, labels_csv: Path, output_dir: Path) -> Pat
     return pred_csv
 
 
+def _ring_count(row) -> int:
+    """How many increments localization must find for this prediction row.
+
+    With ``inference.rebase_quarter_offset`` the reported ``predicted_age`` is the recorded
+    age (+1 for Q1 hauls) and the model's own count sits in ``predicted_rings`` — the outer,
+    not-yet-closed ring of a Q1 fish is not a visible zone, so localization must use the
+    ring count. Without the rebase both are the same number.
+    """
+    v = row.get("predicted_rings")
+    if v is None or v != v:      # absent or NaN
+        v = row.get("predicted_age", 0)
+    return int(v)
+
+
 def _compute_axis_data_for_samples(
     samples: list[dict],
     image_dir: Path,
@@ -547,7 +561,7 @@ def _compute_axis_data_for_samples(
             try:
                 wedge_payload = wc.build_wedge_card_data(
                     model, orig_rgb, mask_arr, axis_info, cfg,
-                    k=int(row.get("predicted_age", 0)),
+                    k=_ring_count(row),
                     out_h_p=grid.shape[0], out_w_p=grid.shape[1], device=device,
                 )
                 density_grid = wedge_payload["image_density"]
@@ -606,7 +620,7 @@ def _compute_axis_data_for_samples(
         # candidates from every ray + the top-`age` consensus increments on the axis.
         from src.ring_extraction import select_increments
         increments = select_increments(
-            density_grid, density_axis_info, int(row.get("predicted_age", 0)), dH_img, dW_img,
+            density_grid, density_axis_info, _ring_count(row), dH_img, dW_img,
             min_distance=min_dist, prominence=prominence, inner_margin=inner_margin,
             width_decay_weight=width_decay_weight, width_ceiling_weight=width_ceiling_weight,
         )
@@ -682,7 +696,7 @@ def _compute_axis_data_for_samples(
                 return_profiles=(classical_concentricity_weight > 0.0))
             _cpk = _cinc["peaks"]
             _cprof = _cinc.get("profiles")
-            _age = int(row.get("predicted_age", 0))
+            _age = _ring_count(row)
             _sc = min(1.0, 360 / max(H_img, W_img))
             _dw, _dh = max(1, int(W_img * _sc)), max(1, int(H_img * _sc))
             for _m in ("density", "classical", "consensus", "dp"):
@@ -774,7 +788,7 @@ def _compute_axis_data_for_samples(
                 import io as _iow
                 _wsc = min(1.0, 480 / max(H_img, W_img))
                 _wdw, _wdh = max(1, int(W_img * _wsc)), max(1, int(H_img * _wsc))
-                _wage = int(row.get("predicted_age", 0))
+                _wage = _ring_count(row)
                 _wd = dp_walkthrough_data(grid, orig_rgb, axis_info, H_img, W_img, _wage,
                                           density_min_distance=min_dist, density_prominence=prominence,
                                           inner_margin=inner_margin,
@@ -1054,7 +1068,7 @@ def _localization_quality(axis_data: dict, samples: list[dict]) -> list[dict]:
     rows: list[dict] = []
     for iid, d in axis_data.items():
         s = by_id.get(iid, {})
-        pred_age = int(s.get("predicted_age", 0))
+        pred_age = _ring_count(s)
         finals = d.get("final_axis_pts") or []
         classical = d.get("classical_pts") or []
         # Per-method scoring (sekcje I/J/K/DP): |n_final - wiek| + odległość do klasyki.
@@ -1333,6 +1347,9 @@ def _write_pipeline_summary(
             "Exact":  round(m["Exact"],  4),
             "MedAE":  round(m["MedAE"],  4),
         }
+        if "predicted_rings" in df.columns:
+            # inference.rebase_quarter_offset: metrics above are on the recorded-age scale.
+            entry["age_scale"] = "recorded (quarter offset added back)"
         # Per-fish block when `inference.aggregate_per_fish` produced one. A fish has one
         # age, so this is the operational unit; kept separate from the per-image numbers
         # rather than replacing them, since the project's history is per-image.

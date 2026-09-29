@@ -391,7 +391,12 @@ class TrainingConfig(BaseModel):
     # heads (old behaviour). No-op when the model has no density head.
     density_lr_mult: float = Field(1.0, ge=0.0)
     early_stopping_patience: int = Field(10, ge=0)
-    early_stopping_metric: Literal["val_mae", "val_loss"] = "val_mae"
+    # 30.09 (L3): "val_exact" selects best.pt / early-stops on the share of val images with
+    # exactly the right age (monitored as 1 - exact, so "lower is better" like the others).
+    # Exact is the metric the age work targets (24.09); val_mae can prefer an epoch with
+    # more ±1 errors and fewer big ones. Scale-safe with the quarter adjustment: the offset
+    # lands on prediction and target alike, so exact is the same on rings or recorded ages.
+    early_stopping_metric: Literal["val_mae", "val_loss", "val_exact"] = "val_mae"
     early_stopping_min_delta: float = Field(0.001, ge=0.0)
     # EMA smoothing of the monitored metric for model selection + early stopping.
     # The raw per-epoch val_mae is noisy (chunky integer-difference metric), so
@@ -430,6 +435,16 @@ class TrainingConfig(BaseModel):
     # Set explicitly for a different amount of patience, or to a very large number to
     # restore the old (unbounded-wait) behaviour on purpose.
     density_gate_max_wait_epochs: Optional[int] = Field(None, ge=1)
+    # 30.09 (L4): density-head collapse guard. `density_zero_ratio` = val density_loss /
+    # the loss the SAME function gives an all-zero map on the same batches (logged every
+    # epoch with a density head). wedge_b sat at 0.97-0.99 from e16 to e33 (logits ~ -13,
+    # an absorbing state: sigmoid' ~ 1e-6) and nothing in the log said so; the ratio would
+    # have shown it at e14-15 (0.78 -> 0.96). After `density_collapse_patience` consecutive
+    # epochs above `density_collapse_ratio`: "warn" logs a warning (default, training
+    # unchanged), "stop" also ends the run, "off" disables the check.
+    density_collapse_ratio: float = Field(0.9, gt=0.0)
+    density_collapse_patience: int = Field(3, ge=1)
+    density_collapse_action: Literal["off", "warn", "stop"] = "warn"
     device: str = "auto"
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
@@ -463,6 +478,15 @@ class InferenceConfig(BaseModel):
     # per-image rule. Default False keeps every existing output untouched; predictions.csv
     # is never modified either way, the per-fish table is a separate file.
     aggregate_per_fish: bool = False
+    # 30.09 — with data.quarter_age_adjustment_enabled the model is trained on "complete
+    # rings visible" (recorded age - 1 for Q1 campaigns), so its raw output is a RING COUNT,
+    # not the recorded age. This flag adds the season offset back at decode time, so
+    # predictions.csv / predictions_per_fish.csv / pipeline_summary.json are on the recorded
+    # scale (comparable with every other run and with what a reader reports), while
+    # `predicted_rings` / `target_rings` keep the ring scale for localization. Measured on
+    # outputs/06.08_attention_first: 53.85 % exact with the offset, 40.81 % without.
+    # No-op unless the quarter adjustment is enabled. Default False = byte-identical outputs.
+    rebase_quarter_offset: bool = False
     increment_samples: IncrementSamplesConfig = Field(
         default_factory=IncrementSamplesConfig)
 

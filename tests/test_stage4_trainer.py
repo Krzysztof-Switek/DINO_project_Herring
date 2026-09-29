@@ -1309,3 +1309,152 @@ def test_fit_logs_run_identity_as_first_line(tmp_path):
     assert "data.wedge_band_edges_t=[0.0, 0.6, 0.8, 0.9, 1.0]" in lines[0]
     assert "model.backbone=" in lines[0]
     assert "model.use_density_head=" in lines[0]
+
+
+# ---------------------------------------------------------------------------
+# L3 (30.09): val_exact + early_stopping_metric="val_exact"
+# ---------------------------------------------------------------------------
+
+def test_validate_reports_val_exact(tmp_path):
+    trainer = _make_trainer(tmp_path)
+    trainer.validate()
+    ex = trainer.last_val_metrics["val_exact"]
+    assert 0.0 <= ex <= 1.0
+
+
+def test_val_exact_selects_best_pt_by_exact_not_mae(tmp_path):
+    """e1 has the better MAE, e2 the better exact → val_exact must pick e2, val_mae e1."""
+    from src.trainer import Trainer
+
+    class Scripted(Trainer):
+        def validate(self):
+            self._vc = getattr(self, "_vc", 0) + 1
+            self.last_val_metrics = {"val_exact": 0.30 if self._vc == 1 else 0.40}
+            return 1.0, (0.80 if self._vc == 1 else 0.90)
+
+    picked = {}
+    for metric in ("val_exact", "val_mae"):
+        cfg = _make_cfg(tmp_path / metric, epochs=2)
+        cfg.training.early_stopping_patience = 0
+        cfg.training.early_stopping_metric = metric
+        trainer = Scripted(cfg, _make_model(cfg), _make_loader(), _make_loader())
+        trainer.fit()
+        ck = torch.load(trainer.checkpoint_dir / "best.pt", map_location="cpu",
+                        weights_only=False)
+        picked[metric] = ck["epoch"]
+    assert picked == {"val_exact": 2, "val_mae": 1}
+
+
+def test_val_exact_logged_every_epoch(tmp_path):
+    trainer = _make_trainer(tmp_path, epochs=2)
+    trainer.fit()
+    lines = [l for l in trainer.log_path.read_text(encoding="utf-8").splitlines()
+             if "epoch=" in l]
+    assert len(lines) == 2 and all("val_exact=" in l for l in lines)
+
+
+# ---------------------------------------------------------------------------
+# L4 (30.09): density_zero_ratio, density_max_logit, collapse guard
+# ---------------------------------------------------------------------------
+
+def _density_trainer(tmp_path, epochs=2):
+    from src.trainer import Trainer
+    cfg = _make_cfg(tmp_path, epochs=epochs)
+    cfg.model.use_density_head = True
+    return Trainer(cfg, _make_model(cfg), _make_loader(), _make_loader(n=8))
+
+
+def test_zero_ratio_is_one_for_an_all_zero_map(tmp_path):
+    """A head outputting ~0 everywhere (wedge_b's absorbing state) must read ~1.0."""
+    trainer = _density_trainer(tmp_path)
+    fwd = trainer.model.forward
+
+    def collapsed(*a, **kw):
+        out = fwd(*a, **kw)
+        out["density"] = torch.full_like(out["density"], torch.sigmoid(torch.tensor(-13.0)).item())
+        return out
+
+    trainer.model.forward = collapsed
+    trainer.validate()
+    m = trainer.last_val_metrics
+    assert m["density_zero_ratio"] == pytest.approx(1.0, abs=1e-3)
+    assert m["density_max_logit"] == pytest.approx(-13.0, abs=1e-3)
+
+
+def test_zero_ratio_below_one_for_a_count_matching_map(tmp_path):
+    """Uniform map with integral = age: count term 0, so the ratio drops well below 1."""
+    trainer = _density_trainer(tmp_path)
+    fwd = trainer.model.forward
+    ages = {}
+
+    def uniform(images, *a, **kw):
+        out = fwd(images, *a, **kw)
+        B, N = out["density"].shape
+        age = ages["cur"].float().to(out["density"].device)
+        out["density"] = (age / N).unsqueeze(1).expand(B, N).clone()
+        return out
+
+    trainer.model.forward = uniform
+    # the dataset's ages are needed inside forward; feed them through a wrapper loader
+    loader = trainer.val_loader
+
+    class _L:
+        def __iter__(self_):
+            for b in loader:
+                ages["cur"] = b["age"]
+                yield b
+    trainer.val_loader = _L()
+    trainer.validate()
+    assert trainer.last_val_metrics["density_zero_ratio"] < 0.6
+
+
+def _scripted_collapse(tmp_path, action, epochs=8, ratios=None):
+    from src.trainer import Trainer
+    ratios = ratios or [0.5, 0.95, 0.96, 0.97, 0.98, 0.99, 0.99, 0.99]
+
+    class Collapsing(Trainer):
+        def validate(self):
+            self._vc = getattr(self, "_vc", 0) + 1
+            self.last_val_metrics = {"density_active": 0.0,
+                                     "density_zero_ratio": ratios[self._vc - 1],
+                                     "density_max_logit": -13.0}
+            return 1.0, 5.0 - 0.1 * self._vc          # age keeps improving
+
+    cfg = _make_cfg(tmp_path, epochs=epochs)
+    cfg.model.use_density_head = True
+    cfg.training.early_stopping_patience = 0
+    cfg.training.density_collapse_action = action
+    cfg.training.keep_only_best = False
+    trainer = Collapsing(cfg, _make_model(cfg), _make_loader(), _make_loader())
+    trainer.fit()
+    log = trainer.log_path.read_text(encoding="utf-8")
+    n_epochs = len(list(trainer.checkpoint_dir.glob("checkpoint_epoch*.pt")))
+    return log, n_epochs
+
+
+def test_collapse_guard_warns_after_three_epochs(tmp_path):
+    log, n = _scripted_collapse(tmp_path, "warn")
+    assert n == 8                                 # warn never changes training
+    warn_lines = [l for l in log.splitlines() if "zapaść głowicy gęstości" in l]
+    assert warn_lines, "guard must fire"
+    # ratios > 0.9 from e2 → third consecutive at e4, first warning must be the e4 one
+    first = log.splitlines().index(warn_lines[0])
+    epoch_before = [l for l in log.splitlines()[:first] if "epoch=" in l][-1]
+    assert "epoch=  4" in epoch_before
+
+
+def test_collapse_guard_stop_ends_run(tmp_path):
+    log, n = _scripted_collapse(tmp_path, "stop")
+    assert n == 4
+    assert "density_collapse_action=stop" in log
+
+
+def test_collapse_guard_resets_on_recovery(tmp_path):
+    log, _ = _scripted_collapse(tmp_path, "warn",
+                                ratios=[0.95, 0.95, 0.5, 0.95, 0.95, 0.5, 0.95, 0.95])
+    assert "zapaść głowicy gęstości" not in log
+
+
+def test_collapse_guard_off(tmp_path):
+    log, n = _scripted_collapse(tmp_path, "off")
+    assert n == 8 and "zapaść głowicy gęstości" not in log
