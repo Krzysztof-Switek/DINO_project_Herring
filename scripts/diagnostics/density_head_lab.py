@@ -569,6 +569,13 @@ def main() -> None:
     args = ap.parse_args()
 
     from src.utils import resolve_device
+    # Windows redirects stdout in the console code page (cp1250), which has no "Σ": the first
+    # local A5 run crashed on its log line after epoch 1. UTF-8 everywhere.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
     if args.threads:
         torch.set_num_threads(args.threads)
     device = resolve_device(args.device)
