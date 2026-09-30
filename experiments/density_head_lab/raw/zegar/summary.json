@@ -1,0 +1,152 @@
+{
+  "heads": [
+    {
+      "head": "A3_seed0",
+      "arm": "A3",
+      "path": "experiments\\density_head_lab\\raw\\A3_seed0\\head.pt",
+      "n_images": 42,
+      "mean_of_per_image_means_px": 25.790952440021652,
+      "median_of_per_image_means_px": 22.531836184082675,
+      "pooled_mean_over_all_pairs_px": 24.984258539370977,
+      "pooled_median_over_all_pairs_px": 24.8633349244904,
+      "total_gt_rings": 205,
+      "total_pairs": 73,
+      "pairing_coverage": 0.35609756097560974,
+      "total_unmatched_model_spurious": 132,
+      "total_unmatched_gt_missed": 132
+    },
+    {
+      "head": "A3_seed1",
+      "arm": "A3",
+      "path": "experiments\\density_head_lab\\raw\\A3_seed1\\head.pt",
+      "n_images": 42,
+      "mean_of_per_image_means_px": 18.722653820404908,
+      "median_of_per_image_means_px": 17.225783068072936,
+      "pooled_mean_over_all_pairs_px": 18.66352018396461,
+      "pooled_median_over_all_pairs_px": 13.76530775413678,
+      "total_gt_rings": 205,
+      "total_pairs": 89,
+      "pairing_coverage": 0.43414634146341463,
+      "total_unmatched_model_spurious": 116,
+      "total_unmatched_gt_missed": 116
+    },
+    {
+      "head": "A3_seed2",
+      "arm": "A3",
+      "path": "experiments\\density_head_lab\\raw\\A3_seed2\\head.pt",
+      "n_images": 42,
+      "mean_of_per_image_means_px": 22.466795850872177,
+      "median_of_per_image_means_px": 18.43727928790886,
+      "pooled_mean_over_all_pairs_px": 21.66910268832301,
+      "pooled_median_over_all_pairs_px": 18.347402334153266,
+      "total_gt_rings": 205,
+      "total_pairs": 56,
+      "pairing_coverage": 0.2731707317073171,
+      "total_unmatched_model_spurious": 149,
+      "total_unmatched_gt_missed": 149
+    },
+    {
+      "head": "A5_seed0",
+      "arm": "A5",
+      "path": "experiments\\density_head_lab\\raw\\A5_seed0\\head.pt",
+      "n_images": 42,
+      "mean_of_per_image_means_px": 14.446184126055131,
+      "median_of_per_image_means_px": 13.31581732805247,
+      "pooled_mean_over_all_pairs_px": 14.926853020920296,
+      "pooled_median_over_all_pairs_px": 11.39234097677841,
+      "total_gt_rings": 205,
+      "total_pairs": 138,
+      "pairing_coverage": 0.6731707317073171,
+      "total_unmatched_model_spurious": 67,
+      "total_unmatched_gt_missed": 67
+    },
+    {
+      "head": "A5_seed1",
+      "arm": "A5",
+      "path": "experiments\\density_head_lab\\raw\\A5_seed1\\head.pt",
+      "n_images": 42,
+      "mean_of_per_image_means_px": 14.73428429667861,
+      "median_of_per_image_means_px": 15.436035365042883,
+      "pooled_mean_over_all_pairs_px": 14.524193579601716,
+      "pooled_median_over_all_pairs_px": 10.282696131964187,
+      "total_gt_rings": 205,
+      "total_pairs": 130,
+      "pairing_coverage": 0.6341463414634146,
+      "total_unmatched_model_spurious": 75,
+      "total_unmatched_gt_missed": 75
+    },
+    {
+      "head": "A5_seed2",
+      "arm": "A5",
+      "path": "experiments\\density_head_lab\\raw\\A5_seed2\\head.pt",
+      "n_images": 42,
+      "mean_of_per_image_means_px": 14.978083444108591,
+      "median_of_per_image_means_px": 15.38205610400739,
+      "pooled_mean_over_all_pairs_px": 15.420130289484371,
+      "pooled_median_over_all_pairs_px": 11.88481022569484,
+      "total_gt_rings": 205,
+      "total_pairs": 112,
+      "pairing_coverage": 0.5463414634146342,
+      "total_unmatched_model_spurious": 93,
+      "total_unmatched_gt_missed": 93
+    },
+    {
+      "head": "A5_seed3",
+      "arm": "A5",
+      "path": "experiments\\density_head_lab\\raw\\A5_seed3\\head.pt",
+      "n_images": 42,
+      "mean_of_per_image_means_px": 18.058189944531403,
+      "median_of_per_image_means_px": 16.138099597326736,
+      "pooled_mean_over_all_pairs_px": 19.80381750408339,
+      "pooled_median_over_all_pairs_px": 14.491090019603357,
+      "total_gt_rings": 205,
+      "total_pairs": 67,
+      "pairing_coverage": 0.32682926829268294,
+      "total_unmatched_model_spurious": 138,
+      "total_unmatched_gt_missed": 138
+    },
+    {
+      "head": "A5_seed4",
+      "arm": "A5",
+      "path": "experiments\\density_head_lab\\raw\\A5_seed4\\head.pt",
+      "n_images": 42,
+      "mean_of_per_image_means_px": 16.679007372414226,
+      "median_of_per_image_means_px": 16.95096888423013,
+      "pooled_mean_over_all_pairs_px": 16.38616603965178,
+      "pooled_median_over_all_pairs_px": 11.243854256248797,
+      "total_gt_rings": 205,
+      "total_pairs": 121,
+      "pairing_coverage": 0.5902439024390244,
+      "total_unmatched_model_spurious": 84,
+      "total_unmatched_gt_missed": 84
+    }
+  ],
+  "arms": [
+    {
+      "arm": "A3",
+      "heads": 3,
+      "median_px": 21.66910268832301,
+      "best_px": 18.66352018396461,
+      "median_coverage": 0.35609756097560974
+    },
+    {
+      "arm": "A5",
+      "heads": 5,
+      "median_px": 15.420130289484371,
+      "best_px": 14.524193579601716,
+      "median_coverage": 0.5902439024390244
+    }
+  ],
+  "experts_kk_vs_ss": {
+    "n_images": 42,
+    "mean_of_per_image_means_px": 3.975183583458252,
+    "median_of_per_image_means_px": 3.6498684490470676,
+    "pooled_mean_over_all_pairs_px": 4.3422578368256275,
+    "pooled_median_over_all_pairs_px": 2.716435165167735,
+    "total_gt_rings": 210,
+    "total_pairs": 205,
+    "pairing_coverage": 0.9761904761904762,
+    "total_unmatched_model_spurious": 4,
+    "total_unmatched_gt_missed": 5
+  }
+}

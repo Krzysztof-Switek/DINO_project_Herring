@@ -1,0 +1,9 @@
+{
+  "arm": "A5",
+  "seed": 2,
+  "matured_epoch": 1,
+  "matured": true,
+  "final_zero_ratio": 0.26986684709093184,
+  "final_active": 3.3187108325872874,
+  "min_zero_ratio": 0.26986684709093184
+}
