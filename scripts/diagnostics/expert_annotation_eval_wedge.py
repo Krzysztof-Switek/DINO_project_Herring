@@ -120,8 +120,52 @@ N_SAMPLES_AXIS = 50  # matches ev.N_SAMPLES_AXIS / paired_metric_all_runs.py's o
 # independently; the actual primitive it wraps, ev.match_t_values, IS a tracked, permanent function.
 # ---------------------------------------------------------------------------
 
-def paired_eval(t_model: list[float], gt_t: list[float], length_px: float, max_gap_t: float) -> dict:
-    pairs, unmatched_model, unmatched_gt = ev.match_t_values(t_model, gt_t, max_gap_t)
+def ring_tolerances(gt_t: list[float], max_gap_t: float, fraction: float = 0.5) -> list:
+    """Per-ring pairing tolerance: half the distance to the nearest neighbouring expert ring,
+    never more than ``max_gap_t``. A hit then means the right ring, not just the ring band near the
+    edge (with the fixed 10 %-of-axis tolerance a point anywhere between two outer rings pairs)."""
+    g = np.asarray(gt_t, dtype=float)
+    if len(g) < 2:
+        return [max_gap_t * fraction] * len(g)
+    order = np.argsort(g)
+    tol = np.empty(len(g))
+    for rank, j in enumerate(order):
+        gaps = []
+        if rank > 0:
+            gaps.append(g[j] - g[order[rank - 1]])
+        if rank < len(g) - 1:
+            gaps.append(g[order[rank + 1]] - g[j])
+        tol[j] = min(fraction * min(gaps), max_gap_t)
+    return list(tol)
+
+
+def match_t_values_tol(t_a: list[float], t_b: list[float], tol_b: list[float]):
+    """Hungarian 1:1 matching where pair (i, j) is allowed only if |t_a[i] - t_b[j]| <= tol_b[j].
+    Maximises the number of pairs, then minimises the total distance."""
+    from scipy.optimize import linear_sum_assignment
+    n, m = len(t_a), len(t_b)
+    if n == 0 or m == 0:
+        return [], list(range(n)), list(range(m))
+    cost = np.abs(np.asarray(t_a)[:, None] - np.asarray(t_b)[None, :])
+    allowed = cost <= np.asarray(tol_b)[None, :]
+    big, dummy = 1e6, 10.0
+    size = n + m
+    padded = np.full((size, size), dummy)
+    padded[:n, :m] = np.where(allowed, cost, big)
+    padded[n:, m:] = 0.0
+    rows, cols = linear_sum_assignment(padded)
+    pairs = [(r, c) for r, c in zip(rows, cols) if r < n and c < m and allowed[r, c]]
+    ua = [i for i in range(n) if i not in {r for r, _ in pairs}]
+    ub = [j for j in range(m) if j not in {c for _, c in pairs}]
+    return pairs, ua, ub
+
+
+def paired_eval(t_model: list[float], gt_t: list[float], length_px: float, max_gap_t: float,
+                tol: list | None = None) -> dict:
+    if tol is None:
+        pairs, unmatched_model, unmatched_gt = ev.match_t_values(t_model, gt_t, max_gap_t)
+    else:
+        pairs, unmatched_model, unmatched_gt = match_t_values_tol(t_model, gt_t, tol)
     paired_px = [abs(t_model[i] - gt_t[j]) * length_px for i, j in pairs]
     return {
         "n_gt": len(gt_t), "n_model": len(t_model), "n_pairs": len(pairs),
@@ -136,6 +180,7 @@ def summarize(rows: list[dict]) -> dict:
     all_paired = [d for r in rows for d in r["paired_px"]]
     total_gt = sum(r["n_gt"] for r in rows)
     total_pairs = sum(r["n_pairs"] for r in rows)
+    n_model = sum(r["n_model"] for r in rows)
     return {
         "n_images": len(rows),
         "mean_of_per_image_means_px": float(np.mean(per_image_means)) if per_image_means else None,
@@ -146,6 +191,13 @@ def summarize(rows: list[dict]) -> dict:
         "pairing_coverage": total_pairs / total_gt if total_gt else None,
         "total_unmatched_model_spurious": sum(r["n_unmatched_model"] for r in rows),
         "total_unmatched_gt_missed": sum(r["n_unmatched_gt"] for r in rows),
+        # 30.09: needed once the number of points is the model's own (free-k evaluation) —
+        # with k forced to the expert count, precision == coverage and the count error is 0.
+        "total_model_points": n_model,
+        "precision": total_pairs / n_model if n_model else None,
+        "f1": 2 * total_pairs / (n_model + total_gt) if (n_model + total_gt) else None,
+        "count_mae": float(np.mean([abs(r["n_model"] - r["n_gt"]) for r in rows])) if rows else None,
+        "count_exact": float(np.mean([r["n_model"] == r["n_gt"] for r in rows])) if rows else None,
     }
 
 
@@ -229,39 +281,86 @@ def load_lab_backbone(cfg, backbone_from: str, expected_sha, override):
     return backbone.eval()
 
 
-def lab_head_t_model(info: dict, tokens, band_t, band_theta, band_tissue,
-                     patch_locations, bands, k: int, axis_info, patch_size: int) -> list:
-    """Run one lab head on the band tokens and return its k ring positions as axis t."""
+def geometric_t(k: int, ratio: float = 0.8) -> list:
+    """k positions along the axis with gaps shrinking outward (each 0.8x the previous) —
+    the no-image spacing prior used as the floor / control of every ZEGAR score."""
+    if k <= 0:
+        return []
+    gaps = np.array([ratio ** i for i in range(k)])
+    edges = np.cumsum(gaps) / gaps.sum()
+    return list(edges - gaps / gaps.sum() / 2)
+
+
+def lab_head_map(info: dict, tokens, band_t, band_theta, band_tissue, patch_locations, bands,
+                 axis_info, patch_size: int, radial_on_axis: bool = False):
+    """One lab head on one image: ``(density, decode_t, valid, to_axis_t)``.
+
+    ``density``/``decode_t``/``valid`` are per cell (5852) or per canvas row (44, row head);
+    ``valid`` is the tissue fraction the training count used; ``to_axis_t(i)`` maps entry ``i``
+    to the axis t the metric compares with the experts.
+
+    ``radial_on_axis``: keep only the peak's canvas row (its radius, normalised to the contour)
+    and place it on the reading axis — the band's middle column — before measuring. The default
+    maps the peak's own (x, y) and projects it onto the axis, which counts a zone hit φ away from
+    the axis as cos φ closer to the nucleus (−23 % at 40°); the row head (A5) is always placed on
+    the axis, so this is the like-for-like comparison with it.
+    """
     arm, head = info["arm"], info["head"]
     t = torch.cat(band_t, 1)
+    tissue = torch.cat(band_tissue, 1)
     with torch.no_grad():
         if arm.head == "rows":
-            tissue = torch.cat(band_tissue, 1)
             dens = torch.sigmoid(head(tokens, t, tissue)).squeeze(-1)[0].numpy()
-            row_t, _ = head.rows(t, tissue)
-            peak_idx = decode_topk_peaks_real_t(dens, row_t[0].numpy(), k)
+            row_t, row_valid = head.rows(t, tissue)
             row_band = [(b, r) for b, band in enumerate(bands)
                         for r in range(band.geom.canvas_h // patch_size)]
-            out = []
-            for idx in peak_idx:
+
+            def to_axis_t(idx):
                 b, r_local = row_band[idx]
                 band = bands[b]
-                col = (band.geom.canvas_w - 1) / 2.0             # middle column = reading axis
-                row = (r_local + 0.5) * patch_size
-                x_crop, y_crop = wedge_band_xy_to_point(col, row, band)
-                out.append(ev.point_to_axis_t(x_crop, y_crop, axis_info))
-            return out
+                x, y = wedge_band_xy_to_point((band.geom.canvas_w - 1) / 2.0,
+                                              (r_local + 0.5) * patch_size, band)
+                return ev.point_to_axis_t(x, y, axis_info)
+            return dens, row_t[0].numpy(), row_valid[0].numpy(), to_axis_t
         ones = torch.ones_like(t, dtype=torch.bool)
         dens = torch.sigmoid(head(tokens, polar_t=t, polar_theta=torch.cat(band_theta, 1),
                                   polar_valid=ones)).squeeze(-1)[0].numpy()
-    peak_idx = decode_topk_peaks_real_t(dens, t[0].numpy(), k)
-    out = []
-    for idx in peak_idx:
+
+    def to_axis_t(idx):
         band, r_local, c_local = patch_locations[idx]
-        x_crop, y_crop = wedge_band_xy_to_point((c_local + 0.5) * patch_size,
-                                                (r_local + 0.5) * patch_size, band)
-        out.append(ev.point_to_axis_t(x_crop, y_crop, axis_info))
-    return out
+        col = (band.geom.canvas_w - 1) / 2.0 if radial_on_axis else (c_local + 0.5) * patch_size
+        x, y = wedge_band_xy_to_point(col, (r_local + 0.5) * patch_size, band)
+        return ev.point_to_axis_t(x, y, axis_info)
+    return dens, t[0].numpy(), tissue[0].numpy(), to_axis_t
+
+
+def decode_peaks(dens, decode_t, valid, k_mode: str, k_oracle: int) -> list:
+    """Indices of the chosen peaks.
+
+    oracle     k = the experts' ring count (every earlier ZEGAR number);
+    count      k = round(sum of density over tissue) — the head's own count, the quantity its
+               training loss matches to the age;
+    threshold  only peaks brighter than 0.5 ("active" cells, the maturity-gate definition).
+    Peaks are always taken greedily by value with the same minimum spacing in t.
+    """
+    if k_mode == "oracle":
+        return decode_topk_peaks_real_t(dens, decode_t, k_oracle)
+    if k_mode == "count":
+        return decode_topk_peaks_real_t(dens, decode_t, int(round(float((dens * valid).sum()))))
+    if k_mode == "threshold":
+        n = int((dens > 0.5).sum())
+        return [i for i in decode_topk_peaks_real_t(dens, decode_t, n) if dens[i] > 0.5]
+    raise ValueError(k_mode)
+
+
+def lab_head_t_model(info: dict, tokens, band_t, band_theta, band_tissue,
+                     patch_locations, bands, k: int, axis_info, patch_size: int,
+                     radial_on_axis: bool = False, k_mode: str = "oracle") -> list:
+    """Run one lab head on the band tokens and return its ring positions as axis t."""
+    dens, dec_t, valid, to_axis_t = lab_head_map(info, tokens, band_t, band_theta, band_tissue,
+                                                 patch_locations, bands, axis_info, patch_size,
+                                                 radial_on_axis)
+    return [to_axis_t(i) for i in decode_peaks(dens, dec_t, valid, k_mode, k)]
 
 
 def main_lab(args) -> None:
@@ -272,7 +371,8 @@ def main_lab(args) -> None:
     if not head_paths:
         sys.exit("Brak głowic do oceny (sprawdź --lab-dir / --arms / --only-matured).")
     heads = [load_lab_head(p) for p in head_paths]
-    out_dir = Path(args.output_dir) if args.output_dir else head_paths[0].parent.parent / "zegar"
+    out_dir = (Path(args.output_dir) if args.output_dir else head_paths[0].parent.parent
+               / ("zegar" if args.k_mode == "oracle" else f"zegar_{args.k_mode}"))
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"ZEGAR — ocena {len(heads)} głowic z laboratorium: {[h['name'] for h in heads]}")
 
@@ -300,7 +400,7 @@ def main_lab(args) -> None:
     if ZEGAR_SPLIT_PATH.exists():
         heldout_ids = set(json.loads(ZEGAR_SPLIT_PATH.read_text(encoding="utf-8")).get("held_out", []))
 
-    rows = {h["name"]: [] for h in heads}
+    rows = {h["name"]: [] for h in heads} | {h["name"] + "__rozstaw": [] for h in heads}
     kkss_rows = []
     for i, sample in enumerate(samples, 1):
         prep = prepare_sample(ann, sample, cfg, seg_params, max_gap_t)
@@ -329,13 +429,21 @@ def main_lab(args) -> None:
                 tokens[key] = torch.cat([bb.forward_features(img)["x_norm_patchtokens"]
                                          for img in band_imgs], dim=1)
         length_px = axis_info["length_px"]
-        kkss_rows.append(paired_eval(t_kk, t_ss, length_px, max_gap_t))
+        frac = {"half_spacing": 0.5, "quarter_spacing": 0.25}.get(args.tolerance)
+        tol = ring_tolerances(gt_t, max_gap_t, frac) if frac else None
+        tol_ss = ring_tolerances(t_ss, max_gap_t, frac) if frac else None
+        kkss_rows.append(paired_eval(t_kk, t_ss, length_px, max_gap_t, tol_ss))
         msg = []
         for h in heads:
             t_model = lab_head_t_model(h, tokens[(h["backbone_from"], h["checkpoint_sha"])],
                                        band_t, band_theta, band_tissue, patch_locations, bands,
-                                       len(gt_t), axis_info, ps)
-            r = paired_eval(t_model, gt_t, length_px, max_gap_t)
+                                       len(gt_t), axis_info, ps, radial_on_axis=args.radial_on_axis,
+                                       k_mode=args.k_mode)
+            # Control: the same number of points, placed by the spacing prior alone.
+            ctrl = paired_eval(geometric_t(len(t_model)), gt_t, length_px, max_gap_t, tol)
+            ctrl["Sample"] = sample
+            rows[h["name"] + "__rozstaw"].append(ctrl)
+            r = paired_eval(t_model, gt_t, length_px, max_gap_t, tol)
             r["Sample"] = sample
             r["is_held_out"] = sample in heldout_ids
             rows[h["name"]].append(r)
@@ -345,6 +453,9 @@ def main_lab(args) -> None:
 
     table = []
     for h in heads:
+        c = summarize(rows[h["name"] + "__rozstaw"])
+        table.append({"head": h["name"] + "__rozstaw", "arm": h["arm"].name + "__rozstaw",
+                      "path": "", **c})
         s = summarize(rows[h["name"]])
         table.append({"head": h["name"], "arm": h["arm"].name, "path": str(h["path"]), **s})
         pd.DataFrame([{k_: v_ for k_, v_ in r.items() if k_ != "paired_px"}
@@ -355,7 +466,14 @@ def main_lab(args) -> None:
     by_arm = df.groupby("arm").agg(heads=("head", "count"),
                                    median_px=("pooled_mean_over_all_pairs_px", "median"),
                                    best_px=("pooled_mean_over_all_pairs_px", "min"),
-                                   median_coverage=("pairing_coverage", "median")).reset_index()
+                                   median_coverage=("pairing_coverage", "median"),
+                                   median_precision=("precision", "median"),
+                                   median_f1=("f1", "median"),
+                                   median_count_mae=("count_mae", "median")).reset_index()
+    cols = ["head", "pooled_mean_over_all_pairs_px", "pairing_coverage", "precision", "f1",
+            "count_mae", "count_exact", "total_model_points"]
+    print(f"\nTryb liczby punktów: {args.k_mode}  (__rozstaw = te same k punktów rozstawione bez zdjęcia)")
+    print(df[cols].round(3).to_string(index=False))
     by_arm.to_csv(out_dir / "summary_arms.csv", index=False)
     (out_dir / "summary.json").write_text(json.dumps(
         {"heads": table, "arms": by_arm.to_dict("records"), "experts_kk_vs_ss": kkss},
@@ -363,7 +481,7 @@ def main_lab(args) -> None:
     print("\nPer ramię (średnia px po wszystkich parach, pokrycie = pary / przyrosty konsensusu):")
     print(by_arm.to_string(index=False))
     print(f"\nOdczyty ekspertów KK vs SS: {kkss['pooled_mean_over_all_pairs_px']:.2f} px, "
-          f"pokrycie {kkss['pairing_coverage']:.3f}")
+          f"pokrycie {kkss['pairing_coverage']:.3f}, precyzja {kkss['precision']:.3f}  (tolerancja: {args.tolerance})")
     print("Odniesienia: Run N 14,9 px / 62,0 %; pasek z maską 18,7 px / 52,7 %.")
     print(f"Zapisano: {out_dir}")
 
@@ -382,6 +500,14 @@ def main() -> None:
                     help="config geometrii pasm (tryb laboratorium)")
     ap.add_argument("--output-dir", default=None)
     ap.add_argument("--limit", type=int, default=None, help="tylko pierwsze N próbek (test)")
+    ap.add_argument("--tolerance", choices=["axis10", "half_spacing", "quarter_spacing"], default="axis10",
+                    help="parowanie: axis10 = 10 %% długości osi (dotychczas); half_spacing = połowa "
+                         "odstępu do najbliższego sąsiedniego przyrostu ekspertów; quarter_spacing = ćwierć")
+    ap.add_argument("--k-mode", choices=["oracle", "count", "threshold"], default="oracle",
+                    help="liczba punktów: oracle = z odczytu ekspertów; count = suma mapy głowicy; "
+                         "threshold = szczyty > 0,5")
+    ap.add_argument("--radial-on-axis", action="store_true",
+                    help="głowice per komórka: tylko promień szczytu, punkt na osi odczytu (jak A5)")
     args = ap.parse_args()
     if args.density_head_weights or args.lab_dir:
         main_lab(args)
