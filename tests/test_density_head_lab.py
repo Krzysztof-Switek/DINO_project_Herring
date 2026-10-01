@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import numpy as np
 import pytest
@@ -291,3 +292,165 @@ def test_stop_after_mature(tmp_path, monkeypatch):
     import pandas as pd
     m = pd.read_csv(tmp_path / "out" / "metrics.csv")
     assert s["matured_epoch"] == 1 and list(m["epoch"]) == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# 01.10 — series B (plan 30.09 §2.4): the new modes remove what they claim to remove
+# ---------------------------------------------------------------------------
+
+def _row_inputs(B=2, dim=32, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(B, N_SMALL, 32 if dim is None else dim, generator=g)
+    t = torch.cat([torch.linspace(0, 1, r).repeat_interleave(c) for r, c in SHAPES]).expand(B, -1)
+    return x, t.contiguous(), torch.ones(B, N_SMALL)
+
+
+def test_b1_head_has_no_position_input():
+    from scripts.diagnostics.density_head_lab import build_head
+    torch.manual_seed(0)
+    h = build_head(ARMS["B1"], 32, SHAPES).eval()
+    assert h.pos_proj is None
+    x, t, v = _row_inputs()
+    with torch.no_grad():
+        a = h(x, t, v)
+        b = h(x, torch.rand_like(t), v)
+    torch.testing.assert_close(a, b)
+
+
+def test_a5_head_does_depend_on_position():
+    """Control for the test above: the base head's output changes with t."""
+    from scripts.diagnostics.density_head_lab import build_head
+    torch.manual_seed(0)
+    h = build_head(ARMS["A5"], 32, SHAPES).eval()
+    x, t, v = _row_inputs()
+    with torch.no_grad():
+        assert not torch.allclose(h(x, t, v), h(x, 1.0 - t, v))
+
+
+def test_b2_jitters_t_in_training_only():
+    from scripts.diagnostics.density_head_lab import build_head
+    torch.manual_seed(0)
+    b2 = build_head(ARMS["B2"], 32, SHAPES)
+    a5 = build_head(ARMS["A5"], 32, SHAPES)
+    a5.load_state_dict(b2.state_dict())
+    for m in (b2, a5):
+        m.out_head[2].p = 0.0                         # dropout off, train mode only for the jitter
+    x, t, v = _row_inputs()
+    with torch.no_grad():
+        b2.eval(); a5.eval()
+        torch.testing.assert_close(b2(x, t, v), a5(x, t, v))     # evaluation: the true t
+        b2.train()
+        o1, o2 = b2(x, t, v), b2(x, t, v)
+    assert not torch.allclose(o1, o2)                             # redrawn every forward
+
+
+def test_old_head_pt_arm_dict_loads_with_defaults():
+    """head.pt files written before 01.10 store only the four original fields."""
+    from scripts.diagnostics.density_head_lab import Arm
+    arm = Arm(**{"name": "A5", "prior_bias": True, "loss_form": "bce_logit", "head": "rows"})
+    assert arm == ARMS["A5"] and arm.pos_mode == "absolute" and arm.consistency == "none"
+
+
+def test_selfsim_head_ignores_t_and_is_shift_equivariant_inside():
+    from scripts.diagnostics.density_head_lab import build_head, RowSelfSimDensityHead
+    torch.manual_seed(0)
+    h = build_head(ARMS["B6"], 32, SHAPES).eval()
+    assert isinstance(h, RowSelfSimDensityHead) and h.pos_proj is None
+    x, t, v = _row_inputs()
+    with torch.no_grad():
+        out = h(x, t, v)
+        torch.testing.assert_close(out, h(x, torch.rand_like(t), v))
+    assert out.shape == (2, sum(r for r, _ in SHAPES), 1)
+    # descriptor of row i = similarity to rows i±2…: identical rows → feature 1 where in range
+    z = torch.ones(1, 5, 32)
+    f = h.similarity_features(z)
+    assert f.shape == (1, len(h.offsets), 5)
+    assert torch.allclose(f[0, h.offsets.index(2), :3], torch.ones(3))
+    assert torch.allclose(f[0, h.offsets.index(2), 3:], torch.zeros(2))
+    assert torch.allclose(f[0, h.offsets.index(-2), :2], torch.zeros(2))
+
+
+def test_selfsim_prior_bias_is_settable():
+    from scripts.diagnostics.density_head_lab import build_head
+    h = build_head(ARMS["B6"], 32, SHAPES)
+    b = set_prior(h, 4.0, 44)
+    x, t, v = _row_inputs()
+    with torch.no_grad():
+        nn.init.zeros_(h.out_head[-1].weight)
+        assert torch.allclose(h.eval()(x, t, v), torch.full((2, 5, 1), b))
+
+
+def test_column_half_pooling_sees_only_its_half():
+    torch.manual_seed(0)
+    h = RowDensityHead(32, SHAPES).eval()
+    x, t, v = _row_inputs()
+    x2 = x.clone()
+    off = 0
+    for r, c in SHAPES:                                   # change only right-half columns
+        blk = x2[:, off:off + r * c].reshape(2, r, c, 32)
+        blk[:, :, c // 2:] += 3.0 * torch.randn_like(blk[:, :, c // 2:])
+        x2[:, off:off + r * c] = blk.reshape(2, r * c, 32)
+        off += r * c
+    with torch.no_grad():
+        torch.testing.assert_close(h(x, t, v, col_half="left"), h(x2, t, v, col_half="left"))
+        assert not torch.allclose(h(x, t, v, col_half="right"), h(x2, t, v, col_half="right"))
+
+
+def test_js_divergence_basic():
+    from scripts.diagnostics.density_head_lab import js_divergence
+    p = torch.tensor([[0.5, 0.5, 0.0], [1.0, 0.0, 0.0]])
+    q = torch.tensor([[0.5, 0.5, 0.0], [0.0, 0.0, 1.0]])
+    d = js_divergence(p, q)
+    assert d[0].abs() < 1e-6 and abs(d[1].item() - math.log(2)) < 1e-4
+
+
+def test_fish_batches_keep_pairs_together():
+    from scripts.diagnostics.density_head_lab import fish_batches, fish_pairs
+    keys = np.array(["a", "a", "b", "c", "c", "d", "d", "e"])
+    batches = fish_batches(np.arange(8), keys, 4, np.random.default_rng(0))
+    assert sorted(np.concatenate(batches).tolist()) == list(range(8))
+    for bt in batches:
+        assert len(bt) <= 4
+        ks = keys[bt]
+        for k in set(ks):
+            assert (ks == k).sum() == (keys == k).sum()   # never split
+    assert fish_pairs(np.array(["x", "y", "x", "z"])) == [(0, 2)]
+
+
+def test_fish_consistency_gradient_flows_to_one_image_of_the_pair():
+    from scripts.diagnostics.density_head_lab import consistency_loss
+    logits = torch.randn(4, 5, requires_grad=True)
+    b = {"fish": np.array(["a", "b", "a", "c"])}
+    loss = consistency_loss(ARMS["B4a"], None, b, logits, torch.ones(4, 5))
+    loss.backward()
+    nz = (logits.grad.abs().sum(1) > 0).tolist()
+    assert sum(nz) == 1 and (nz[0] or nz[2]) and not nz[1] and not nz[3]
+
+
+def test_cell_heads_refuse_row_only_modes():
+    from scripts.diagnostics.density_head_lab import Arm, build_head
+    with pytest.raises(NotImplementedError):
+        build_head(Arm("X", True, "bce_logit", "canvas", pos_mode="none"), 32, SHAPES)
+
+
+def _fake_cache_with_fish(root):
+    _fake_cache(root)
+    import pandas as pd
+    idx = pd.read_csv(root / "index.csv")
+    idx["fish_key"] = [f"f{i // 2}" for i in range(len(idx))]
+    idx.to_csv(root / "index.csv", index=False)
+
+
+@pytest.mark.parametrize("arm", ["B1", "B2", "B3a", "B4a", "B6", "B6c1", "B6f1"])
+def test_series_b_run_arm_end_to_end(tmp_path, arm):
+    from scripts.diagnostics.density_head_lab import Arm
+    (tmp_path / "cache").mkdir()
+    _fake_cache_with_fish(tmp_path / "cache")
+    cache = TokenCache(tmp_path / "cache", "quarter")
+    run_arm(ARMS[arm], cache, seed=0, epochs=2, batch_size=4, device=torch.device("cpu"),
+            out_dir=tmp_path / "out", log=lambda m: None, stop_after_mature=None)
+    ck = torch.load(tmp_path / "out" / "head.pt", weights_only=False)
+    assert Arm(**ck["arm"]) == ARMS[arm]
+    import pandas as pd
+    m = pd.read_csv(tmp_path / "out" / "metrics.csv")
+    assert list(m["epoch"]) == [0, 1, 2] and np.isfinite(m["zero_ratio"]).all()

@@ -309,7 +309,7 @@ def lab_head_map(info: dict, tokens, band_t, band_theta, band_tissue, patch_loca
     t = torch.cat(band_t, 1)
     tissue = torch.cat(band_tissue, 1)
     with torch.no_grad():
-        if arm.head == "rows":
+        if arm.head.startswith("rows"):
             dens = torch.sigmoid(head(tokens, t, tissue)).squeeze(-1)[0].numpy()
             row_t, row_valid = head.rows(t, tissue)
             row_band = [(b, r) for b, band in enumerate(bands)

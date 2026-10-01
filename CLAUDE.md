@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Język komunikacji
+
+**Wszystkie wiadomości do użytkownika wyłącznie po polsku** — także krótkie meldunki o postępie, reakcje
+na powiadomienia z zadań w tle i podsumowania wyników. Dokumenty w `plans and summaries/` po polsku.
+Kod i komentarze w kodzie mogą pozostać po angielsku.
+
 ## Project Overview
 
 OtolithDinoStandalone — weakly supervised fish age prediction from otolith (ear bone) images using DINOv2 (self-supervised ViT). The pipeline covers data preparation → training → inference → heatmap interpretation → increment-marker candidate detection → HTML report generation.

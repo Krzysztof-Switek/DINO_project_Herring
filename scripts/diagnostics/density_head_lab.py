@@ -19,6 +19,16 @@ mechanism 3 is off, and a head epoch costs minutes. The arms switch one mechanis
   A5  A3 + row head: attention-pooling over the columns of each of the 44 canvas rows
       → 1-D density over t (N = 44)                                     (dilution + window)
 
+01.10 — series B (`plans and summaries/30.09_plan_testow_laboratorium.md` §3), each one change
+against A5 on the raw cache. The question is no longer maturity but whether the head reads the
+individual otolith or only learns where rings usually lie (population prior):
+  B1  A5 without the row's t                      (E1, pos_mode=none)
+  B2  A5 with t' = a·t + b in training            (E1, pos_mode=jitter)
+  B3a/b  A5 + left/right column-half profile consistency, λ 0.1 / 0.5   (E2, columns)
+  B4a/b  A5 + left/right otolith of one fish consistency, λ 0.1 / 0.5   (E2, fish)
+  B6  row similarity structure only, no t         (E3, rows_selfsim)
+  B6c1/B6c5, B6f1/B6f5  B6 + columns / fish consistency, λ 0.1 / 0.5   (E2 on the B6 base)
+
 Everything that exists in production is reused, not re-implemented: `RadialAttentionDensityHead`,
 `density_count_loss`, `polar_fourier_features`. A4 runs the production head's own
 TransformerEncoderLayer with a sparse neighbourhood (pinned equal to the dense masked layer by
@@ -78,6 +88,13 @@ class Arm:
     prior_bias: bool          # output bias = log(π/(1−π)) instead of PyTorch's default init
     loss_form: str            # "prob_sq" (production) | "bce_logit"
     head: str                 # "radial" (production mask) | "canvas" (21-patch window) | "rows"
+                              # | "rows_selfsim" (row similarities only, no t — B6)
+    # 01.10 (plan 30.09 §2.4) — defaults keep every earlier head.pt loadable as it was trained.
+    pos_mode: str = "absolute"    # row heads: "absolute" (t as Fourier feature) | "none" (no t)
+                                  # | "jitter" (train on t' = a·t + b, evaluate on the true t)
+    consistency: str = "none"     # row heads: "none" | "columns" (left vs right half of the
+                                  # canvas columns) | "fish" (the two otoliths of one fish)
+    cons_weight: float = 0.0      # λ of the Jensen–Shannon consistency term
 
 
 ARMS = {
@@ -87,7 +104,25 @@ ARMS = {
     "A3": Arm("A3", True, "bce_logit", "radial"),
     "A4": Arm("A4", True, "bce_logit", "canvas"),
     "A5": Arm("A5", True, "bce_logit", "rows"),
+    # Plan 30.09 §3 — one change against the base A5 (raw cache) each.
+    "B1": Arm("B1", True, "bce_logit", "rows", pos_mode="none"),                    # E1
+    "B2": Arm("B2", True, "bce_logit", "rows", pos_mode="jitter"),                  # E1
+    "B3a": Arm("B3a", True, "bce_logit", "rows", consistency="columns", cons_weight=0.1),  # E2
+    "B3b": Arm("B3b", True, "bce_logit", "rows", consistency="columns", cons_weight=0.5),
+    "B4a": Arm("B4a", True, "bce_logit", "rows", consistency="fish", cons_weight=0.1),     # E2
+    "B4b": Arm("B4b", True, "bce_logit", "rows", consistency="fish", cons_weight=0.5),
+    "B6": Arm("B6", True, "bce_logit", "rows_selfsim"),                             # E3
+    # E2 on the B6 base (01.10: B6 was the best E1/E3 variant) — columns / fish, λ 0.1 / 0.5
+    "B6c1": Arm("B6c1", True, "bce_logit", "rows_selfsim", consistency="columns", cons_weight=0.1),
+    "B6c5": Arm("B6c5", True, "bce_logit", "rows_selfsim", consistency="columns", cons_weight=0.5),
+    "B6f1": Arm("B6f1", True, "bce_logit", "rows_selfsim", consistency="fish", cons_weight=0.1),
+    "B6f5": Arm("B6f5", True, "bce_logit", "rows_selfsim", consistency="fish", cons_weight=0.5),
 }
+# B3/B4 sit on the base (absolute t) until E1 decides; if B1 wins, add B1-based copies here.
+JITTER_SCALE = (0.7, 1.3)     # B2: a ~ U(0,7; 1,3)
+JITTER_SHIFT = (-0.2, 0.2)    #     b ~ U(−0,2; 0,2), redrawn per image
+SELFSIM_MAX_OFFSET = 8        # B6: similarities to rows i±2 … i±8 (±1 masked: adjacent rows
+                              # are alike by image continuity, not by ring structure)
 
 # Production values of the wedge_b run (configs/config_wedge_b.yaml) — the lab changes only
 # what an arm names.
@@ -301,13 +336,19 @@ class RowDensityHead(nn.Module):
     """
 
     def __init__(self, embed_dim: int, shapes: list[tuple[int, int]], hidden_dim: int = 64,
-                 dropout: float = 0.1, num_radius_freqs: int = 4):
+                 dropout: float = 0.1, num_radius_freqs: int = 4, pos_mode: str = "absolute"):
         super().__init__()
+        if pos_mode not in ("absolute", "none", "jitter"):
+            raise ValueError(pos_mode)
         self.shapes = shapes
         self.num_radius_freqs = num_radius_freqs
+        self.pos_mode = pos_mode
         self.input_norm = nn.LayerNorm(embed_dim)
         self.score = nn.Linear(embed_dim, 1)
-        self.pos_proj = nn.Linear(polar_positional_feature_dim(0, num_radius_freqs), embed_dim)
+        # B1: no position module at all — the head cannot see t (the DINOv2 tokens still carry
+        # their own canvas position embedding; that is the backbone's, not the head's).
+        self.pos_proj = (None if pos_mode == "none" else
+                         nn.Linear(polar_positional_feature_dim(0, num_radius_freqs), embed_dim))
         self.out_head = nn.Sequential(nn.Linear(embed_dim, hidden_dim), nn.GELU(),
                                       nn.Dropout(p=dropout), nn.Linear(hidden_dim, 1))
 
@@ -319,19 +360,75 @@ class RowDensityHead(nn.Module):
             rv.append(tissue[:, off:off + R * C].reshape(-1, R, C).mean(-1))
         return torch.cat(rt, 1), torch.cat(rv, 1)
 
-    def forward(self, patches: Tensor, polar_t: Tensor, tissue: Tensor) -> Tensor:
+    def pool(self, patches: Tensor, tissue: Tensor, col_half: Optional[str] = None) -> Tensor:
+        """(B, n_rows, D) attention pooling over each row's columns.
+
+        ``col_half`` = "left" | "right" pools only that half of every band's columns (B3: two
+        independent profiles of the same wedge)."""
         x = self.input_norm(patches)
         s = self.score(x).squeeze(-1) + torch.log(tissue.clamp(min=1e-4))      # (B, N)
         pooled = []
         for off, R, C in row_layout(self.shapes):
             xb = x[:, off:off + R * C].reshape(x.shape[0], R, C, -1)
-            wb = torch.softmax(s[:, off:off + R * C].reshape(-1, R, C), dim=-1)
+            sb = s[:, off:off + R * C].reshape(-1, R, C)
+            if col_half is not None:
+                keep = torch.arange(C, device=x.device) < C // 2
+                sb = sb.masked_fill((~keep if col_half == "left" else keep)[None, None, :],
+                                    float("-inf"))
+            wb = torch.softmax(sb, dim=-1)
             pooled.append((wb.unsqueeze(-1) * xb).sum(2))                       # (B, R, D)
-        z = torch.cat(pooled, 1)                                                 # (B, 44, D)
-        row_t, _ = self.rows(polar_t, tissue)
-        z = z + self.pos_proj(polar_fourier_features(row_t, torch.zeros_like(row_t),
-                                                     0, self.num_radius_freqs))
+        return torch.cat(pooled, 1)                                              # (B, 44, D)
+
+    def forward(self, patches: Tensor, polar_t: Tensor, tissue: Tensor,
+                col_half: Optional[str] = None) -> Tensor:
+        z = self.pool(patches, tissue, col_half)
+        if self.pos_proj is not None:
+            row_t, _ = self.rows(polar_t, tissue)
+            if self.pos_mode == "jitter" and self.training:
+                B = row_t.shape[0]
+                a = torch.empty(B, 1, device=row_t.device).uniform_(*JITTER_SCALE)
+                b = torch.empty(B, 1, device=row_t.device).uniform_(*JITTER_SHIFT)
+                row_t = a * row_t + b
+            z = z + self.pos_proj(polar_fourier_features(row_t, torch.zeros_like(row_t),
+                                                         0, self.num_radius_freqs))
         return self.out_head(z)
+
+
+class RowSelfSimDensityHead(RowDensityHead):
+    """B6: one logit per row from the row-to-row similarity structure only (RepNet-style).
+
+    Rows are pooled as in A5, projected and L2-normalised; row i is described by its cosine
+    similarity to rows i±2 … i±SELFSIM_MAX_OFFSET (relative offsets, so the descriptor does not
+    say where row i is), and a small 1-D convolution along the rows gives the logit. No t input.
+    Out-of-range offsets are 0 — the only positional cue left is the distance to the canvas ends
+    within SELFSIM_MAX_OFFSET rows (plus whatever the DINOv2 tokens carry themselves).
+    """
+
+    def __init__(self, embed_dim: int, shapes: list[tuple[int, int]], hidden_dim: int = 64,
+                 dropout: float = 0.1, proj_dim: int = 64, max_offset: int = SELFSIM_MAX_OFFSET):
+        super().__init__(embed_dim, shapes, hidden_dim, dropout, pos_mode="none")
+        self.offsets = [d for d in range(-max_offset, max_offset + 1) if abs(d) >= 2]
+        self.proj = nn.Linear(embed_dim, proj_dim)
+        self.out_head = nn.Sequential(
+            nn.Conv1d(len(self.offsets), hidden_dim, kernel_size=3, padding=1), nn.GELU(),
+            nn.Dropout(p=dropout), nn.Conv1d(hidden_dim, 1, kernel_size=1))
+
+    def similarity_features(self, z: Tensor) -> Tensor:
+        """(B, n_offsets, R): feature[:, j, i] = cos(row i, row i + offsets[j]), 0 off the canvas."""
+        e = F.normalize(self.proj(z), dim=-1)
+        S = e @ e.transpose(1, 2)                                               # (B, R, R)
+        R = S.shape[1]
+        feats = []
+        for d in self.offsets:
+            diag = torch.diagonal(S, offset=d, dim1=1, dim2=2)                  # (B, R − |d|)
+            pad = (0, d) if d > 0 else (-d, 0)
+            feats.append(F.pad(diag, pad) if abs(d) < R else torch.zeros_like(S[:, 0]))
+        return torch.stack(feats, 1)
+
+    def forward(self, patches: Tensor, polar_t: Tensor, tissue: Tensor,
+                col_half: Optional[str] = None) -> Tensor:
+        z = self.pool(patches, tissue, col_half)
+        return self.out_head(self.similarity_features(z)).transpose(1, 2)       # (B, R, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +473,68 @@ def bce_logit_loss(logits: Tensor, age: Tensor, valid: Tensor,
     return l_count + conc_weight * (l_on + l_off).mean()
 
 
+def row_profile(logits: Tensor, valid: Tensor, eps: float = 1e-8) -> Tensor:
+    """Where along the radius the head puts its count: p·tissue normalised to sum 1 per image."""
+    p = torch.sigmoid(logits) * valid
+    return p / p.sum(1, keepdim=True).clamp(min=eps)
+
+
+def js_divergence(p: Tensor, q: Tensor, eps: float = 1e-8) -> Tensor:
+    """Jensen–Shannon divergence (nats) between rows of two (B, M) distributions → (B,)."""
+    m = 0.5 * (p + q)
+    kl = lambda a, b: (a * (torch.log(a + eps) - torch.log(b + eps))).sum(1)
+    return 0.5 * kl(p, m) + 0.5 * kl(q, m)
+
+
+def fish_pairs(keys: np.ndarray) -> list[tuple[int, int]]:
+    """Index pairs (i, j) of batch positions holding two images of the same fish."""
+    first: dict = {}
+    pairs = []
+    for i, k in enumerate(keys):
+        if k in first:
+            pairs.append((first.pop(k), i))
+        else:
+            first[k] = i
+    return pairs
+
+
+def fish_batches(rows: np.ndarray, keys: np.ndarray, batch_size: int,
+                 rng: np.random.Generator) -> list[np.ndarray]:
+    """Shuffled batches that never split the images of one fish (B4)."""
+    groups: dict = {}
+    for r in rows:
+        groups.setdefault(keys[r], []).append(r)
+    order = [groups[k] for k in rng.permutation(list(groups))]
+    out, cur = [], []
+    for g in order:
+        if cur and len(cur) + len(g) > batch_size:
+            out.append(np.array(cur)); cur = []
+        cur.extend(g)
+    if cur:
+        out.append(np.array(cur))
+    return out
+
+
+def consistency_loss(arm: Arm, head: nn.Module, b: dict, logits: Tensor, valid: Tensor) -> Tensor:
+    """E2 terms. columns: JS between the profiles of the left and right column halves of the same
+    wedge. fish: JS between the two otoliths of one fish, gradient through one of them only
+    (asymmetric, chosen at random per pair — Count-level weak supervision, 2003.00164)."""
+    if arm.consistency == "columns":
+        lv = head_forward(arm, head, b, col_half="left")[0]
+        rv = head_forward(arm, head, b, col_half="right")[0]
+        return js_divergence(row_profile(lv, valid), row_profile(rv, valid)).mean()
+    if arm.consistency == "fish":
+        pairs = fish_pairs(b["fish"])
+        if not pairs:
+            return logits.new_zeros(())
+        prof = row_profile(logits, valid)
+        flip = torch.rand(len(pairs)) < 0.5
+        i = torch.tensor([q if f else p for (p, q), f in zip(pairs, flip)])
+        j = torch.tensor([p if f else q for (p, q), f in zip(pairs, flip)])
+        return js_divergence(prof[i], prof[j].detach()).mean()
+    return logits.new_zeros(())
+
+
 def arm_loss(arm: Arm, logits: Tensor, age: Tensor, valid: Tensor) -> Tensor:
     if arm.loss_form == "prob_sq":
         return density_count_loss(torch.sigmoid(logits), age, CONC_WEIGHT, 0.0, valid_mask=valid)
@@ -402,6 +561,8 @@ class TokenCache:
         self.theta = np.load(root / "polar_theta.npy", mmap_mode="r")
         self.valid = np.load(root / "tissue_valid.npy", mmap_mode="r")
         self.age = self.index[{"recorded": "age_recorded", "quarter": "age_quarter"}[label]].to_numpy()
+        self.fish = (self.index["fish_key"].astype(str).to_numpy() if "fish_key" in self.index
+                     else self.index["image_id"].astype(str).to_numpy())
         self.shapes = band_shapes(self.meta)
 
     def rows_of(self, split: str) -> np.ndarray:
@@ -412,26 +573,37 @@ class TokenCache:
         to = lambda a, dt: torch.from_numpy(np.ascontiguousarray(a[rows]).astype(dt)).to(device)
         return {"x": to(self.tokens, np.float32), "t": to(self.t, np.float32),
                 "theta": to(self.theta, np.float32), "valid": to(self.valid, np.float32),
-                "age": torch.from_numpy(self.age[rows]).to(device)}
+                "age": torch.from_numpy(self.age[rows]).to(device), "fish": self.fish[rows]}
 
 
 # ---------------------------------------------------------------------------
 # Head construction, forward, metrics
 # ---------------------------------------------------------------------------
 
+def is_row_head(arm: Arm) -> bool:
+    return arm.head.startswith("rows")
+
+
 def build_head(arm: Arm, dim: int, shapes: list[tuple[int, int]]) -> nn.Module:
+    if not is_row_head(arm) and (arm.pos_mode != "absolute" or arm.consistency != "none"):
+        raise NotImplementedError(f"{arm.name}: pos_mode/consistency only for row heads")
     if arm.head == "radial":
         return BinBlockRadialHead(embed_dim=dim, **HEAD_KW)
     if arm.head == "canvas":
         return CanvasWindowDensityHead(dim, shapes, **HEAD_KW)
+    if arm.head == "rows_selfsim":
+        return RowSelfSimDensityHead(dim, shapes, hidden_dim=HEAD_KW["hidden_dim"],
+                                     dropout=HEAD_KW["dropout"])
     return RowDensityHead(dim, shapes, hidden_dim=HEAD_KW["hidden_dim"],
-                          dropout=HEAD_KW["dropout"], num_radius_freqs=HEAD_KW["num_radius_freqs"])
+                          dropout=HEAD_KW["dropout"], num_radius_freqs=HEAD_KW["num_radius_freqs"],
+                          pos_mode=arm.pos_mode)
 
 
-def head_forward(arm: Arm, head: nn.Module, b: dict) -> tuple[Tensor, Tensor]:
-    """(logits (B, M), per-cell validity (B, M)) — M = 5852 cells, or 44 rows for A5."""
-    if arm.head == "rows":
-        logits = head(b["x"], b["t"], b["valid"]).squeeze(-1)
+def head_forward(arm: Arm, head: nn.Module, b: dict,
+                 col_half: Optional[str] = None) -> tuple[Tensor, Tensor]:
+    """(logits (B, M), per-cell validity (B, M)) — M = 5852 cells, or 44 rows for row heads."""
+    if is_row_head(arm):
+        logits = head(b["x"], b["t"], b["valid"], col_half=col_half).squeeze(-1)
         _, row_valid = head.rows(b["t"], b["valid"])
         return logits, row_valid
     ones = torch.ones_like(b["t"], dtype=torch.bool)       # production: positions always valid
@@ -486,10 +658,11 @@ def run_arm(arm: Arm, cache: TokenCache, seed: int, epochs: int, batch_size: int
     train_rows, val_rows = cache.rows_of("train"), cache.rows_of("val")
     if max_train:
         train_rows = rng.permutation(train_rows)[:max_train]
-    n_cells = 44 if arm.head == "rows" else int(cache.meta["n_patches"])
+    n_cells = 44 if is_row_head(arm) else int(cache.meta["n_patches"])
     bias = set_prior(head, float(cache.age[train_rows].mean()), n_cells) if arm.prior_bias else None
     opt = torch.optim.AdamW(head.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    steps = epochs * math.ceil(len(train_rows) / batch_size)
+    steps = epochs * (len(fish_batches(train_rows, cache.fish, batch_size, np.random.default_rng(0)))
+                      if arm.consistency == "fish" else math.ceil(len(train_rows) / batch_size))
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -514,12 +687,18 @@ def run_arm(arm: Arm, cache: TokenCache, seed: int, epochs: int, batch_size: int
             log(f"  {arm.name} seed{seed}: dojrzało w e{mat_epoch}, stop po {stop_after_mature} epokach")
             break
         head.train()
-        order = rng.permutation(train_rows)
+        if arm.consistency == "fish":
+            batches = fish_batches(train_rows, cache.fish, batch_size, rng)
+        else:
+            order = rng.permutation(train_rows)
+            batches = [order[i:i + batch_size] for i in range(0, len(order), batch_size)]
         tot, n = 0.0, 0
-        for i in range(0, len(order), batch_size):
-            b = cache.batch(order[i:i + batch_size], device)
+        for rows_b in batches:
+            b = cache.batch(rows_b, device)
             logits, valid = head_forward(arm, head, b)
             loss = arm_loss(arm, logits, b["age"], valid)
+            if arm.consistency != "none":
+                loss = loss + arm.cons_weight * consistency_loss(arm, head, b, logits, valid)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step(); sched.step()
