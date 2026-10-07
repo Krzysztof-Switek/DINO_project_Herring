@@ -36,6 +36,12 @@ change against B6 each:
   B9a/B9b  concentration (on/off) term only on images with ≤ 3 / ≤ 2 rings, count term on all
       ("subitizing", Cholakkal et al. 2019): learn the look of a ring where it is easiest to see
 
+07.10 — band-seam fix (`30.09_plan_testow_laboratorium.md`, dziennik E8): the 44 rows are 4 band
+canvases stacked, the row description jumps at each seam regardless of the otolith, and seams lie
+where rings are common — some B6 seeds put 79 % of their points there. One change against B6:
+  B6s  row embeddings centred per band (tissue-weighted band mean removed) before the cosine
+  B6m  similarities between rows of different bands set to 0, i.e. a seam acts like a canvas end
+
 Everything that exists in production is reused, not re-implemented: `RadialAttentionDensityHead`,
 `density_count_loss`, `polar_fourier_features`. A4 runs the production head's own
 TransformerEncoderLayer with a sparse neighbourhood (pinned equal to the dense masked layer by
@@ -104,6 +110,8 @@ class Arm:
     cons_weight: float = 0.0      # λ of the Jensen–Shannon consistency term
     # 07.10 — None = concentration on every image; a number = only on images with age ≤ it
     conc_max_age: Optional[float] = None
+    # 07.10 — rows_selfsim only: "none" | "center" (per-band centring) | "mask" (no cross-band pairs)
+    seam_fix: str = "none"
 
 
 ARMS = {
@@ -133,6 +141,9 @@ ARMS = {
     "B6f100": Arm("B6f100", True, "bce_logit", "rows_selfsim", consistency="fish", cons_weight=10.0),
     "B9a": Arm("B9a", True, "bce_logit", "rows_selfsim", conc_max_age=3.0),
     "B9b": Arm("B9b", True, "bce_logit", "rows_selfsim", conc_max_age=2.0),
+    # 07.10 — band-seam fix on the B6 base
+    "B6s": Arm("B6s", True, "bce_logit", "rows_selfsim", seam_fix="center"),
+    "B6m": Arm("B6m", True, "bce_logit", "rows_selfsim", seam_fix="mask"),
 }
 # B3/B4 sit on the base (absolute t) until E1 decides; if B1 wins, add B1-based copies here.
 JITTER_SCALE = (0.7, 1.3)     # B2: a ~ U(0,7; 1,3)
@@ -421,18 +432,38 @@ class RowSelfSimDensityHead(RowDensityHead):
     """
 
     def __init__(self, embed_dim: int, shapes: list[tuple[int, int]], hidden_dim: int = 64,
-                 dropout: float = 0.1, proj_dim: int = 64, max_offset: int = SELFSIM_MAX_OFFSET):
+                 dropout: float = 0.1, proj_dim: int = 64, max_offset: int = SELFSIM_MAX_OFFSET,
+                 seam_fix: str = "none"):
         super().__init__(embed_dim, shapes, hidden_dim, dropout, pos_mode="none")
+        if seam_fix not in ("none", "center", "mask"):
+            raise ValueError(seam_fix)
+        self.seam_fix = seam_fix
+        self.register_buffer("band_of_row", torch.cat(
+            [torch.full((R,), b, dtype=torch.long) for b, (_o, R, _c) in enumerate(row_layout(shapes))]),
+            persistent=False)
         self.offsets = [d for d in range(-max_offset, max_offset + 1) if abs(d) >= 2]
         self.proj = nn.Linear(embed_dim, proj_dim)
         self.out_head = nn.Sequential(
             nn.Conv1d(len(self.offsets), hidden_dim, kernel_size=3, padding=1), nn.GELU(),
             nn.Dropout(p=dropout), nn.Conv1d(hidden_dim, 1, kernel_size=1))
 
-    def similarity_features(self, z: Tensor) -> Tensor:
-        """(B, n_offsets, R): feature[:, j, i] = cos(row i, row i + offsets[j]), 0 off the canvas."""
-        e = F.normalize(self.proj(z), dim=-1)
+    def similarity_features(self, z: Tensor, row_w: Optional[Tensor] = None) -> Tensor:
+        """(B, n_offsets, R): feature[:, j, i] = cos(row i, row i + offsets[j]), 0 off the canvas.
+
+        seam_fix "center": each band's tissue-weighted (``row_w``) mean embedding is removed
+        before normalising; "mask": pairs of rows from different bands get 0 (as off the canvas)."""
+        e = self.proj(z)
+        if self.seam_fix == "center":
+            w = (torch.ones_like(e[..., 0]) if row_w is None else row_w).clamp(min=1e-6)   # (B, R)
+            onehot = F.one_hot(self.band_of_row, int(self.band_of_row.max()) + 1).to(e.dtype)  # (R, nb)
+            wb = w.unsqueeze(-1) * onehot                                       # (B, R, nb)
+            mean = torch.einsum("brk,brp->bkp", wb, e) / wb.sum(1).unsqueeze(-1)  # (B, nb, P)
+            e = e - mean[:, self.band_of_row]
+        e = F.normalize(e, dim=-1)
         S = e @ e.transpose(1, 2)                                               # (B, R, R)
+        if self.seam_fix == "mask":
+            same = self.band_of_row[:, None] == self.band_of_row[None, :]
+            S = S * same.to(S.dtype)
         R = S.shape[1]
         feats = []
         for d in self.offsets:
@@ -444,7 +475,8 @@ class RowSelfSimDensityHead(RowDensityHead):
     def forward(self, patches: Tensor, polar_t: Tensor, tissue: Tensor,
                 col_half: Optional[str] = None) -> Tensor:
         z = self.pool(patches, tissue, col_half)
-        return self.out_head(self.similarity_features(z)).transpose(1, 2)       # (B, R, 1)
+        row_w = self.rows(polar_t, tissue)[1] if self.seam_fix == "center" else None
+        return self.out_head(self.similarity_features(z, row_w)).transpose(1, 2)  # (B, R, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -616,7 +648,7 @@ def build_head(arm: Arm, dim: int, shapes: list[tuple[int, int]]) -> nn.Module:
         return CanvasWindowDensityHead(dim, shapes, **HEAD_KW)
     if arm.head == "rows_selfsim":
         return RowSelfSimDensityHead(dim, shapes, hidden_dim=HEAD_KW["hidden_dim"],
-                                     dropout=HEAD_KW["dropout"])
+                                     dropout=HEAD_KW["dropout"], seam_fix=arm.seam_fix)
     return RowDensityHead(dim, shapes, hidden_dim=HEAD_KW["hidden_dim"],
                           dropout=HEAD_KW["dropout"], num_radius_freqs=HEAD_KW["num_radius_freqs"],
                           pos_mode=arm.pos_mode)

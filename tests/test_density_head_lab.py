@@ -441,7 +441,7 @@ def _fake_cache_with_fish(root):
     idx.to_csv(root / "index.csv", index=False)
 
 
-@pytest.mark.parametrize("arm", ["B1", "B2", "B3a", "B4a", "B6", "B6c1", "B6f1", "B6c100", "B6f100", "B9a"])
+@pytest.mark.parametrize("arm", ["B1", "B2", "B3a", "B4a", "B6", "B6c1", "B6f1", "B6c100", "B6f100", "B9a", "B6s", "B6m"])
 def test_series_b_run_arm_end_to_end(tmp_path, arm):
     from scripts.diagnostics.density_head_lab import Arm
     (tmp_path / "cache").mkdir()
@@ -498,3 +498,43 @@ def test_arm_loss_passes_conc_max_age():
     assert torch.allclose(arm_loss(ARMS["B9b"], logits, age, valid),
                           bce_logit_loss(logits, age, valid, conc_max_age=2.0))
     assert torch.allclose(arm_loss(ARMS["B6"], logits, age, valid), bce_logit_loss(logits, age, valid))
+
+
+# ---------------------------------------------------------------------------
+# 07.10 — band-seam fix (B6s centring per band, B6m no cross-band pairs)
+# ---------------------------------------------------------------------------
+
+def _selfsim(seam_fix):
+    from scripts.diagnostics.density_head_lab import RowSelfSimDensityHead
+    torch.manual_seed(0)
+    return RowSelfSimDensityHead(16, REAL_SHAPES, seam_fix=seam_fix).eval()
+
+
+def test_b6s_ignores_a_constant_offset_per_band():
+    head = _selfsim("center")
+    z = torch.randn(2, 44, 16)
+    offsets = torch.randn(4, 16) * 5
+    shifted = z + offsets[head.band_of_row]
+    assert torch.allclose(head.similarity_features(z), head.similarity_features(shifted), atol=1e-5)
+    plain = _selfsim("none")
+    assert not torch.allclose(plain.similarity_features(z), plain.similarity_features(shifted), atol=1e-3)
+
+
+def test_b6m_rows_never_see_another_band():
+    head = _selfsim("mask")
+    z = torch.randn(1, 44, 16)
+    z2 = z.clone()
+    z2[0, 11:23] = torch.randn(12, 16)                     # change band 2 only
+    f1, f2 = head.similarity_features(z), head.similarity_features(z2)
+    band = head.band_of_row
+    for b in (0, 2, 3):
+        assert torch.allclose(f1[..., band == b], f2[..., band == b])
+    # row 10 (last of band 1) has no partner at +2 … +8
+    assert (f1[0, [i for i, d in enumerate(head.offsets) if d > 0], 10] == 0).all()
+
+
+def test_seam_fix_arms_are_one_change_against_b6():
+    for name, fix in (("B6s", "center"), ("B6m", "mask")):
+        a = ARMS[name]
+        assert a.seam_fix == fix and a.head == "rows_selfsim" and a.cons_weight == 0 and a.conc_max_age is None
+    assert ARMS["B6"].seam_fix == "none"

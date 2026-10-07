@@ -10,6 +10,13 @@ reported as the mean over val images. Row t is the contour-normalised radius of 
 (the evaluation's axis t differs by the axis/contour ratio, close enough for a 1/3 split).
 Each val batch is read from the memmap once and fed to every head.
 
+07.10 — second detector, the "band seam" shortcut: the 44 rows are 4 band canvases stacked
+(t 0–0.6, 0.6–0.8, 0.8–0.9, 0.9–1), and some heads put their points on the last/first row of
+adjacent bands (on ZEGAR: B1 39–86 % of points, B6 seeds 1 and 3 79 % / 22 %, B6 seeds 0, 2, 4
+0 %; 6 of 44 rows are seam rows, 14 % by chance). Measured the same way on the val split:
+
+    seam_mass = Σ p over seam rows  /  Σ p over all rows
+
     python scripts/diagnostics/lab_inner_mass.py --arms A5,B1,B2,B6
 Writes (merges into) <lab-dir>/inner_mass_val.csv; with --zegar-report it joins the ZEGAR inner-third share.
 """
@@ -41,6 +48,23 @@ def inner_mass(logits: torch.Tensor, row_t: torch.Tensor, row_valid: torch.Tenso
     return (p * (row_t < INNER)).sum(1) / p.sum(1).clamp(min=1e-8)
 
 
+def seam_rows(shapes) -> list[int]:
+    """Row indices of the last row of each band and the first row of the next one."""
+    from density_head_lab import row_layout
+    starts, r0 = [], 0
+    for _off, R, _C in row_layout(shapes):
+        starts.append(r0)
+        r0 += R
+    return sorted({i for s in starts[1:] for i in (s - 1, s)})
+
+
+@torch.no_grad()
+def seam_mass(logits: torch.Tensor, row_valid: torch.Tensor, seams: list[int]) -> torch.Tensor:
+    """(B,) share of each image's tissue-weighted Σp lying on band-seam rows."""
+    p = torch.sigmoid(logits) * row_valid
+    return p[:, seams].sum(1) / p.sum(1).clamp(min=1e-8)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cache", default="raw")
@@ -63,18 +87,21 @@ def main() -> None:
     cache = TokenCache(CACHE_ROOT / args.cache, "quarter")
     val = cache.rows_of("val")
     sums = {h["name"]: [] for h in heads}
+    seam = {h["name"]: [] for h in heads}
     for i in range(0, len(val), args.batch_size):
         b = cache.batch(val[i:i + args.batch_size], torch.device("cpu"))
         for h in heads:
             logits, row_valid = head_forward(h["arm"], h["head"], b)
             row_t, _ = h["head"].rows(b["t"], b["valid"])
             sums[h["name"]].append(inner_mass(logits, row_t, row_valid))
+            seam[h["name"]].append(seam_mass(logits, row_valid, seam_rows(h["head"].shapes)))
         print(f"  {min(i + args.batch_size, len(val))}/{len(val)}", flush=True)
     rows = []
     for h in heads:
         m = torch.cat(sums[h["name"]]).numpy()
         rows.append({"head": h["name"], "arm": h["arm"].name, "val_inner_mass": round(float(m.mean()), 4),
-                     "val_images_inner_gt_half": round(float((m > 0.5).mean()), 4)})
+                     "val_images_inner_gt_half": round(float((m > 0.5).mean()), 4),
+                     "val_seam_mass": round(float(torch.cat(seam[h["name"]]).mean()), 4)})
     df = pd.DataFrame(rows)
     zeg = {}
     for path in args.zegar_report:
