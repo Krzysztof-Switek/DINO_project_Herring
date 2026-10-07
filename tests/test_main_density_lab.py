@@ -56,3 +56,32 @@ def test_gate_pending_while_seeds_missing(lab):
     mdl.write_report()
     out = json.loads((lab / "wyniki.json").read_text(encoding="utf-8"))
     assert out["arms"][0]["gate"] == "w toku"
+
+
+def test_series_jobs_main_seeds_first_and_skip_done(lab, monkeypatch):
+    monkeypatch.setattr(mdl, "SERIES_ARMS", ["B6", "B9a"])
+    monkeypatch.setattr(mdl, "SERIES_SEEDS_MAIN", [0, 1])
+    monkeypatch.setattr(mdl, "SERIES_SEEDS_EXTRA", [5])
+    done = lab / mdl.SERIES_DIR / "B9a_seed0"
+    done.mkdir(parents=True)
+    (done / "summary.json").write_text("{}", encoding="utf-8")
+    jobs = mdl.series_jobs()
+    assert [j[0] for j in jobs] == ["B6_seed0", "B6_seed1", "B9a_seed1", "B6_seed5", "B9a_seed5"]
+    cmd = jobs[0][1]
+    assert cmd[cmd.index("--out-dir") + 1] == str(lab / mdl.SERIES_DIR)
+    assert cmd[cmd.index("--cache") + 1] == "raw" and cmd[cmd.index("--seeds") + 1] == "0"
+
+
+def test_run_parallel_reports_failures_and_keeps_going(lab, tmp_path):
+    import sys
+    ok = [sys.executable, "-c", "print('ok')"]
+    bad = [sys.executable, "-c", "import sys; sys.exit(3)"]
+    jobs = [("a", ok, tmp_path / "l" / "a.log"), ("b", bad, tmp_path / "l" / "b.log"),
+            ("c", ok, tmp_path / "l" / "c.log")]
+    assert mdl.run_parallel(jobs, 2) == ["b"]
+    assert (tmp_path / "l" / "c.log").read_text(encoding="utf-8").strip() == "ok"
+
+
+def test_gate_seeds_is_80_percent():
+    import math
+    assert mdl.GATE_SEEDS == (math.ceil(0.8 * len(mdl.SEEDS)) if len(mdl.SEEDS) >= 5 else len(mdl.SEEDS))

@@ -441,7 +441,7 @@ def _fake_cache_with_fish(root):
     idx.to_csv(root / "index.csv", index=False)
 
 
-@pytest.mark.parametrize("arm", ["B1", "B2", "B3a", "B4a", "B6", "B6c1", "B6f1"])
+@pytest.mark.parametrize("arm", ["B1", "B2", "B3a", "B4a", "B6", "B6c1", "B6f1", "B6c100", "B6f100", "B9a"])
 def test_series_b_run_arm_end_to_end(tmp_path, arm):
     from scripts.diagnostics.density_head_lab import Arm
     (tmp_path / "cache").mkdir()
@@ -454,3 +454,47 @@ def test_series_b_run_arm_end_to_end(tmp_path, arm):
     import pandas as pd
     m = pd.read_csv(tmp_path / "out" / "metrics.csv")
     assert list(m["epoch"]) == [0, 1, 2] and np.isfinite(m["zero_ratio"]).all()
+
+
+# ---------------------------------------------------------------------------
+# 07.10 — server series: E2 at λ 5/10, E9 concentration only on young fish
+# ---------------------------------------------------------------------------
+
+def test_series_0710_arms_are_one_change_against_b6():
+    base = ARMS["B6"]
+    for name, field, value in [("B6c50", "cons_weight", 5.0), ("B6c100", "cons_weight", 10.0),
+                               ("B6f50", "cons_weight", 5.0), ("B6f100", "cons_weight", 10.0),
+                               ("B9a", "conc_max_age", 3.0), ("B9b", "conc_max_age", 2.0)]:
+        a = ARMS[name]
+        assert getattr(a, field) == value
+        assert (a.head, a.loss_form, a.prior_bias, a.pos_mode) == (base.head, base.loss_form,
+                                                                   base.prior_bias, base.pos_mode)
+    assert base.conc_max_age is None
+
+
+def test_conc_max_age_drops_only_the_concentration_of_older_fish():
+    torch.manual_seed(0)
+    logits = torch.randn(4, 44)
+    valid = torch.ones(4, 44)
+    age = torch.tensor([1, 3, 5, 8])
+    full = bce_logit_loss(logits, age, valid)
+    young = bce_logit_loss(logits, age, valid, conc_max_age=3.0)
+    none_kept = bce_logit_loss(logits, age, valid, conc_max_age=-1.0)
+    count_only = bce_logit_loss(logits, age, valid, conc_weight=0.0)
+    assert torch.allclose(none_kept, count_only)                # every image dropped → count term only
+    assert count_only < young < full
+    # gradient of an old image's logits comes from the count term only
+    z = logits.clone().requires_grad_(True)
+    bce_logit_loss(z, age, valid, conc_max_age=3.0).backward()
+    g_old = z.grad[2:].clone()
+    z.grad = None
+    bce_logit_loss(z, age, valid, conc_weight=0.0).backward()
+    assert torch.allclose(g_old, z.grad[2:])
+
+
+def test_arm_loss_passes_conc_max_age():
+    torch.manual_seed(1)
+    logits, valid, age = torch.randn(3, 44), torch.ones(3, 44), torch.tensor([2, 6, 9])
+    assert torch.allclose(arm_loss(ARMS["B9b"], logits, age, valid),
+                          bce_logit_loss(logits, age, valid, conc_max_age=2.0))
+    assert torch.allclose(arm_loss(ARMS["B6"], logits, age, valid), bce_logit_loss(logits, age, valid))

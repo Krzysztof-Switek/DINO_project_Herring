@@ -29,6 +29,13 @@ individual otolith or only learns where rings usually lie (population prior):
   B6  row similarity structure only, no t         (E3, rows_selfsim)
   B6c1/B6c5, B6f1/B6f5  B6 + columns / fish consistency, λ 0.1 / 0.5   (E2 on the B6 base)
 
+07.10 — server series (`plans and summaries/07.10_audyt_literatury_perplexity.md`), again one
+change against B6 each:
+  B6c50/B6c100, B6f50/B6f100  columns / fish consistency at λ 5 / 10 — at λ ≤ 0.5 the JS term
+      (~0.05) added ≤ 0.03 to a loss of ~1.2 and did nothing; λ 5–10 makes it comparable
+  B9a/B9b  concentration (on/off) term only on images with ≤ 3 / ≤ 2 rings, count term on all
+      ("subitizing", Cholakkal et al. 2019): learn the look of a ring where it is easiest to see
+
 Everything that exists in production is reused, not re-implemented: `RadialAttentionDensityHead`,
 `density_count_loss`, `polar_fourier_features`. A4 runs the production head's own
 TransformerEncoderLayer with a sparse neighbourhood (pinned equal to the dense masked layer by
@@ -95,6 +102,8 @@ class Arm:
     consistency: str = "none"     # row heads: "none" | "columns" (left vs right half of the
                                   # canvas columns) | "fish" (the two otoliths of one fish)
     cons_weight: float = 0.0      # λ of the Jensen–Shannon consistency term
+    # 07.10 — None = concentration on every image; a number = only on images with age ≤ it
+    conc_max_age: Optional[float] = None
 
 
 ARMS = {
@@ -117,6 +126,13 @@ ARMS = {
     "B6c5": Arm("B6c5", True, "bce_logit", "rows_selfsim", consistency="columns", cons_weight=0.5),
     "B6f1": Arm("B6f1", True, "bce_logit", "rows_selfsim", consistency="fish", cons_weight=0.1),
     "B6f5": Arm("B6f5", True, "bce_logit", "rows_selfsim", consistency="fish", cons_weight=0.5),
+    # 07.10 — server series on the B6 base: E2 at a weight that matters, E9 age curriculum
+    "B6c50": Arm("B6c50", True, "bce_logit", "rows_selfsim", consistency="columns", cons_weight=5.0),
+    "B6c100": Arm("B6c100", True, "bce_logit", "rows_selfsim", consistency="columns", cons_weight=10.0),
+    "B6f50": Arm("B6f50", True, "bce_logit", "rows_selfsim", consistency="fish", cons_weight=5.0),
+    "B6f100": Arm("B6f100", True, "bce_logit", "rows_selfsim", consistency="fish", cons_weight=10.0),
+    "B9a": Arm("B9a", True, "bce_logit", "rows_selfsim", conc_max_age=3.0),
+    "B9b": Arm("B9b", True, "bce_logit", "rows_selfsim", conc_max_age=2.0),
 }
 # B3/B4 sit on the base (absolute t) until E1 decides; if B1 wins, add B1-based copies here.
 JITTER_SCALE = (0.7, 1.3)     # B2: a ~ U(0,7; 1,3)
@@ -449,7 +465,7 @@ def set_prior(head: nn.Module, mean_age: float, n_cells: float) -> float:
 
 
 def bce_logit_loss(logits: Tensor, age: Tensor, valid: Tensor,
-                   conc_weight: float = CONC_WEIGHT) -> Tensor:
+                   conc_weight: float = CONC_WEIGHT, conc_max_age: Optional[float] = None) -> Tensor:
     """Production structure (count + top-⌈age⌉ on/off), concentration on logits.
 
     Same count term and same on/off split as ``density_count_loss`` (top-k by value among
@@ -457,6 +473,10 @@ def bce_logit_loss(logits: Tensor, age: Tensor, valid: Tensor,
     imbalance is already balanced). Only the per-cell penalty changes: (1−p)² → −log p and
     p² → −log(1−p), whose gradient w.r.t. the logit tends to −1 (not 0) for an "on" cell deep
     in the negative range — the absorbing state of the squared form cannot occur.
+
+    ``conc_max_age`` (B9): the on/off term is zeroed for images with age above it — still
+    averaged over the whole batch, so those images simply drop out of it; the count term is
+    unchanged for every image.
     """
     p = torch.sigmoid(logits)
     l_count = F.smooth_l1_loss((p * valid).sum(dim=1), age.float())
@@ -470,7 +490,10 @@ def bce_logit_loss(logits: Tensor, age: Tensor, valid: Tensor,
     off = 1.0 - on
     l_on = (F.softplus(-z) * on).sum(1) / on.sum(1).clamp(min=1.0)
     l_off = (F.softplus(z) * off).sum(1) / off.sum(1).clamp(min=1.0)
-    return l_count + conc_weight * (l_on + l_off).mean()
+    l_conc = l_on + l_off
+    if conc_max_age is not None:
+        l_conc = l_conc * (age.float() <= conc_max_age).float()
+    return l_count + conc_weight * l_conc.mean()
 
 
 def row_profile(logits: Tensor, valid: Tensor, eps: float = 1e-8) -> Tensor:
@@ -538,7 +561,7 @@ def consistency_loss(arm: Arm, head: nn.Module, b: dict, logits: Tensor, valid: 
 def arm_loss(arm: Arm, logits: Tensor, age: Tensor, valid: Tensor) -> Tensor:
     if arm.loss_form == "prob_sq":
         return density_count_loss(torch.sigmoid(logits), age, CONC_WEIGHT, 0.0, valid_mask=valid)
-    return bce_logit_loss(logits, age, valid)
+    return bce_logit_loss(logits, age, valid, conc_max_age=arm.conc_max_age)
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +768,9 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=None)
     ap.add_argument("--skip-done", action="store_true",
                     help="skip arm/seed pairs that already have summary.json (resume)")
+    ap.add_argument("--out-dir", default=None,
+                    help="where <arm>_seed<s>/ go (default experiments/density_head_lab/<cache>); "
+                         "a server series uses its own directory so its seeds never collide with local ones")
     args = ap.parse_args()
 
     from src.utils import resolve_device
@@ -764,7 +790,7 @@ def main() -> None:
     if device.type == "cpu" and any(a.head == "radial" for a in arms):
         print("INFO: ramiona A0–A3 (maska produkcyjna liczona blokami binów) to ~1,35 s na próbkę "
               "na 16 rdzeniach — ~2 h/epokę; serwer (128 rdzeni, bez GPU) szybciej.")
-    root = OUT_ROOT / args.cache
+    root = Path(args.out_dir) if args.out_dir else OUT_ROOT / args.cache
     print(f"LAB  cache={args.cache}  label={args.label}  device={device}  arms={[a.name for a in arms]}  "
           f"seeds={seeds}  epochs={args.epochs}  N={cache.meta['n_patches']}  "
           f"train={len(cache.rows_of('train'))}  val={len(cache.rows_of('val'))}", flush=True)

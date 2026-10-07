@@ -22,6 +22,16 @@ się zwykłym ponownym uruchomieniem):
 A5 i A4 liczą się lokalnie; ich wyniki dołączy ten sam raport, jeśli katalogi
 experiments/density_head_lab/raw/A5_seed*, A4_seed* zostaną tu skopiowane.
 
+07.10 — SERIA NA SERWER (`plans and summaries/07.10_audyt_literatury_perplexity.md`). Ramiona
+SERIES_ARMS × ziarna SERIES_SEEDS liczone RÓWNOLEGLE (PARALLEL procesów po THREADS_PER_JOB wątków)
+do osobnego katalogu experiments/density_head_lab/<SERIES_DIR>/ — razem z kontrolą B6 na tej
+samej maszynie, więc porównanie parami nie miesza serwera z komputerem lokalnym i katalogi nie
+kolidują przy git pull. Najpierw ziarna 0–4 wszystkich ramion (wiążące, kryterium 2.3 planu),
+potem 5–9 (pomocnicze: szum między powtórzeniami ~±10 pkt). Log każdego zadania osobno:
+logs/density_lab_<SERIES_DIR>/<ramię>_seed<s>.log. Nieudane zadanie nie zatrzymuje pozostałych.
+Na końcu wskaźnik „tekstura przy środku” na walidacji (lab_inner_mass.py) i raport.
+Ocena ZEGAR — lokalnie, po git pull (zegar_report.py --lab-dir experiments/density_head_lab/<SERIES_DIR>).
+
     python main_density_lab.py              # całość
     python main_density_lab.py --report     # tylko raport z tego, co już policzone
     python main_density_lab.py --dry-run    # plan i kontrole, bez liczenia
@@ -30,6 +40,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import subprocess
 import sys
 import time
@@ -41,9 +53,23 @@ from pathlib import Path
 
 LOCATION = "server"          # "server" → serwer (Linux)  |  "local" → Twój komp (Windows, Z:)
 
-ARMS_RAW = ["A3", "A4"]      # A3 główny kandydat, A4 okno kanwy (przeniesione z lokalnego: serwer ~3,4× szybszy); A0/A1/A2 odłożone
+ARMS_RAW = []                # seria A (A3, A4 — policzone 30.09–01.10); A0/A1/A2 odłożone
 ARMS_CONTROL = []            # ["A0"] = kontrola na cache (b), wymaga zbudowania drugiego cache (~28 GB)
-SEEDS = [0, 1, 2]
+
+# Seria 07.10 — każde ramię to jedna zmiana względem B6 (głowica samopodobieństwa wierszy):
+SERIES_DIR = "raw_s0710"     # katalog wyników serii (cache tokenów nadal "raw")
+SERIES_ARMS = [
+    "B6",                    # kontrola: baza na tej samej maszynie i tych samych ziarnach
+    "B6c50", "B6c100",       # E2: zgodność lewej/prawej połowy kolumn, λ 5 / 10
+    "B6f50", "B6f100",       # E2: zgodność dwóch otolitów ryby, λ 5 / 10
+    "B9a", "B9b",            # E9: koncentracja tylko na zdjęciach z ≤ 3 / ≤ 2 przyrostami
+]
+SERIES_SEEDS_MAIN = [0, 1, 2, 3, 4]     # wiążące (kryterium 2.3)
+SERIES_SEEDS_EXTRA = [5, 6, 7, 8, 9]    # pomocnicze; [] = pomiń
+PARALLEL = 6                 # równoległe zadania (ramię × ziarno)
+THREADS_PER_JOB = 16         # PARALLEL × THREADS_PER_JOB ≤ 128 rdzeni; głowica wierszowa nie skaluje się dalej
+
+SEEDS = SERIES_SEEDS_MAIN + SERIES_SEEDS_EXTRA   # do bramki dojrzałości w raporcie
 EPOCHS = 20                  # bramka patrzy tylko na epoki <= 20
 STOP_AFTER_MATURE = 3        # ziarno, które dojrzało, kończy 3 epoki później
 BATCH_SIZE = 16
@@ -67,11 +93,12 @@ LOG = PROJECT_ROOT / "logs" / "main_density_lab.log"
 
 CACHES = {"raw": []} | ({"wedge_b_best_age": ["--backbone-from", str(CKPT_B)]} if ARMS_CONTROL else {})
 TESTS = ["tests/test_density_head_lab.py", "tests/test_cache_wedge_band_tokens.py",
-         "tests/test_stage4_trainer.py"]
+         "tests/test_stage4_trainer.py", "tests/test_main_density_lab.py"]
+SERIES_LOG_DIR = PROJECT_ROOT / "logs" / f"density_lab_{SERIES_DIR}"
 
 # Maturity gate of the plan (§5): active ≥ 1 and zero_ratio < 0.5 before epoch 20, in ≥ 4/5 seeds;
 # with fewer than 5 seeds every seed has to mature.
-GATE_SEEDS = 4 if len(SEEDS) >= 5 else len(SEEDS)
+GATE_SEEDS = math.ceil(0.8 * len(SEEDS)) if len(SEEDS) >= 5 else len(SEEDS)
 # wedge_b's own state from e16 on: 97–99 % of the zero-map loss.
 COLLAPSED_RATIO = 0.9
 
@@ -129,10 +156,15 @@ def preflight() -> None:
         for p in problems:
             log("BŁĄD: " + p)
         sys.exit(1)
-    import os
     import torch
     log(f"CPU: {os.cpu_count()} rdzeni, torch {torch.__version__}, wątki {torch.get_num_threads()} "
         f"(serwer nie ma GPU — wszystko na CPU)")
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        kb = {l.split(":")[0]: int(l.split()[1]) for l in meminfo.read_text().splitlines() if l.split()[1:]}
+        log(f"RAM: {kb.get('MemTotal', 0) / 2**20:.0f} GB, dostępne {kb.get('MemAvailable', 0) / 2**20:.0f} GB "
+            f"(cache tokenów ~27 GB czytany przez wszystkie procesy — mieści się w pamięci podręcznej "
+            f"systemu, jeśli dostępne > ~35 GB; inaczej zmniejsz PARALLEL)")
 
 
 def step_tests() -> None:
@@ -159,6 +191,75 @@ def step_lab() -> None:
             run([PY, "scripts/diagnostics/density_head_lab.py", "--cache", cache,
                  "--arms", arm, *common])
         write_report()             # partial report after each cache
+
+
+def series_jobs() -> list[tuple[str, list[str], Path]]:
+    """(name, command, log file) per arm × seed; seeds 0–4 of every arm before seeds 5–9."""
+    out_dir = LAB_ROOT / SERIES_DIR
+    jobs = []
+    for seeds in (SERIES_SEEDS_MAIN, SERIES_SEEDS_EXTRA):
+        for seed in seeds:
+            for arm in SERIES_ARMS:
+                if (out_dir / f"{arm}_seed{seed}" / "summary.json").exists():
+                    continue
+                cmd = [PY, "scripts/diagnostics/density_head_lab.py", "--cache", "raw",
+                       "--out-dir", str(out_dir), "--arms", arm, "--seeds", str(seed),
+                       "--epochs", str(EPOCHS), "--stop-after-mature", str(STOP_AFTER_MATURE),
+                       "--device", "cpu", "--batch-size", str(BATCH_SIZE), "--label", LABEL,
+                       "--threads", str(THREADS_PER_JOB), "--skip-done"]
+                jobs.append((f"{arm}_seed{seed}", cmd, SERIES_LOG_DIR / f"{arm}_seed{seed}.log"))
+    return jobs
+
+
+def run_parallel(jobs: list[tuple[str, list[str], Path]], parallel: int) -> list[str]:
+    """Run the jobs ``parallel`` at a time, each with its own log; return the names that failed."""
+    env = os.environ | {"OMP_NUM_THREADS": str(THREADS_PER_JOB), "MKL_NUM_THREADS": str(THREADS_PER_JOB),
+                        "PYTHONIOENCODING": "utf-8"}
+    pending, running, failed, done = list(jobs), {}, [], 0
+    while pending or running:
+        while pending and len(running) < parallel:
+            name, cmd, log_path = pending.pop(0)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            f = log_path.open("a", encoding="utf-8")
+            p = subprocess.Popen(cmd, cwd=PROJECT_ROOT, stdout=f, stderr=subprocess.STDOUT, env=env)
+            running[p] = (name, f, time.time())
+            log(f"start {name}  (w toku {len(running)}, w kolejce {len(pending)})")
+        time.sleep(5)
+        for p in [q for q in running if q.poll() is not None]:
+            name, f, t0 = running.pop(p)
+            f.close()
+            done += 1
+            if p.returncode != 0:
+                failed.append(name)
+            status = "koniec" if p.returncode == 0 else f"BŁĄD (kod {p.returncode})"
+            log(f"{status} {name}  {(time.time() - t0) / 60:.0f} min  [{done}/{len(jobs)}]")
+    return failed
+
+
+def step_series() -> None:
+    jobs = series_jobs()
+    if not jobs:
+        log(f"seria {SERIES_DIR}: wszystko policzone — pomijam")
+        return
+    log(f"seria {SERIES_DIR}: {len(jobs)} zadań, {PARALLEL} naraz × {THREADS_PER_JOB} wątków; "
+        f"logi w {SERIES_LOG_DIR}")
+    failed = run_parallel(jobs, PARALLEL)
+    import pandas as pd
+    out_dir = LAB_ROOT / SERIES_DIR
+    rows = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(out_dir.glob("*_seed*/summary.json"))]
+    pd.DataFrame(rows).to_csv(out_dir / "summary.csv", index=False)
+    if failed:
+        log(f"UWAGA: nieudane zadania ({len(failed)}): {', '.join(failed)} — szczegóły w ich logach; "
+            f"ponowne uruchomienie policzy tylko brakujące")
+
+
+def step_inner_mass() -> None:
+    """Training-side detector of the "nucleus texture" failure (threshold 0.2, plan 30.09 §6)."""
+    if not any((LAB_ROOT / SERIES_DIR).glob("*_seed*/head.pt")):
+        return
+    run([PY, "scripts/diagnostics/lab_inner_mass.py", "--cache", "raw",
+         "--lab-dir", str(LAB_ROOT / SERIES_DIR), "--arms", ",".join(SERIES_ARMS),
+         "--threads", str(min(64, os.cpu_count() or 16))])
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +314,11 @@ def arm_table(rows: list[dict]) -> list[dict]:
 
 ARM_DESC = {"A0": "przepis wedge_b bez zmian", "A1": "+ bias z priorem",
             "A2": "+ BCE na logitach", "A3": "prior + BCE",
-            "A4": "A3 + okno kanwy 21 patchy", "A5": "A3 + głowica wierszowa (44)"}
+            "A4": "A3 + okno kanwy 21 patchy", "A5": "A3 + głowica wierszowa (44)",
+            "B6": "samopodobieństwo wierszy, bez t (baza serii)",
+            "B6c50": "B6 + zgodność połów kolumn, λ 5", "B6c100": "B6 + zgodność połów kolumn, λ 10",
+            "B6f50": "B6 + zgodność otolitów ryby, λ 5", "B6f100": "B6 + zgodność otolitów ryby, λ 10",
+            "B9a": "B6, koncentracja tylko wiek ≤ 3", "B9b": "B6, koncentracja tylko wiek ≤ 2"}
 
 
 def verdicts(table: list[dict]) -> list[str]:
@@ -232,7 +337,7 @@ def verdicts(table: list[dict]) -> list[str]:
                      f"{a0['matured']}/{a0['seeds']} ziaren — "
                      + ("dryf był warunkiem koniecznym zapaści." if a0["gate"] == "TAK" else
                         "sam brak dryfu nie wystarcza; przyczyna leży w stracie, inicjalizacji lub oknie."))
-    passing = [t for t in table if t["cache"] == "raw" and t["gate"] == "TAK"]
+    passing = [t for t in table if t["cache"] in ("raw", SERIES_DIR) and t["gate"] == "TAK"]
     if passing:
         lines.append(f"Ramiona przechodzące bramkę dojrzałości (≥ {GATE_SEEDS}/{len(SEEDS)} ziaren): "
                      + ", ".join(f"{t['arm']} ({t['matured']}/{t['seeds']}, mediana e"
@@ -244,7 +349,7 @@ def verdicts(table: list[dict]) -> list[str]:
 
 
 def write_report() -> None:
-    rows = seed_rows("raw") + seed_rows("wedge_b_best_age")
+    rows = seed_rows("raw") + seed_rows(SERIES_DIR) + seed_rows("wedge_b_best_age")
     table = arm_table(rows)
     LAB_ROOT.mkdir(parents=True, exist_ok=True)
     (LAB_ROOT / "wyniki.json").write_text(json.dumps({"arms": table, "seeds": rows,
@@ -286,8 +391,9 @@ def main() -> None:
         write_report()
         return
     log(f"LOCATION={LOCATION}  IMAGE_DIR={IMAGE_DIR}  CKPT_B={CKPT_B}")
-    log(f"plan: cache {list(CACHES)}; ramiona raw {ARMS_RAW} × ziarna {SEEDS}; "
-        f"kontrola {ARMS_CONTROL} na wedge_b_best_age; {EPOCHS} epok, batch {BATCH_SIZE}, cel {LABEL}")
+    log(f"plan: cache {list(CACHES)}; ramiona raw {ARMS_RAW}; kontrola {ARMS_CONTROL} na wedge_b_best_age; "
+        f"seria {SERIES_DIR}: {SERIES_ARMS} × ziarna {SERIES_SEEDS_MAIN}+{SERIES_SEEDS_EXTRA} "
+        f"({len(series_jobs())} do policzenia, {PARALLEL} naraz); {EPOCHS} epok, batch {BATCH_SIZE}, cel {LABEL}")
     preflight()
     if args.dry_run:
         for tag in CACHES:
@@ -296,6 +402,8 @@ def main() -> None:
     step_tests()
     step_caches()
     step_lab()
+    step_series()
+    step_inner_mass()
     write_report()
     log("KONIEC — wyniki w experiments/density_head_lab/WYNIKI.md")
 
